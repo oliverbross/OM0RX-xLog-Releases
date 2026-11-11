@@ -1,0 +1,48 @@
+.contest-setup-dialog { height:100dvh; min-height:0; overflow:hidden; box-sizing:border-box; padding:10px; }
+.contest-setup-dialog>.contest-setup { height:100%; min-height:0; display:flex; flex-direction:column; }
+.contest-setup-dialog .contest-setup>header { display:none; }
+.contest-setup-dialog .contest-setup>form { flex:1; min-height:0; display:flex; flex-direction:column; }
+.contest-setup-dialog .contest-setup fieldset { flex:1; min-height:0; overflow:auto; }
+.contest-setup-dialog .contest-setup footer { flex:none; }
+.contest-setup-dialog .contest-setup [role=tablist] { flex:none; }
+.contest-setup-dialog .contest-setup label { flex-direction:row; }
+.contest-setup-dialog .contest-setup label>span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.contest-setup-dialog .contest-setup :is(button,input,select,textarea) { font:inherit; }
+.contest-setup-dialog .contest-setup button { min-height:30px; white-space:nowrap; }
+.contest-setup-dialog .contest-setup footer { flex-wrap:wrap; }
+.contest-setup-dialog[data-dialog-kind=station] { --contest-setup-label-width:92px; }
+.contest-setup-dialog[data-dialog-kind=station] .contest-setup fieldset { padding:10px 12px; }
+.contest-setup-dialog[data-dialog-kind=station] .contest-manual-content { min-height:0; }
+.contest-setup-dialog[data-dialog-kind=station] .contest-station-form { gap:4px; }
+.contest-setup-dialog[data-dialog-kind=station] .contest-manual-row { gap:6px; }
+.contest-setup-dialog[data-dialog-kind=station] .contest-setup :is(input:not([type=checkbox]):not([type=radio]),select) { min-height:27px; padding-block:3px; }
+.contest-setup-dialog[data-dialog-kind=station] .contest-setup footer { padding-block:8px; }
+.contest-setup-dialog[data-dialog-kind=configuration] { height:auto; max-height:100dvh; overflow:hidden; }
+.contest-setup-dialog[data-dialog-kind=configuration]>.contest-setup { height:auto; max-height:calc(100dvh - 20px); }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup>form { flex:1; min-height:0; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup fieldset { flex:1; min-height:0; overflow:auto; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup [role=tablist] { display:grid; grid-template-columns:repeat(var(--contest-setup-tab-count),minmax(0,1fr)); gap:clamp(0px,.2vw,2px); overflow:visible; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup button[role=tab] { min-width:0; padding-inline:clamp(1px,.3vw,3px); font-size:clamp(8px,1.45vw,12px); }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-manual-content { min-height:0; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup fieldset { padding-block:10px; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-manual-content { gap:8px; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-manual-stack { gap:6px; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup :is(input:not([type=checkbox]):not([type=radio]),select,textarea) { min-height:28px; padding-block:3px; }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup footer { position:static; background:var(--panel,#0b1728); }
+.contest-setup-dialog[data-dialog-kind=configuration] .contest-setup footer { padding-block:8px; }
+.contest-setup-dialog[data-dialog-kind=macros] { padding:10px; }
+.contest-setup-dialog[data-dialog-kind=macros]>.contest-setup { max-width:none; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-manual-content { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; min-height:0; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-manual-content>p { grid-column:1 / -1; margin:0; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-manual-content>section { min-width:0; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-manual-content h3 { margin:0 0 5px; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-macro-table { min-width:0; table-layout:fixed; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-macro-table th:first-child { width:34px; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-macro-table th:nth-child(2) { width:30%; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-macro-table :is(th,td) { padding:3px 4px; }
+.contest-setup-dialog[data-dialog-kind=macros] .contest-macro-table input { min-height:26px; padding-block:2px; }
+.contest-setup-dialog[data-dialog-kind=keys] .contest-setup fieldset { overflow:hidden; }
+.contest-setup-dialog[data-dialog-kind=keys] .contest-manual-content { height:100%; min-height:0; }
+.contest-setup-dialog[data-dialog-kind=keys] .contest-key-scroll { flex:1; min-height:0; }
+.contest-setup-dialog[data-dialog-kind=keys] .contest-key-actions { flex:none; }
+@media(max-width:700px) { .contest-setup-dialog[data-dialog-kind=macros] .contest-manual-content { grid-template-columns:minmax(0,1fr); } }

@@ -1,0 +1,153 @@
+import { validSpotActivationSnapshot, type SpotActivationSnapshot } from "./spotActivation";
+import { validSpotOperation } from "./spotActivationBarrier";
+type Call = (command: string, params?: Record<string, unknown>) => Promise<any>;
+type State = { status: SpotActivationSnapshot | null; error: string; requesting: boolean; checked: boolean; rotorStopBlocked?: boolean };
+const terminal = (status: SpotActivationSnapshot | null) => !!status && ["blocked", "confirmed", "failed", "uncertain"].includes(status.phase);
+export function activationMessage(status: SpotActivationSnapshot | null): string {
+  if (!status || status.phase === "idle") return "";
+  if (status.phase === "preparing") return "Checking shared editors before loading this spot…";
+  if (status.phase === "draft_applied") return "Spot loaded. Waiting for native radio admission…";
+  if (status.phase === "tuning") return "Spot loaded. Waiting for observed radio confirmation…";
+  if (status.phase === "confirmed" && status.draftOnly && status.intent === "antenna-profile") return "Software antenna metadata checked for the observed transmit band. No hardware command was sent.";
+  if (status.phase === "confirmed" && status.draftOnly && status.intent === "nearby-callsign") return "Spot callsign entered. Receiver and all other draft fields are unchanged.";
+  if (status.phase === "confirmed" && status.draftOnly) return "Chaser selection loaded into the shared draft. Radio follow and Auto rotor are off; no station command was sent.";
+  if (status.phase === "confirmed") return `${status.tuneConfirmed ? "Spot loaded · observed radio tune confirmed." : "Spot loaded; radio tune is not confirmed."}${status.error ? ` ${status.error}` : ""}${status.rotor && status.rotor !== "not_requested" ? ` Rotor: ${status.rotor.replaceAll("_", " ")}.` : ""}`;
+  if (status.phase === "uncertain") return "";
+  return status.error || (status.phase === "blocked" ? "Spot activation was blocked. Finish the shared editor operation first." : "Spot activation failed. Check its status before selecting another report.");
+}
+/** Holds the exact operation identity after lost IPC. Only an explicit user
+ * click creates a UUID; neither polling nor reconciliation invokes activation. */
+export class SpotActivationClient {
+  private state: State = { status: null, error: "", requesting: false, checked: false };
+  private listeners = new Set<() => void>();
+  private operation: string | null = null;
+  private active = true;
+  private version = 0;
+  private reading: Promise<void> | null = null;
+  private superseding: Promise<void> | null = null;
+  private stopBlocked = false;
+  private stopOperation: string | null = null;
+  private retired = new Set<string>();
+  constructor(private call: Call, private uuid: () => string = () => crypto.randomUUID(), private command: "activate_spot" | "activate_opportunity" = "activate_spot") {}
+  getSnapshot = () => this.state;
+  subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
+  canActivate = () => this.active && !this.stopBlocked && !this.state.requesting && (!this.operation || this.resolved());
+  private update(change: Partial<State>) { if (this.active) { this.state = { ...this.state, ...change }; this.listeners.forEach(listener => listener()); } }
+  private resolved() { const status = this.state.status; return !!status && status.phase !== "idle" && terminal(status) && status.reservationActive === false; }
+  private accept(value: unknown, expected?: string) {
+    if (!validSpotActivationSnapshot(value) || expected && value.operationId !== expected) throw new Error("The activation status could not be correlated. Check the existing operation before selecting another report.");
+    if (value.operationId && this.retired.has(value.operationId)) return;
+    const previous = this.state.status;
+    if (previous?.operationId === value.operationId && terminal(previous) && (!terminal(value) ||
+      previous.phase !== "idle" && value.phase !== "idle" && previous.reservationActive === false && value.reservationActive === true)) return;
+    if (value.phase === "idle" && this.operation && !this.resolved()) return;
+    if (value.phase === "uncertain" && value.reservationActive === false) {
+      if (value.operationId) this.retired.add(value.operationId);
+      this.operation = null;
+      this.update({ status: { operationId: null, phase: "idle", barrier: null }, error: "", checked: false });
+      return;
+    }
+    const changedOperation = value.operationId !== this.operation;
+    this.operation = value.operationId;
+    // Keep authority reads and recovery active without notifying React again
+    // for the same validated, error-free idle state (all three fields fixed).
+    if (!changedOperation && previous?.phase === "idle" && value.phase === "idle" && !this.state.error) return;
+    this.update({ status: value, error: "", ...(changedOperation ? { checked: false } : {}) });
+  }
+  private async settle(operationId: string, version: number, value: unknown) {
+    this.accept(value, operationId);
+    const status = this.state.status;
+    if (!this.active || version !== this.version || status?.operationId !== operationId ||
+        status.phase !== "uncertain" || status.reservationActive === false) return value;
+    const recovered = await this.call("spot_activation_reconcile", { operationId });
+    if (this.active && version === this.version) this.accept(recovered, operationId);
+    return recovered;
+  }
+  supersedeRotor(): Promise<void> {
+    if (!this.active || !(this.stopOperation ?? this.operation) || this.command !== "activate_spot" ||
+        this.state.status?.phase !== "idle" && this.state.status?.draftOnly) return Promise.resolve();
+    if (this.superseding) return this.superseding;
+    const operationId = this.stopOperation ?? this.operation!;
+    this.stopOperation = operationId;
+    this.stopBlocked = true;
+    this.update({ rotorStopBlocked: true });
+    this.superseding = (async () => {
+      try {
+        const reply = await this.call("supersede_spot_rotor", { operationId });
+        if (!reply || reply.operationId !== operationId || reply.superseded !== true || reply.stopAcknowledged !== true)
+          throw new Error("Rotor Stop acknowledgement could not be verified. The queued spot remains protected.");
+        if (this.active) { this.stopOperation = null; this.stopBlocked = false; this.update({ error: "", rotorStopBlocked: false }); }
+      } catch (cause) {
+        this.update({ error: cause instanceof Error ? cause.message : "Rotor Stop is unconfirmed. Check its outcome before another spot." });
+        throw cause;
+      }
+    })().finally(() => { this.superseding = null; });
+    return this.superseding;
+  }
+  async activate(spot: Record<string, any>) {
+    if (!this.canActivate()) throw new Error("Check the existing spot activation before selecting another report.");
+    if (!validSpotOperation(spot.activation?.sourceEpoch) || !validSpotOperation(spot.activation?.spotVersion) ||
+      typeof spot.id !== "string" || !spot.id || spot.id.length > 128 || spot.id.includes("\0"))
+      throw new Error("Refresh the shared cluster before selecting this report. Its native activation identity is unavailable.");
+    const operationId = this.uuid(); if (!validSpotOperation(operationId)) throw new Error("The activation operation identity could not be created.");
+    this.operation = operationId; const version = ++this.version;
+    this.update({ requesting: true, checked: false, status: null, error: "" });
+    try {
+      const result = await this.call(this.command, { operationId, sourceEpoch: spot.activation.sourceEpoch, spotId: spot.id, spotVersion: spot.activation.spotVersion });
+      if (!this.active || version !== this.version || this.state.status?.operationId === operationId && terminal(this.state.status)) return result;
+      return await this.settle(operationId, version, result);
+    } catch (cause) {
+      if (this.active && version === this.version) {
+        try {
+          const recovered = await this.call("spot_activation_reconcile", { operationId });
+          if (this.active && version === this.version) return await this.settle(operationId, version, recovered);
+        } catch {}
+        this.update({ error: "Activation acknowledgement unavailable. The existing operation will be recovered automatically; no action is replayed." });
+      }
+      throw cause;
+    } finally { if (version === this.version) this.update({ requesting: false }); }
+  }
+  refresh(): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    if (this.reading) return this.reading;
+    const version = this.version, operationId = this.operation && !this.resolved() ? this.operation : null;
+    this.reading = (async () => {
+      try {
+        const result = await this.call(operationId ? "spot_activation_status" : "spot_activation_snapshot", operationId ? { operationId } : {});
+        if (this.active && version === this.version) {
+          if (operationId) await this.settle(operationId, version, result);
+          else {
+            this.accept(result);
+            const status = this.state.status;
+            if (status?.operationId && status.phase === "uncertain" && status.reservationActive === true)
+              await this.settle(status.operationId, version, status);
+          }
+        }
+      } catch (cause) { if (this.active && version === this.version) this.update({ error: cause instanceof Error ? cause.message : "Activation status is unavailable. No action was replayed." }); }
+    })().finally(() => { this.reading = null; });
+    return this.reading;
+  }
+  async reconcile() {
+    if (!this.active || !this.operation || this.state.requesting) return;
+    const operationId = this.operation, version = ++this.version;
+    this.update({ requesting: true, checked: false });
+    try {
+      const result = await this.call("spot_activation_reconcile", { operationId });
+      if (this.active && version === this.version) { this.accept(result, operationId); this.update({ checked: true }); }
+    } catch (cause) { if (this.active && version === this.version) this.update({ error: cause instanceof Error ? cause.message : "The existing activation could not be reconciled. No tune was replayed." }); }
+    finally { if (version === this.version) this.update({ requesting: false }); }
+  }
+  /** Explicit retirement only after native receipt/lease recovery confirms a
+   * terminal, closed reservation. Never sends another activation or effect. */
+  async retire() {
+    if (!this.active || !this.operation || this.state.requesting) return false;
+    const operationId = this.operation;
+    await this.reconcile();
+    if (!this.active || this.operation !== operationId || !this.resolved() || !this.state.checked) return false;
+    this.retired.add(operationId); this.version++;
+    this.operation = null;
+    this.update({ status: { operationId: null, phase: "idle", barrier: null }, error: "", checked: false });
+    return true;
+  }
+  dispose() { this.active = false; this.version++; this.listeners.clear(); }
+}

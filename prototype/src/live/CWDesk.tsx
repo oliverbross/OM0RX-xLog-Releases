@@ -1,0 +1,37 @@
+import { useEffect, useRef, useState } from "react";
+import { Square } from "lucide-react";
+import { cwOutputLimit, defaultCWProfile, expandCWMacro, type CWContext, type CWMacro, type CWProfile } from "./cwMacros";
+import type { CWController, CWState } from "./cwController";
+import type { SharedCWSession, SharedCWState } from "./sharedCWSession";
+import CWComposition from "./CWComposition";
+import "./CW.css";
+
+export default function CWDesk({ profile = defaultCWProfile, context, controller, state, radioProvider = "direct_agent", releaseOnly = false }: { profile?: CWProfile; context: CWContext; controller: Pick<CWController, "arm" | "send" | "stop" | "acknowledgeStopped"> & Partial<Pick<SharedCWSession,"compose">>; state: CWState & Partial<SharedCWState>; radioProvider?: string; releaseOnly?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null), [width, setWidth] = useState(0);
+  const [confirmed, setConfirmed] = useState(false);
+  useEffect(() => { setConfirmed(false); }, [state.owner, state.error]);
+  useEffect(() => { if (!ref.current) return; const resize = new ResizeObserver(entries => setWidth(entries[0].contentRect.width)); resize.observe(ref.current); return () => resize.disconnect(); }, []);
+  const chosen = profile.showOnDesk ? profile.macros.filter(item => item.enabled && item.onDesk) : [];
+  const visible = Math.max(0, Math.min(chosen.length, Math.floor((width - 290) / 140)));
+  const blocked = releaseOnly || !state.armed || state.pending || profile.output === "winkeyer" && !!state.owner;
+  const preview = (macro: CWMacro) => { try { return expandCWMacro(macro.text, context, cwOutputLimit(profile.output, radioProvider)); } catch (error) { return error instanceof Error ? error.message : "Preview unavailable"; } };
+  return <div className="cw-desk" ref={ref}>
+    <div className="cw-desk-row" role="group" aria-label="CW macro controls">
+      <button type="button" className={state.armed ? "cw-armed" : ""} disabled={releaseOnly && !state.armed || state.pending || (!!state.owner || !!state.lease) && !state.armed} aria-pressed={state.armed} onClick={() => state.armed ? void controller.stop() : void controller.arm()}>{state.armed ? "Disarm CW" : "Arm CW"}</button>
+      <button type="button" className="cw-stop" disabled={!state.armed && !state.owner && !state.pending && !state.lease} onClick={() => void controller.stop()}><Square size={12} />Stop</button>
+      {chosen.slice(0, visible).map(macro => <button type="button" className={`cw-macro cw-color-${macro.color}`} key={macro.id} disabled={blocked} title={`${macro.label}: ${preview(macro)}`} onClick={() => void controller.send(macro, context)}><span>{macro.label}</span>{macro.shortcut && <kbd>{macro.shortcut}</kbd>}</button>)}
+      {chosen.length > visible && <select aria-label="More CW macros — select to send" value="" disabled={blocked} onChange={event => { const macro = chosen.find(item => item.id === Number(event.target.value)); if (macro) void controller.send(macro, context); }}><option value="">More macros · {chosen.length - visible}</option>{chosen.slice(visible).map(macro => <option key={macro.id} value={macro.id}>{macro.label}{macro.shortcut ? ` · ${macro.shortcut}` : ""}</option>)}</select>}
+      {!chosen.length && <span className="cw-key-only">CW shortcuts</span>}
+    </div>
+    <p className={state.error ? "cw-error" : "cw-state"} role="status">{state.error || state.message}</p>
+    {profile.output === "winkeyer" && state.winkeyer && <p className="cw-keyer-feedback" role="status">
+      {state.winkeyer.speed_source === "pot"
+        ? state.winkeyer.pot_wpm != null && state.winkeyer.pot_age_ms <= 2000 ? `Pot reported ${state.winkeyer.pot_wpm} WPM` : "Pot speed unavailable or stale"
+        : `Software speed ${state.winkeyer.requested_wpm ?? profile.winkeyer?.wpm ?? "unknown"} WPM requested`}
+      {state.winkeyer.reported_echo ? <> · Keyer report (uncorrelated): <samp>{state.winkeyer.reported_echo}</samp></> : " · No keyer echo reported"}
+      {state.winkeyer.configuration_uncertain ? " · Configuration uncertain; reconnect and apply while idle" : " · RF not verified"}
+    </p>}
+    {controller.compose && <CWComposition context={context} state={state} mode={profile.composition?.mode} disabled={releaseOnly} compose={controller.compose} stop={controller.stop}/>}
+    {state.error && state.owner && <div className="cw-recovery"><label><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I physically checked that CW has stopped</label><button type="button" disabled={!confirmed || state.pending} onClick={() => { controller.acknowledgeStopped(); setConfirmed(false); }}>Release CW guard</button></div>}
+  </div>;
+}

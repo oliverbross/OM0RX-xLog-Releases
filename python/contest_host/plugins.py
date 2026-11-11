@@ -1,0 +1,314 @@
+"""Finite registry of source-pinned plugins supported by the application adapter."""
+from dataclasses import dataclass
+from types import MappingProxyType
+
+
+RTTY_MODES = ("RTTY", "RTTY-R", "LSB-D", "USB-D", "AM-D", "FM-D",
+              "DIGI-U", "DIGI-L", "RTTYR", "PKTLSB", "PKTUSB")
+FULL_PINNED_BANDS = (
+    "2190m", "630m", "560m", "160m", "80m", "60m", "40m", "30m", "20m", "17m",
+    "15m", "12m", "10m", "8m", "6m", "5m", "4m", "2m", "1.25m", "70cm", "33cm",
+    "23cm", "13cm", "9cm", "6cm", "3cm", "1.25cm", "6mm", "4mm", "2.5mm", "2mm",
+    "1mm", "submm",
+)
+VHF_AND_UP_BANDS = (
+    "6m", "4m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "6cm",
+    "3cm", "1.25cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm",
+)
+
+
+@dataclass(frozen=True)
+class Plugin:
+    name: str
+    serial: bool = False
+    conditional_serial: bool = False
+    bands: tuple[str, ...] = ("160m", "80m", "40m", "20m", "15m", "10m")
+    modes: tuple[str, ...] = ("CW",)
+    allow_duplicate_commit: bool = False
+    matrix_trackers: tuple[str, ...] = ()
+    manual_enter: bool = False
+    clear_on_vfo_change: bool = False
+    filter_spot_ranges: bool = False
+    preview_required_fields: tuple[str, ...] = ()
+    duplicate_description: str = ""
+    sent_exchange_hint: str = "Sent Exchange"
+    overlay_choices: tuple[str, ...] = ("N/A", "CLASSIC", "ROOKIE", "TB-WIRES", "YOUTH")
+    export_formats: tuple[str, ...] = ("cabrillo", "adif")
+    reverse_history_fields: tuple[str, ...] = ()
+
+
+PLUGIN_REGISTRY = MappingProxyType({
+    "cq_ww_cw": Plugin("CQ WW CW", matrix_trackers=("countries", "zones")),
+    "cq_ww_ssb": Plugin("CQ WW SSB", modes=("SSB",), matrix_trackers=("countries", "zones"),
+                        manual_enter=True, clear_on_vfo_change=True, filter_spot_ranges=True,
+                        sent_exchange_hint="CQ Zone No."),
+    "cq_ww_rtty": Plugin(
+        "CQ WW RTTY",
+        bands=("80m", "40m", "20m", "15m", "10m"),
+        modes=RTTY_MODES,
+        matrix_trackers=("countries", "zones", "states"),
+        sent_exchange_hint="CQ Zone + (state/VE area)",
+    ),
+    "cq_wpx_cw": Plugin("CQ WPX CW", serial=True),
+    "cq_wpx_ssb": Plugin("CQ WPX SSB", serial=True, modes=("SSB",)),
+    "cq_wpx_rtty": Plugin("CQ WPX RTTY", serial=True,
+                            bands=("80m", "40m", "20m", "15m", "10m"), modes=RTTY_MODES),
+    "arrl_ss_cw": Plugin("ARRL Sweepstakes CW", serial=True,
+                         preview_required_fields=("other_2",),
+                         sent_exchange_hint="Prec Call Check Section", overlay_choices=("N/A",)),
+    "arrl_ss_phone": Plugin("ARRL Sweepstakes Phone", serial=True, modes=("SSB",),
+                            preview_required_fields=("other_2",),
+                            sent_exchange_hint="Prec Call Check Section", overlay_choices=("N/A",)),
+    "arrl_dx_cw": Plugin("ARRL DX CW", sent_exchange_hint="Power/State/Province"),
+    "arrl_dx_ssb": Plugin("ARRL DX SSB", modes=("SSB",), sent_exchange_hint="Power/State/Province"),
+    "naqp_cw": Plugin("NAQP CW", sent_exchange_hint="Name + SPC", reverse_history_fields=("name", "state")),
+    "naqp_ssb": Plugin("NAQP SSB", modes=("SSB",), sent_exchange_hint="Name + SPC", reverse_history_fields=("name", "state")),
+    "naqp_rtty": Plugin("NAQP RTTY", modes=RTTY_MODES, sent_exchange_hint="Name + SPC", reverse_history_fields=("name", "state")),
+    "phone_weekly_test": Plugin("PHONE WEEKLY TEST",
+                                bands=("160m", "80m", "40m", "20m", "15m"),
+                                modes=("SSB",), sent_exchange_hint="Name + SPC"),
+    "weekly_rtty": Plugin("WEEKLY RTTY TEST", bands=("80m", "40m", "20m", "15m", "10m"),
+                           modes=RTTY_MODES, sent_exchange_hint="Name + SPC"),
+    "icwc_mst": Plugin("ICWC Medium Speed Test", serial=True, sent_exchange_hint="Name"),
+    "cwt": Plugin("CWT"),
+    "cwo": Plugin("CWOPS - Open", serial=True, allow_duplicate_commit=True, sent_exchange_hint="Name"),
+    "k1usn_sst": Plugin("K1USN SLOW SPEED TEST"),
+    "trans_tasman": Plugin("Trans Tasman CW", serial=True, bands=("160m", "80m", "40m"),
+                            allow_duplicate_commit=True,
+                            duplicate_description="Worked on this band and mode in this 2-hour UTC block (08–10, 10–12, 12–14)."),
+    "oceania_dx_cw": Plugin("Oceania DX CW", serial=True, allow_duplicate_commit=True),
+    "oceania_dx_ssb": Plugin("Oceania DX SSB", serial=True, modes=("SSB",), allow_duplicate_commit=True),
+    "sac_cw": Plugin("SAC CW", serial=True),
+    "sac_ssb": Plugin("SAC SSB", serial=True, modes=("SSB",)),
+    "iaru_fieldday_r1_cw": Plugin("IARU FIELDDAY R1 DARC CW", serial=True),
+    "iaru_fieldday_r1_ssb": Plugin("IARU FIELDDAY R1 DARC SSB", serial=True, modes=("SSB",)),
+    "10_10_fall_cw": Plugin("10 10 FALL CW", bands=("10m",)),
+    "10_10_spring_cw": Plugin("10 10 SPRING CW", bands=("10m",)),
+    "10_10_winter_phone": Plugin("10 10 WINTER PHONE", bands=("10m",), modes=("SSB",)),
+    "10_10_summer_phone": Plugin("10 10 SUMMER PHONE", bands=("10m",), modes=("SSB",)),
+    "jidx_cw": Plugin("JIDX CW", sent_exchange_hint="Prefecture or CQ Zone"),
+    "jidx_ph": Plugin("JIDX PH", modes=("SSB",), sent_exchange_hint="Prefecture or CQ Zone"),
+    "aadx_cw": Plugin("AADX CW", sent_exchange_hint="Age (or 01)"),
+    "aadx_ssb": Plugin("AADX SSB", modes=("SSB",), sent_exchange_hint="Age (or 01)"),
+    "cq_160_cw": Plugin("CQ 160 CW", bands=("160m",), sent_exchange_hint="ST/Prov or DX CQ Zone"),
+    "cq_160_ssb": Plugin("CQ 160 SSB", bands=("160m",), modes=("SSB",),
+                           sent_exchange_hint="ST/Prov or DX CQ Zone"),
+    "euhfc": Plugin("EUHFC", modes=("CW", "SSB"),
+                     sent_exchange_hint="Lic. Year (2 digits)"),
+    "iaru_hf": Plugin("IARU HF", modes=("CW", "SSB"), sent_exchange_hint="ITU Zone"),
+    "arrl_10m": Plugin("ARRL 10M", conditional_serial=True, bands=("10m",), modes=("CW", "SSB"),
+                       sent_exchange_hint="State/Province, serial or ITU region"),
+    "arrl_160m": Plugin("ARRL 160-Meter", bands=("160m",),
+                        sent_exchange_hint="ARRL/RAC section or DX CQ zone"),
+    "arrl_field_day": Plugin("ARRL Field Day", modes=("CW", "SSB", "RTTY", "AM", "FM"),
+                             bands=("160m", "80m", "40m", "20m", "15m", "10m",
+                                    "6m", "2m", "1.25m", "70cm", "33cm", "23cm"),
+                             sent_exchange_hint="Class + ARRL/RAC section"),
+    "arrl_rtty_ru": Plugin("ARRL RTTY Roundup", conditional_serial=True,
+                           bands=("80m", "40m", "20m", "15m", "10m"), modes=RTTY_MODES,
+                           sent_exchange_hint="State/province or #"),
+    "arrl_vhf_jan": Plugin("ARRL VHF JAN", modes=("CW", "SSB", "RTTY", "AM", "FM"),
+                           bands=("6m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm",
+                                  "6cm", "3cm", "1.25cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm"),
+                            sent_exchange_hint="4-character grid square", reverse_history_fields=("locator",)),
+    "arrl_vhf_jun": Plugin("ARRL VHF JUN", modes=("CW", "SSB", "RTTY", "AM", "FM"),
+                           bands=("6m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm",
+                                  "6cm", "3cm", "1.25cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm"),
+                            sent_exchange_hint="4-character grid square", reverse_history_fields=("locator",)),
+    "arrl_vhf_sep": Plugin("ARRL VHF SEP", modes=("CW", "SSB", "RTTY", "AM", "FM"),
+                           bands=("6m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm",
+                                  "6cm", "3cm", "1.25cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm"),
+                            sent_exchange_hint="4-character grid square", reverse_history_fields=("locator",)),
+    "ea_majestad_cw": Plugin("His Maj. King of Spain Contest, CW", conditional_serial=True,
+                             sent_exchange_hint="Province or #"),
+    "ea_majestad_ssb": Plugin("His Maj. King of Spain Contest, SSB", conditional_serial=True,
+                              modes=("SSB",), sent_exchange_hint="Province or #"),
+    "ref_cw": Plugin("French REF DX contest - CW", conditional_serial=True,
+                     bands=("80m", "40m", "20m", "15m", "10m"),
+                     sent_exchange_hint="Department/prefix or #"),
+    "ref_ssb": Plugin("French REF DX contest - SSB", conditional_serial=True,
+                      bands=("80m", "40m", "20m", "15m", "10m"), modes=("SSB",),
+                      sent_exchange_hint="Department/prefix or #"),
+    "rsgb_80m_cc": Plugin("RSGB 80M CC", serial=True, bands=("80m",),
+                          sent_exchange_hint="Serial number"),
+    "rsgb_commonwealth_beru": Plugin("RSGB Commonwealth BERU", serial=True,
+                                     bands=("80m", "40m", "20m", "15m", "10m"),
+                                     sent_exchange_hint="Serial number (optional HQ)"),
+    "es_field_day": Plugin("ES FIELD DAY", serial=True, modes=("CW", "SSB"),
+                           allow_duplicate_commit=True,
+                           duplicate_description="Worked on this band and mode in this configured 30-minute period; outside the schedule, band/mode applies.",
+                           sent_exchange_hint="Serial + Estonian region"),
+    "es_ll_kv": Plugin("ES LL KV", serial=True, modes=("CW", "SSB"),
+                       allow_duplicate_commit=True, sent_exchange_hint="Serial number",
+                       duplicate_description="Worked on this band and mode in this configured 15-minute period; outside the schedule, band/mode applies."),
+    "es_manual_key": Plugin("ES MANUAL KEY", serial=True, allow_duplicate_commit=True,
+                            duplicate_description="Worked on this band and mode in this configured 15-minute period; outside the schedule, band/mode applies.",
+                            sent_exchange_hint="Seniority + serial"),
+    "es_open": Plugin("ES OPEN", serial=True, bands=("80m", "40m"), modes=("CW", "SSB"),
+                      allow_duplicate_commit=True, sent_exchange_hint="Serial number",
+                      duplicate_description="Worked on this band and mode in this configured one-hour period; outside the schedule, band/mode applies."),
+    "hadx": Plugin("HA DX", conditional_serial=True, modes=("CW", "SSB"),
+                   sent_exchange_hint="# or County"),
+    "helvetia": Plugin("HELVETIA", conditional_serial=True, modes=("CW", "SSB"),
+                       sent_exchange_hint="Canton or #"),
+    "pacc": Plugin("PACC", conditional_serial=True, modes=("CW", "SSB"),
+                   sent_exchange_hint="# or Province"),
+    "spdx": Plugin("SPDX", conditional_serial=True, modes=("CW", "SSB"),
+                   sent_exchange_hint="Province/Territory"),
+    "ari_dx": Plugin("ARI International DX", conditional_serial=True,
+                     bands=("80m", "40m", "20m", "15m", "10m"), modes=("CW", "SSB", "RTTY"),
+                     sent_exchange_hint="Province or #", overlay_choices=("N/A",)),
+    "darc_xmas": Plugin("DARC XMAS", conditional_serial=True, bands=("80m", "40m"),
+                        modes=("CW", "SSB"), sent_exchange_hint="DOK/NM or #", overlay_choices=("N/A",)),
+    "eudx": Plugin("EUDXC", modes=("CW", "SSB"),
+                   sent_exchange_hint="ITU zone or EU Union region", overlay_choices=("N/A",)),
+    "lz-dx": Plugin("LZ DX", modes=("CW", "SSB"),
+                    sent_exchange_hint="District or ITU zone", overlay_choices=("N/A",)),
+    "wag": Plugin("WAG", conditional_serial=True,
+                  bands=("80m", "40m", "20m", "15m", "10m"), modes=("CW", "SSB"),
+                  sent_exchange_hint="DOK/NM or #", overlay_choices=("N/A",)),
+    "ari_40_80": Plugin("ARI 40 80", bands=("80m", "40m"), modes=("CW", "SSB"),
+                        sent_exchange_hint="Automobile Code", overlay_choices=("N/A",)),
+    "ea_rtty": Plugin("EA RTTY", conditional_serial=True,
+                      bands=("80m", "40m", "20m", "15m", "10m"), modes=RTTY_MODES,
+                      sent_exchange_hint="Province or #", overlay_choices=("N/A",)),
+    "ok1wc": Plugin("OK1WC Memorial Contest (MWC)", serial=True, bands=("80m", "40m"),
+                    sent_exchange_hint="Serial number", overlay_choices=("N/A",)),
+    "ssa_mt_cw": Plugin("SSA MT CW", serial=True, bands=("80m", "40m"),
+                        sent_exchange_hint="Serial + locator", overlay_choices=("N/A",)),
+    "ssa_mt_ssb": Plugin("SSA MT SSB", serial=True, bands=("80m", "40m"), modes=("SSB",),
+                         sent_exchange_hint="Serial + locator", overlay_choices=("N/A",)),
+    "dxpedition": Plugin("DX-Pedition", modes=("CW", "SSB"), allow_duplicate_commit=True,
+                           overlay_choices=("N/A",), export_formats=("adif",)),
+    "general_logging": Plugin("General Logging", modes=("CW", "SSB"), allow_duplicate_commit=True,
+                                overlay_choices=("N/A",), export_formats=("adif",)),
+    "randomgram": Plugin("RandomGram", allow_duplicate_commit=True, overlay_choices=("N/A",),
+                           export_formats=("adif",)),
+    "qso_party_rst": Plugin("QSO PARTY RST", modes=("CW", "SSB"), allow_duplicate_commit=True,
+                             bands=("160m", "80m", "40m", "20m", "15m", "10m", "6m", "2m", "70cm"),
+                             sent_exchange_hint="County", overlay_choices=("N/A",)),
+    "qso_party_sn": Plugin("QSO PARTY SN", serial=True, modes=("CW", "SSB"), allow_duplicate_commit=True,
+                            bands=("160m", "80m", "40m", "20m", "15m", "10m", "6m", "2m", "70cm"),
+                            sent_exchange_hint="County", overlay_choices=("N/A",)),
+    "ca_qso_party": Plugin("California QSO Party", serial=True, modes=("CW", "SSB"),
+                           sent_exchange_hint="# + state/province or CA county", overlay_choices=("N/A",)),
+    "canada_day": Plugin("CANADA DAY", conditional_serial=True, bands=FULL_PINNED_BANDS, modes=("CW", "SSB"),
+                         sent_exchange_hint="# + province/territory", overlay_choices=("N/A",)),
+    "cqws": Plugin("CQ WORLD SCOUT", bands=FULL_PINNED_BANDS, modes=("CW", "SSB"),
+                   sent_exchange_hint="Station type", overlay_choices=("N/A",)),
+    "darc_schwaben": Plugin("DARC SCHWABEN", conditional_serial=True,
+                            bands=("80m", "40m", "2m", "70cm"), modes=("CW", "SSB", "FM"),
+                            sent_exchange_hint="DOK/NM or # (+Locator for VHF)", overlay_choices=("N/A",)),
+    # The bounded host advertises only the pinned plugin's modes whose scoring
+    # and Cabrillo/ADIF mapping it can faithfully represent.
+    "winter_field_day": Plugin("Winter Field Day", bands=FULL_PINNED_BANDS,
+                               modes=("CW", "SSB", "RTTY", "AM", "FM"),
+                               sent_exchange_hint="Class + section", overlay_choices=("N/A",)),
+    "agcw_qrp": Plugin("AGCW QRP", conditional_serial=True,
+                       bands=("80m", "40m", "20m", "15m", "10m"),
+                       sent_exchange_hint="# power-class member-number", overlay_choices=("N/A",)),
+    "raem": Plugin("RAEM", serial=True, bands=("80m", "40m", "20m", "15m", "10m"),
+                   sent_exchange_hint="Latitude/longitude", overlay_choices=("N/A",)),
+    "rda_contest": Plugin("RDA Contest", conditional_serial=True, modes=("CW", "SSB"),
+                          sent_exchange_hint="# or RDA code", overlay_choices=("N/A",)),
+    "rdxc": Plugin("RDXC", serial=True, modes=("CW", "SSB"),
+                   sent_exchange_hint="Serial or oblast", overlay_choices=("N/A",)),
+    "rsgb_iota": Plugin("RSGB-IOTA", conditional_serial=True,
+                        bands=("80m", "40m", "20m", "15m", "10m"), modes=("CW", "SSB"),
+                        sent_exchange_hint="# or # and IOTA reference", overlay_choices=("N/A",)),
+    "stew_perry_topband": Plugin("Stew Perry Topband", bands=("160m",),
+                                 sent_exchange_hint="4-character grid square", overlay_choices=("N/A",)),
+    "ukeidx": Plugin("UKEI-DX", conditional_serial=True,
+                     bands=("80m", "40m", "20m", "15m", "10m"), modes=("CW", "SSB"),
+                     sent_exchange_hint="# or # and district", overlay_choices=("N/A",)),
+    "wia_remembrance": Plugin("WIA REMEMBRANCE", conditional_serial=True,
+                              bands=("160m", "80m", "40m", "20m", "15m", "10m", "6m", "2m",
+                                     "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "6cm", "3cm",
+                                     "1.25cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm"),
+                              modes=("CW", "SSB", "FM", *RTTY_MODES), sent_exchange_hint="Years licensed",
+                              duplicate_description="Worked on this band and mode within the preceding three hours.",
+                              overlay_choices=("N/A",)),
+    "cq_ww_vhf": Plugin("CQ WW VHF", bands=("6m", "2m"),
+                        modes=("CW", "SSB", "FM", *RTTY_MODES),
+                        duplicate_description="Worked on this band from this sent grid square.",
+                        sent_exchange_hint="4-character grid square", overlay_choices=("N/A",),
+                        reverse_history_fields=("locator",)),
+    "darc_vhf": Plugin("DARC VHF", serial=True,
+                       bands=("2m", "70cm", "23cm", "13cm", "9cm", "6cm", "3cm", "1.25cm",
+                              "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm"),
+                       modes=("CW", "SSB", "FM"), sent_exchange_hint="# + 6char grid",
+                       overlay_choices=("N/A",), export_formats=("cabrillo", "adif", "edi")),
+    "john_moyle_field_day": Plugin(
+        "John Moyle Field Day", serial=True,
+        bands=("160m", "80m", "40m", "20m", "15m", "10m", *VHF_AND_UP_BANDS[:-1]),
+        modes=("CW", "SSB", "FM", "AM"), sent_exchange_hint="#", overlay_choices=("N/A",),
+        duplicate_description="Worked on this band and mode group in this three-hour UTC block.",
+    ),
+    "labre_rs_digi": Plugin("LABRE-RS Digi", bands=("80m", "40m", "20m", "15m", "10m"),
+                            modes=RTTY_MODES, sent_exchange_hint="4-character grid square",
+                            overlay_choices=("N/A",)),
+    "nac_vhf": Plugin("NAC VHF", serial=True, bands=VHF_AND_UP_BANDS[:-1],
+                      modes=("CW", "SSB"), sent_exchange_hint="# + 6char grid",
+                      overlay_choices=("N/A",), export_formats=("cabrillo", "adif", "edi")),
+    "ta_vhf_uhf_contest": Plugin("TA VHF UHF", serial=True, bands=("6m", "2m", "70cm"),
+                                 modes=("CW", "SSB"), sent_exchange_hint="# + 6char grid",
+                                 overlay_choices=("N/A",), export_formats=("adif", "edi")),
+    "vhf_sprint": Plugin("VHF SPRINT",
+                         bands=("6m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm",
+                                "6cm", "3cm", "1.25cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "submm"),
+                         modes=("CW", "SSB"), sent_exchange_hint="4-character grid square",
+                         overlay_choices=("N/A",)),
+    "wae_cw": Plugin("WAE CW", serial=True, bands=("80m", "40m", "20m", "15m", "10m"), manual_enter=True),
+    "wae_ssb": Plugin("WAE SSB", serial=True, modes=("SSB",), bands=("80m", "40m", "20m", "15m", "10m"), manual_enter=True),
+    "wae_rtty": Plugin("WAE RTTY", serial=True, modes=("RTTY",), bands=("80m", "40m", "20m", "15m", "10m"), manual_enter=True),
+    "okom_dx_cw": Plugin("OK/OM DX CW", conditional_serial=True, allow_duplicate_commit=True,
+                          sent_exchange_hint="OK/OM district; DX # (reserved serial)", overlay_choices=("N/A",),
+                          duplicate_description="First valid contact with this callsign on this band scores; retain later duplicates in the log."),
+})
+FIRST_PARTY_PLUGINS = frozenset({"wae_cw", "wae_ssb", "wae_rtty", "okom_dx_cw"})
+PLUGINS = MappingProxyType({key: plugin.name for key, plugin in PLUGIN_REGISTRY.items()})
+CQ_WW_PLUGINS = frozenset({"cq_ww_cw", "cq_ww_ssb", "cq_ww_rtty"})
+SERIAL_PLUGINS = frozenset(key for key, plugin in PLUGIN_REGISTRY.items() if plugin.serial)
+CONDITIONAL_SERIAL_PLUGINS = frozenset(
+    key for key, plugin in PLUGIN_REGISTRY.items() if plugin.conditional_serial)
+SENTNR_FIELD_PLUGINS = SERIAL_PLUGINS | CONDITIONAL_SERIAL_PLUGINS
+TEN_TEN_PLUGINS = frozenset({"10_10_fall_cw", "10_10_spring_cw", "10_10_winter_phone", "10_10_summer_phone"})
+NAME_SPC_PLUGINS = frozenset({"naqp_cw", "naqp_ssb", "naqp_rtty", "phone_weekly_test"})
+NAME_SPC_ENTRY_PLUGINS = NAME_SPC_PLUGINS | frozenset({"weekly_rtty"})
+RTTY_PLUGINS = frozenset({"cq_ww_rtty", "cq_wpx_rtty", "naqp_rtty", "weekly_rtty", "arrl_rtty_ru",
+                          "ea_rtty", "wia_remembrance", "cq_ww_vhf", "labre_rs_digi"})
+CONFIGURED_SENTNR_PLUGINS = frozenset({"cq_ww_rtty", "naqp_rtty", "weekly_rtty",
+                                       "aadx_cw", "aadx_ssb", "euhfc", "iaru_hf", "eudx", "lz-dx", "cqws"})
+DISPLAY_SENTNR_PLUGINS = frozenset({"euhfc", "iaru_hf", "eudx", "lz-dx", "arrl_rtty_ru",
+                                    "arrl_vhf_jan", "arrl_vhf_jun", "arrl_vhf_sep"})
+ARRL_DX_PLUGINS = frozenset({"arrl_dx_cw", "arrl_dx_ssb"})
+JIDX_PLUGINS = frozenset({"jidx_cw", "jidx_ph"})
+AADX_PLUGINS = frozenset({"aadx_cw", "aadx_ssb"})
+CQ_160_PLUGINS = frozenset({"cq_160_cw", "cq_160_ssb"})
+EA_MAJESTAD_PLUGINS = frozenset({"ea_majestad_cw", "ea_majestad_ssb"})
+REF_PLUGINS = frozenset({"ref_cw", "ref_ssb"})
+RSGB_PLUGINS = frozenset({"rsgb_80m_cc", "rsgb_commonwealth_beru"})
+ESTONIAN_PLUGINS = frozenset({"es_field_day", "es_ll_kv", "es_manual_key", "es_open"})
+EUROPEAN_DX_PLUGINS = frozenset({"hadx", "helvetia", "pacc", "spdx"})
+CENTRAL_EUROPEAN_PLUGINS = frozenset({"ari_dx", "darc_xmas", "eudx", "lz-dx", "wag"})
+EUROPEAN_HF_PLUGINS = frozenset({"ari_40_80", "ea_rtty", "ok1wc", "ssa_mt_cw", "ssa_mt_ssb"})
+TYPE4_UTILITY_PLUGINS = frozenset({"dxpedition", "general_logging", "randomgram", "qso_party_rst", "qso_party_sn"})
+NO_MULTIPLIER_PLUGINS = frozenset({"dxpedition", "general_logging", "randomgram", "darc_schwaben",
+                                   "raem", "stew_perry_topband", "wia_remembrance", "darc_vhf",
+                                   "ta_vhf_uhf_contest"})
+QSO_PARTY_PLUGINS = frozenset({"qso_party_rst", "qso_party_sn"})
+SENT_FIELD_SERIAL_PLUGINS = frozenset({"qso_party_sn", "ca_qso_party", "raem"})
+SSA_MT_PLUGINS = frozenset({"ssa_mt_cw", "ssa_mt_ssb"})
+ARRL_VHF_PLUGINS = frozenset({"arrl_vhf_jan", "arrl_vhf_jun", "arrl_vhf_sep"})
+SIMPLE_MULTIPLIER_PLUGINS = frozenset({
+    "sac_cw", "sac_ssb", "iaru_fieldday_r1_cw", "iaru_fieldday_r1_ssb",
+    "euhfc", "arrl_10m", "arrl_160m", "arrl_field_day", "arrl_rtty_ru",
+}) | JIDX_PLUGINS | AADX_PLUGINS | CQ_160_PLUGINS | EA_MAJESTAD_PLUGINS | REF_PLUGINS | RSGB_PLUGINS | ESTONIAN_PLUGINS | EUROPEAN_DX_PLUGINS
+SIMPLE_MULTIPLIER_PLUGINS |= ARRL_VHF_PLUGINS
+SIMPLE_MULTIPLIER_PLUGINS |= CENTRAL_EUROPEAN_PLUGINS
+SIMPLE_MULTIPLIER_PLUGINS |= EUROPEAN_HF_PLUGINS
+SIMPLE_MULTIPLIER_PLUGINS |= QSO_PARTY_PLUGINS
+SIMPLE_MULTIPLIER_PLUGINS |= frozenset({"ca_qso_party", "canada_day", "cqws", "winter_field_day"})
+SIMPLE_MULTIPLIER_PLUGINS |= frozenset({"agcw_qrp", "rda_contest", "rdxc", "rsgb_iota", "ukeidx"})
+SIMPLE_MULTIPLIER_PLUGINS |= frozenset({"cq_ww_vhf", "john_moyle_field_day", "labre_rs_digi",
+                                        "vhf_sprint"})

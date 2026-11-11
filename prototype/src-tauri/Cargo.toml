@@ -1,0 +1,50 @@
+[package]
+name = "xlog-prototype"
+version = "1.6.0"
+description = "Shared xLog desktop with integrated station and cluster services"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[features]
+default = []
+contesting-test = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "=2.6.0"
+serialport = { version = "4.9", default-features = false }
+tempfile = "3.27"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+libc = "0.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rfd = "0.16"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "=0.18.2"
+rtrb = "0.3"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSOpenPanel", "NSSavePanel", "NSAlert"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
+
+[profile.release]
+# Avoid rust-objcopy LINKEDIT misalignment on current macOS toolchains.
+# https://github.com/rust-lang/rust/issues/157750
+strip = "none"
+
+# GTK3 requires glib 0.18. The public crate misses gtk-rs/gtk-rs-core#1343.
+[patch.crates-io]
+glib = { path = "../vendor/glib-0.18.5" }
+
+[profile.release.build-override]
+debug = true
+strip = "none"

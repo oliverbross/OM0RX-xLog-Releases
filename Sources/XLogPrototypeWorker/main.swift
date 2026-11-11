@@ -1,0 +1,199 @@
+import Foundation
+import XLogPrototypeSupport
+#if os(Windows)
+import ucrt
+#elseif canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
+let worker = PrototypeWorker()
+let output = FileHandle.standardOutput
+let workerArguments = Array(CommandLine.arguments.dropFirst())
+
+let runtimeProfile: AppRuntimeProfile
+let operatingModule: WorkerOperatingModule
+do {
+    runtimeProfile = try AppRuntimeProfile.resolve(arguments: workerArguments,
+        executableURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL)
+    try AppRuntimeProfile.configure(runtimeProfile)
+    operatingModule = try WorkerOperatingModule.resolve(environment: ProcessInfo.processInfo.environment)
+} catch {
+    FileHandle.standardError.write(Data("Runtime profile validation failed.\n".utf8))
+    exit(2)
+}
+
+private actor OutputWriter {
+    func send(_ response: Data) {
+        var frame = response
+        frame.append(10)
+        FileHandle.standardOutput.write(frame)
+    }
+}
+
+private actor Admission {
+    private var running = 0
+    private let limit = 16
+    func enter() -> Bool {
+        guard running < limit else { return false }
+        running += 1
+        return true
+    }
+    func leave() { running -= 1 }
+}
+
+private let writer = OutputWriter()
+private let admission = Admission()
+func overloaded(_ input: Data?) -> Data {
+    let object = input.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    let id = (object?["id"] as? String).flatMap { $0.utf8.count <= 128 ? $0 : nil } ?? ""
+    return (try? JSONSerialization.data(withJSONObject: [
+        "id": id, "ok": false,
+        "error": ["code": "worker_busy", "message": "Station service is busy; try again."]
+    ])) ?? Data()
+}
+
+func emit(_ input: Data?, using liveWorker: LiveWorker) async {
+    let response: Data
+    if let input { response = await liveWorker.response(to: input) }
+    else { response = PrototypeWorker().oversizedResponse() }
+    await writer.send(response)
+}
+
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
+    let response = worker.response(to: Data("{\"id\":\"self-test\",\"method\":\"self_test\",\"params\":{}}".utf8))
+    output.write(response)
+    output.write(Data([10]))
+    let object = try? JSONSerialization.jsonObject(with: response) as? [String: Any]
+    exit(object?["ok"] as? Bool == true ? 0 : 1)
+} else if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--recorder-acceptance" {
+    do {
+        let result = try await ContestRecorderAcceptance.run()
+        output.write(try JSONSerialization.data(withJSONObject: ["ok": true, "result": result], options: [.sortedKeys]))
+        output.write(Data([10]))
+        exit(0)
+    } catch {
+        // This flag owns only disposable fixture data; keep diagnostics bounded.
+        let diagnostic = String(describing: error)
+        output.write((try? JSONSerialization.data(withJSONObject: ["ok":false,"error":String(diagnostic.prefix(512))])) ?? Data())
+        output.write(Data([10]))
+        exit(1)
+    }
+} else if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--local-logbook-self-test" {
+    do {
+        let result = try LocalLogbookSelfTest.run()
+        output.write(try JSONSerialization.data(withJSONObject: ["id": "local-logbook-self-test", "ok": true, "result": result], options: [.sortedKeys]))
+        output.write(Data([10]))
+        exit(0)
+    } catch {
+        // Never print raw dependency errors, paths, preferences or contact data.
+        output.write(Data("{\"id\":\"local-logbook-self-test\",\"ok\":false,\"error\":{\"code\":\"local_self_test_failed\",\"message\":\"Local logbook acceptance failed.\"}}\n".utf8))
+        exit(1)
+    }
+} else if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--contest-runtime-self-test" {
+    do {
+        let result = try await ContestRuntimeSelfTest.run()
+        output.write(try JSONSerialization.data(withJSONObject: ["id": "contest-runtime-self-test", "ok": true, "result": result], options: [.sortedKeys]))
+        output.write(Data([10]))
+        exit(0)
+    } catch {
+        let stage = (error as? ContestRuntimeSelfTest.Failure)?.stage ?? "runtime"
+        output.write((try? JSONSerialization.data(withJSONObject: ["id": "contest-runtime-self-test", "ok": false,
+            "error": ["code": "contest_runtime_self_test_failed", "stage": stage,
+                      "message": "Bundled contest runtime acceptance failed."]], options: [.sortedKeys])) ?? Data())
+        output.write(Data([10]))
+        exit(1)
+    }
+} else if let localAcceptance = AppRuntimeProfile.workerServiceLocalAcceptance(arguments: workerArguments) {
+    let acceptance: LocalAcceptanceSession?
+    do { acceptance = localAcceptance ? try LocalAcceptanceSession() : nil }
+    catch {
+        FileHandle.standardError.write(Data("Could not create isolated local acceptance session.\n".utf8))
+        exit(1)
+    }
+    let liveWorker = acceptance?.worker ?? LiveWorker.processWorker(
+        operatingModule: operatingModule, runtimeProfile: runtimeProfile)
+    // Protocol admission must not wait behind reference/provider startup. The
+    // worker remains responsive while those owners initialize, and EOF fences
+    // the task through the normal terminal-shutdown path below.
+    let backgroundServices = Task { await liveWorker.startBackgroundServices() }
+    var lines = WorkerLineReader()
+    #if os(Windows)
+    // Prevent CRT text-mode CRLF translation from altering byte limits/framing.
+    _ = ucrt._setmode(0, _O_BINARY)
+    #endif
+    // Requests have no group result to consume. An ordinary TaskGroup retains
+    // every completed child until next()/scope exit, growing for the lifetime
+    // of this pipe even though Admission bounds the *running* requests at 16.
+    let retirement = await withDiscardingTaskGroup(returning: LiveWorkerShutdownOutcome.self) { group in
+    func dispatch(_ requests: [Data?]) async {
+        for request in requests {
+            if await admission.enter() {
+                group.addTask {
+                    await emit(request, using: liveWorker)
+                    await admission.leave()
+                }
+            } else {
+                // A saturated lane rejects immediately with the same request
+                // ID; it never builds an unbounded queue behind slow I/O.
+                await writer.send(overloaded(request))
+            }
+        }
+    }
+    while true {
+        // Foundation read(upToCount:) may wait for the full count on a pipe.
+        // Native reads return the available fragment without waiting for EOF.
+        let (count, chunk, readError) = await Task.detached {
+            var bytes = [UInt8](repeating: 0, count: 4096)
+            let count = bytes.withUnsafeMutableBytes { buffer -> Int in
+            #if os(Windows)
+            return Int(ucrt._read(0, buffer.baseAddress, UInt32(buffer.count)))
+            #elseif canImport(Darwin)
+            return Darwin.read(STDIN_FILENO, buffer.baseAddress, buffer.count)
+            #else
+            return Glibc.read(STDIN_FILENO, buffer.baseAddress, buffer.count)
+            #endif
+            }
+            return (count, Data(bytes.prefix(max(0, count))), errno)
+        }.value
+        if count == 0 { break }
+        if count < 0 {
+            #if !os(Windows)
+            if readError == EINTR { continue }
+            #endif
+            FileHandle.standardError.write(Data("Worker input stream failed.\n".utf8))
+            break
+        }
+        var requests: [Data?] = []
+        lines.consume(chunk) { requests.append($0) }
+        await dispatch(requests)
+    }
+    var requests: [Data?] = []
+    lines.finish { requests.append($0) }
+    await dispatch(requests)
+    // EOF is the graceful shutdown signal. Retire station ownership before
+    // waiting on unrelated slow service/logbook work so RF releases are not
+    // delayed behind a network lookup or database import.
+    backgroundServices.cancel()
+    let retirement = acceptance == nil ? await liveWorker.shutdownOutcome() : .clean
+    await backgroundServices.value
+    // Returning from the discarding group still joins every admitted request.
+    // Keep station retirement before that join and fatal exit after it.
+    return retirement
+    }
+    if !retirement.permitsRestart {
+        FileHandle.standardError.write(Data("Background delivery retirement failed.\n".utf8))
+        exit(retirement.rawValue)
+    }
+    if let acceptance {
+        do { try await acceptance.close() }
+        catch {
+            FileHandle.standardError.write(Data("Could not clean isolated local acceptance session.\n".utf8))
+            exit(1)
+        }
+    }
+} else {
+    FileHandle.standardError.write(Data("Usage: xlog-prototype-worker [--self-test | --local-logbook-self-test | --contest-runtime-self-test | [--runtime-profile=contesting-test] [--local-ui-acceptance]]\n".utf8))
+    exit(2)
+}

@@ -1,0 +1,73 @@
+OM0RX-xLog
+Copyright © 2026 Oliver Bross OM0RX
+
+This product uses public amateur-radio reference data supplied by its configured
+sources. Those datasets remain subject to their respective providers' terms.
+
+The OM0RX-xLog icon was created specifically for this project.
+
+Bundled contest country prefixes are from Jim Reisert AD1C's Contest Country
+Files #3533 (12 October 2025). cty.csv is the published file with LF line
+endings. The original permission notice is in
+Sources/XLogCore/Resources/CTY-COPYRIGHT.txt.
+Source: https://www.country-files.com/cty/download/3533/cty-3533.zip
+
+The dated country reference pack uses country tables developed by Martin OK1RR,
+distributed by CQRLOG at revision 4adb0e70bf29faefc3b203bc355796cd0c6201fe.
+The data is separately credited and is not covered by the upstream parser's
+GPL v2 licence. The source table hashes and normalization details are in the
+pack itself. See https://github.com/ok2cqr/cqrlog-cnty-files/blob/4adb0e70bf29faefc3b203bc355796cd0c6201fe/data/README.md
+
+DXCC map geometry: amazingproducer/dxcc-world-map, pinned in
+Sources/XLogCore/Resources/DXCC_BOUNDARIES_SOURCE.md. Ham Mission Control is
+adapted from Billy NZ3C's MIT-licensed project; its notices, asset origins and
+hashes are under prototype/vendor/ham-mission-control and
+prototype/public/hm-control-assets. Individual assets and reference data are
+subject to their credited providers' terms.
+
+The desktop application includes code adapted from
+OM0RX-xCluster by Oliver Bross OM0RX, GPL-3.0-only, source revision
+776b7b04ffa5a9057f1e909339393549a103836b.
+
+The Mac direct-station integration is based on OM0RX-xCat XCatCore by
+Oliver Bross OM0RX, GPL-3.0-only. Original source revision:
+b8f2e95527425247623dae366f94114bc0e1e94e, with integration-time source
+diff SHA-256 01439189a7d6aac7356c5cb36a1b8c9c9015a4185d3ab1837f9d917d750d824d.
+
+The read-only chaser and DX calendar are independently implemented from the
+ShackCQ GPL-3.0-only behavioral contracts at revision
+f5bdbd9186f33d3a257971a08a222ae622a9c66e. Public spot publishers and 425DXN retain
+their own data terms and visible source attribution. No third-party calendar
+code or raw provider data is bundled.
+
+The initial CQ WW CW, CQ WPX CW, CQ WW SSB, CQ WPX SSB, Oceania DX CW,
+Oceania DX SSB, SAC CW, SAC SSB, the isolated NAQP CW/SSB/RTTY preview,
+and the inactive ARRL RTTY Roundup station-policy preview
+in Sources/XContestCore/PilotRules.swift, Sources/XContestCore/OceaniaRules.swift,
+Sources/XContestCore/SACRules.swift, Sources/XContestCore/Cabrillo.swift,
+Sources/XContestCore/NAQPRules.swift, and Sources/XContestCore/ARRLRTTYRoundupRule.swift
+is a Swift translation adapted from
+Not1MM by Michael Bridak (GPL-3.0-or-later), using Oliver Bross's read-only
+contest-sw fork at revision 7c8b499225a73f7f8f792246881bd7aefc05452f. The ARRL
+comparison additionally uses `not1mm/plugins/arrl_rtty_ru.py`; operational rule
+authority remains the independently pinned ARRL primary documents.
+The translated source paths are not1mm/plugins/cq_ww_cw.py,
+not1mm/plugins/cq_wpx_cw.py, not1mm/plugins/cq_ww_ssb.py,
+not1mm/plugins/cq_wpx_ssb.py, not1mm/plugins/oceania_dx_cw.py,
+not1mm/plugins/oceania_dx_ssb.py, not1mm/plugins/sac_cw.py,
+not1mm/plugins/sac_ssb.py, not1mm/lib/ham_utility.py,
+not1mm/plugins/naqp_cw.py, not1mm/plugins/naqp_ssb.py,
+not1mm/plugins/naqp_rtty.py, not1mm/plugins/arrl_rtty_ru.py,
+not1mm/lib/database.py and duplicate dispatch in not1mm/__main__.py. The
+translation was modified for OM0RX-xLog on 17-18 October 2026.
+The NAQP export layout also references the NCJ Cabrillo template at
+https://ncjweb.com/NAQP_Cabrillo_Template.txt and the ADIF 3.1.8 annotated
+specification at https://www.adif.org/318/ADIF_318_annotated.htm, both retrieved
+18 October 2026.
+
+The Linux GTK3 build uses gtk-rs glib 0.18.5 (MIT), with the upstream fix
+https://github.com/gtk-rs/gtk-rs-core/pull/1343 for RUSTSEC-2024-0429.
+The original crates.io archive has SHA-256
+233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5.
+Only src/variant_iter.rs changes from that archive, applying the two changed
+lines from upstream. See prototype/vendor/glib-0.18.5/LICENSE and COPYRIGHT.

@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Native Ubuntu packaging/audit. Parses standard ldd output, never ELF bytes."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+PRODUCT_NAME = 'OM0RX-xLog'
+MAINTAINER = 'Oliver Bross <oliver@bross.eu>'
+# These internal paths are also used by installed/relocated acceptance harnesses.
+STAGE_NAME = 'om0rx-xlog-prototype-linux-amd64'
+INSTALL_PATH = '/opt/om0rx-xlog-prototype'
+
+
+def application_metadata(root):
+    configuration = root / 'prototype/src-tauri/tauri.conf.json'
+    configuration_bytes = configuration.read_bytes()
+    source = json.loads(configuration_bytes)
+    version = source.get('version')
+    number = r'(?:0|[1-9][0-9]*)'
+    suffix = r'[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*'
+    version_pattern = rf'{number}\.{number}\.{number}(?:-{suffix})?(?:\+{suffix})?'
+    if (source.get('productName') != PRODUCT_NAME or not isinstance(version, str)
+            or not re.fullmatch(version_pattern, version)):
+        raise RuntimeError('Expected OM0RX-xLog application name and a valid application version')
+    channel = 'prerelease' if '-' in version.split('+')[0] else 'stable'
+    return {'productName': PRODUCT_NAME, 'version': version, 'releaseChannel': channel,
+            'maintainer': MAINTAINER,
+            'applicationConfigurationSHA256': hashlib.sha256(configuration_bytes).hexdigest()}
+
+
+def write_debian_metadata(deb, application, dependencies):
+    (deb / 'DEBIAN').mkdir()
+    # Debian sorts prereleases before their stable version using '~'. Keep the
+    # original application SemVer in runtime-manifest.json for exact provenance.
+    debian_version = application['version'].replace('-', '~', 1) if application['releaseChannel'] == 'prerelease' else application['version']
+    label = ' (prerelease)' if application['releaseChannel'] == 'prerelease' else ''
+    (deb / 'DEBIAN/control').write_text(
+        f'Package: om0rx-xlog\nVersion: {debian_version}\nArchitecture: amd64\n'
+        f'Maintainer: {MAINTAINER}\nSection: hamradio\nPriority: optional\n'
+        f'Depends: {", ".join(dependencies)}\n'
+        f'Description: OM0RX-xLog amateur-radio logging{label}\n'
+        ' Local logbooks and Wavelog integration. Ubuntu 24.04 amd64.\n')
+    (deb / 'usr/bin').mkdir(parents=True)
+    for name in ['om0rx-xlog', 'om0rx-xlog-prototype']:
+        command = deb / 'usr/bin' / name
+        command.write_text(f'#!/bin/sh\nexec {INSTALL_PATH}/launch "$@"\n')
+        command.chmod(0o755)
+    desktop = deb / 'usr/share/applications/om0rx-xlog-prototype.desktop'
+    desktop.parent.mkdir(parents=True)
+    desktop.write_text(f'[Desktop Entry]\nType=Application\nName=OM0RX-xLog{label}\n'
+                       'GenericName=Amateur Radio Logging\n'
+                       'Comment=Local logbooks and Wavelog integration\n'
+                       f'Exec={INSTALL_PATH}/launch\nTerminal=false\nCategories=HamRadio;Utility;\n')
+
+
+def run(*args, env=None):
+    return subprocess.check_output(args, text=True, env=env, stderr=subprocess.STDOUT)
+
+
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def write_json(path, data):
+    path.write_text(json.dumps(data, indent=2) + '\n')
+
+
+def normalize_permissions(directory):
+    # Build caches can contain owner-only licenses. Installed payloads must be
+    # readable/traversable by regular users, while keeping executable helpers.
+    directory.chmod(0o755)
+    for current, directories, files in os.walk(directory, followlinks=False):
+        for name in directories + files:
+            path = Path(current) / name
+            if path.is_symlink():
+                raise RuntimeError(f'Unexpected package symlink during permission normalization: {path}')
+            if path.is_dir():
+                path.chmod(0o755)
+            else:
+                path.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
+
+
+def stage_contest_runtime(root, stage):
+    # The shipping locator resolves Not1MM beside the worker executable.
+    subprocess.check_call([sys.executable, str(root / 'prototype/scripts/stage-contest-runtime.py'),
+                           '--platform', 'linux', '--destination', str(stage / 'bin')])
+    evidence = stage / 'bin/evidence/contest-runtime.json'
+    return {'launcher': 'bin/Not1MM/python/contest_host/launcher.py',
+            'executable': '/usr/bin/python3.12', 'evidence': str(evidence.relative_to(stage)),
+            'evidenceSHA256': digest(evidence)}
+
+
+def loader(path, env):
+    output = run('ldd', str(path), env=env)
+    if 'not found' in output:
+        raise RuntimeError(f'Unresolved dependency for {path}:\n{output}')
+    paths = []
+    for line in output.splitlines():
+        match = re.search(r'(?:=>\s+)?(/\S+)\s+\(0x[0-9a-f]+\)', line)
+        if match:
+            paths.append(Path(match[1]))
+    return output, paths
+
+
+def audit(package, output):
+    env = dict(os.environ, PATH='/usr/bin:/bin', LD_LIBRARY_PATH=str(package / 'lib'))
+    # Native loader metadata and full recursive loader resolutions retained verbatim.
+    entries = []
+    graph = {}
+    library_inventory = {}
+    binaries = [package / 'bin' / name for name in ['xlog-prototype', 'xlog-prototype-worker', 'rigctld', 'rotctld']]
+    binaries += sorted((package / 'lib').glob('*.so*'))
+    for binary in binaries:
+        resolved, paths = loader(binary, env)
+        entries.append(f'\n### {binary.relative_to(package)}\n' +
+                       run('readelf', '-d', str(binary)) + resolved)
+        graph[str(binary.relative_to(package))] = [str(path) for path in paths]
+        for dependency in paths:
+            canonical = dependency.resolve()
+            bundled = canonical.is_relative_to(package.resolve())
+            if not bundled and not str(canonical).startswith(('/usr/lib/', '/lib/')):
+                raise RuntimeError(f'Unapproved loader origin: {canonical}')
+            if str(canonical) not in library_inventory:
+                record = {'sha256': digest(canonical), 'origin': 'bundled' if bundled else 'os-package'}
+                if not bundled:
+                    candidates = [str(dependency), str(canonical)]
+                    if str(canonical).startswith('/usr/lib/'):
+                        candidates.append(str(canonical).removeprefix('/usr'))
+                    for candidate in candidates:
+                        try:
+                            owner = run('dpkg-query', '-S', candidate).splitlines()[0].split(': /')[0]
+                            record['package'] = run('dpkg-query', '-W', '-f=${binary:Package}\t${Version}\t${Architecture}', owner)
+                            record['notice'] = f'/usr/share/doc/{owner.split(":")[0]}/copyright'
+                            break
+                        except subprocess.CalledProcessError:
+                            pass
+                    if 'package' not in record:
+                        raise RuntimeError(f'System dependency has no package provenance: {canonical}')
+                library_inventory[str(canonical)] = record
+    output.write_text(''.join(entries))
+    write_json(output.with_suffix('.json'), {'schema': 1, 'resolutionsByPayload': graph,
+                                           'libraries': library_inventory})
+
+
+def package(root, out, swift_root, sha):
+    application = application_metadata(root)
+    stage = out / STAGE_NAME
+    for folder in ['bin', 'lib', 'notices']:
+        (stage / folder).mkdir(parents=True)
+    for name in ['xlog-prototype', 'xlog-prototype-worker', 'rigctld', 'rotctld']:
+        shutil.copy2(root / 'prototype/src-tauri/target/release' / name, stage / 'bin' / name)
+    contest_runtime = stage_contest_runtime(root, stage)
+    shutil.copytree(root / 'prototype/src-tauri/binaries/hamlib-4.7.2-notices', stage / 'notices/hamlib-4.7.2')
+    resource_names = [
+        'OM0RXXLogPrototype_XLogPortableCore.resources',
+        'OM0RXXLogPrototype_XContestCore.resources',
+    ]
+    for resource_name in resource_names:
+        shutil.copytree(root / 'prototype/src-tauri/target/release' / resource_name,
+                        stage / 'bin' / resource_name)
+    # The exact native closure decides what is bundled. No host /usr/lib copied.
+    env = dict(os.environ)
+    runtime = swift_root / 'usr/lib/swift/linux'
+    if not runtime.is_dir():
+        raise RuntimeError(f'Swift runtime directory is absent: {runtime}')
+    env['LD_LIBRARY_PATH'] = str(runtime)
+    origins = {}
+    queue = [path for path in (stage / 'bin').iterdir() if path.is_file()]
+    seen = set()
+    while queue:
+        binary = queue.pop()
+        if binary.resolve() in seen:
+            continue
+        seen.add(binary.resolve())
+        _, dependencies = loader(binary, env)
+        for dependency in dependencies:
+            canonical = dependency.resolve()
+            if canonical.is_relative_to(swift_root):
+                target = stage / 'lib' / dependency.name
+                if target.exists() and digest(target) != digest(canonical):
+                    raise RuntimeError(f'Conflicting bundled SONAME: {dependency.name}')
+                if not target.exists():
+                    shutil.copy2(canonical, target)
+                    origins[str(target.relative_to(stage))] = str(canonical)
+                    queue.append(canonical)
+            elif not str(canonical).startswith(('/lib/', '/usr/lib/')):
+                raise RuntimeError(f'Unapproved build dependency origin: {canonical}')
+    if not origins:
+        raise RuntimeError('Dynamic Swift closure was unexpectedly empty')
+    # Retain licenses/notices supplied by the exact downloaded toolchain.
+    notice_count = 0
+    for source in sorted(swift_root.rglob('*')):
+        if source.is_file() and re.match(r'^(LICENSE|NOTICE|NOTICES|COPYING)([.-].*)?$', source.name, re.I):
+            relative = source.relative_to(swift_root)
+            target = stage / 'notices/swift-toolchain' / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            notice_count += 1
+    swift_version = run('swift', '--version').strip()
+    version = re.search(r'Swift version (\d+\.\d+(?:\.\d+)?)', swift_version)
+    if not version:
+        raise RuntimeError('Cannot identify exact Swift release for redistribution notices')
+    tag = f'swift-{version[1]}-RELEASE'
+    notice_sources = {}
+    notice_availability = {}
+    for repository in ['swift', 'swift-foundation', 'swift-foundation-icu', 'swift-corelibs-foundation', 'swift-corelibs-libdispatch']:
+        directory = stage / 'notices' / repository
+        directory.mkdir()
+        found_license = False
+        for filename in ['LICENSE.txt', 'LICENSE.md', 'LICENSE', 'NOTICE.txt', 'NOTICE', 'NOTICES.txt']:
+            url = f'https://raw.githubusercontent.com/swiftlang/{repository}/{tag}/{filename}'
+            try:
+                with urllib.request.urlopen(url, timeout=30) as response:
+                    content = response.read()
+            except urllib.error.HTTPError as error:
+                if error.code == 404:
+                    notice_availability[url] = 'not present at release tag'
+                    continue
+                raise
+            (directory / filename).write_bytes(content)
+            notice_sources[str((directory / filename).relative_to(stage))] = url
+            notice_availability[url] = 'included'
+            found_license = found_license or filename.startswith('LICENSE')
+        if not found_license:
+            raise RuntimeError(f'Version-pinned license missing for {repository} {tag}')
+    for name in ['LICENSE', 'NOTICE', 'Package.swift']:
+        shutil.copy2(root / name, stage / name)
+    for source in ['prototype/package-lock.json', 'prototype/src-tauri/Cargo.lock']:
+        shutil.copy2(root / source, stage / Path(source).name)
+    shared_notices = root / 'prototype/distribution-metadata'
+    if not (shared_notices / 'components.json').is_file():
+        raise RuntimeError('Generate shared distribution-metadata before Linux packaging')
+    shutil.copytree(shared_notices, stage / 'notices/shared')
+    shutil.copy2(root / 'prototype/scripts/linux-runtime-dependencies.txt', stage / 'system-dependencies.txt')
+    launcher = stage / 'launch'
+    launcher.write_text('#!/bin/sh\nset -eu\npackage="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
+                        'export LD_LIBRARY_PATH="$package/lib"\nexec "$package/bin/xlog-prototype" "$@"\n')
+    launcher.chmod(0o755)
+    audit(stage, stage / 'native-loader-audit.txt')
+    dependencies = [line.strip() for line in (stage / 'system-dependencies.txt').read_text().splitlines()
+                    if line.strip() and not line.startswith('#')]
+    metadata = {'schema': 1, **application, 'commit': sha, 'platform': 'ubuntu-24.04-amd64',
+                'contestRuntime': contest_runtime,
+                'swift': swift_version, 'bundledLibraryOrigins': origins,
+                'redistributionNoticeSources': notice_sources, 'toolchainNoticeCount': notice_count,
+                'redistributionNoticeAvailability': notice_availability,
+                'systemPackages': dependencies, 'systemPackageVersions': run('dpkg-query', '-W'),
+                'source': f'https://github.com/oliverbross/OM0RX-xLog-Releases/tree/v{application["version"]}',
+                'scope': 'Hardware and provider qualification is recorded separately in the release notes.'}
+    write_json(stage / 'runtime-manifest.json', metadata)
+    normalize_permissions(stage)
+    hashes = {str(path.relative_to(stage)): digest(path) for path in sorted(stage.rglob('*')) if path.is_file()}
+    hash_manifest = stage / 'payload.sha256'
+    hash_manifest.write_text(''.join(f'{value}  {name}\n' for name, value in hashes.items()))
+    hash_manifest.chmod(0o644)
+    deb = out / 'deb-root'
+    install = deb / INSTALL_PATH.removeprefix('/')
+    shutil.copytree(stage, install)
+    write_debian_metadata(deb, application, dependencies)
+    normalize_permissions(deb)
+
+
+if __name__ == '__main__':
+    if sys.argv[1] == 'package':
+        package(*(Path(value).resolve() for value in sys.argv[2:5]), sys.argv[5])
+    elif sys.argv[1] == 'audit':
+        audit(Path(sys.argv[2]).resolve(), Path(sys.argv[3]))
+    elif sys.argv[1] == 'version':
+        print(application_metadata(Path(sys.argv[2]).resolve())['version'])
+    else:
+        raise SystemExit('Expected package, audit or version')

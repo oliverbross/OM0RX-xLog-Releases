@@ -1,0 +1,26 @@
+.build/
+# Generated only by portable-swift-lock.py from the tracked full pin policy.
+# Every portable Swift command force-resolves and verifies its manifest/pins.
+/Package.resolved
+dist/
+.DS_Store
+*.xcuserstate
+__pycache__/
+*.py[cod]
+.swiftpm/
+.impeccable/review/
+.recovery/
+prototype/node_modules/
+/node_modules/
+prototype/src-tauri/target/
+prototype/src-tauri/gen/
+prototype/src-tauri/binaries/
+prototype/test-results/
+prototype/playwright-report/
+prototype/distribution-metadata/
+prototype/dist-linux/
+prototype/dist-windows/
+prototype/dist-macos/
+prototype/packaging-evidence/
+
+/Sources/XLogCore/Resources/dxcc-boundaries.geojson

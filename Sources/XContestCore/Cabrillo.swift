@@ -1,0 +1,539 @@
+import Foundation
+
+private let arrlUSSectionAbbreviations: Set<String> = [
+    "CT", "EMA", "ME", "NH", "RI", "VT", "WMA",
+    "ENY", "NLI", "NNJ", "NNY", "SNJ", "WNY",
+    "DE", "EPA", "MDC", "WPA",
+    "AL", "GA", "KY", "NC", "NFL", "SC", "SFL", "TN", "VA", "WCF",
+    "AR", "LA", "MS", "NM", "NTX", "OK", "STX", "WTX",
+    "EB", "LAX", "ORG", "SB", "SCV", "SDG", "SF", "SJV", "SV",
+    "AZ", "EWA", "ID", "MT", "NV", "OR", "UT", "WWA", "WY",
+    "MI", "OH", "WV", "IL", "IN", "WI",
+    "CO", "IA", "KS", "MN", "MO", "NE", "ND", "SD",
+]
+private let arrlCanadaSectionAbbreviations: Set<String> = [
+    "AB", "BC", "GH", "MB", "NB", "NL", "NS", "ONE", "ONN", "ONS", "PE", "QC", "SK", "TER",
+]
+private let arrlPacificSectionEntityCodes: Set<Int> = [
+    9,   // American Samoa
+    20,  // Baker and Howland Islands
+    103, // Guam
+    110, // Hawaii
+    123, // Johnston Island
+    138, // Kure Island
+    166, // Mariana Islands
+    174, // Midway Island
+    197, // Palmyra and Jarvis Islands
+    297, // Wake Island
+    515, // Swains Island
+]
+
+public struct CabrilloHeader: Codable, Hashable, Sendable {
+    public let callsign: String
+    public let categoryOperator: String
+    public let categoryAssisted: String
+    public let categoryBand: String
+    public let categoryMode: String
+    public let categoryTransmitter: String
+    public let categoryPower: String
+    public let categoryOverlay: String?
+    public let operators: [String]
+    public let location: String
+    public let club: String?
+    public let name: String
+    public let addressLines: [String]
+    public let email: String
+
+    public init(callsign: String, categoryOperator: String, categoryAssisted: String,
+                categoryBand: String, categoryMode: String, categoryTransmitter: String,
+                categoryPower: String, categoryOverlay: String? = nil, operators: [String] = [],
+                location: String = "", club: String? = nil, name: String = "",
+                addressLines: [String] = [], email: String = "") {
+        self.callsign = callsign.uppercased()
+        self.categoryOperator = categoryOperator
+        self.categoryAssisted = categoryAssisted
+        self.categoryBand = categoryBand
+        self.categoryMode = categoryMode
+        self.categoryTransmitter = categoryTransmitter
+        self.categoryPower = categoryPower
+        self.categoryOverlay = categoryOverlay
+        self.operators = operators.map { $0.uppercased() }
+        self.location = location
+        self.club = club
+        self.name = name
+        self.addressLines = addressLines
+        self.email = email
+    }
+}
+
+public enum CabrilloExportError: Error, Equatable {
+    case invalidHeader(String)
+    case invalidQSO(qsoID: UUID, field: String)
+}
+
+public enum CabrilloExporter {
+    public static func document(input: ContestExportInput, rule: any ContestRule,
+                                createdBy: String = "OM0RX-xLog") throws -> String {
+        let score: ContestScore
+        do { score = try input.validatedScore(rule: rule) }
+        catch { throw CabrilloExportError.invalidHeader("exportInput") }
+        return try document(header: input.metadata.cabrilloHeader, score: score,
+                            qsos: input.qsos, session: input.session, rule: rule,
+                            formatterVersion: input.formatterVersion, createdBy: createdBy)
+    }
+
+    public static func document(header: CabrilloHeader, score: ContestScore, qsos: [ContestQSO],
+                                session: ContestSessionSnapshot, rule: any ContestRule,
+                                formatterVersion: String = ContestExportInput.legacyFormatterVersion,
+                                createdBy: String = "OM0RX-xLog") throws -> String {
+        guard session.rule == rule.metadata.identity else { throw CabrilloExportError.invalidHeader("rule") }
+        guard header.callsign == session.station.callsign else { throw CabrilloExportError.invalidHeader("callsign") }
+        guard rule.metadata.entry.isCoherent(supportedModes: rule.metadata.supportedModes),
+              header.categoryMode == rule.metadata.entry.mode else {
+            throw CabrilloExportError.invalidHeader("categoryMode")
+        }
+        let recomputed: ContestScore
+        let renderedQSOs: [ContestQSO]
+        do {
+            if formatterVersion == ContestExportInput.naqpPreviewFormatterVersion ||
+                formatterVersion == ContestExportInput.arrlRTTYPreviewFormatterVersion ||
+                formatterVersion == ContestExportInput.jidxPreviewFormatterVersion ||
+                formatterVersion == ContestExportInput.arrlDXCWPreviewFormatterVersion ||
+                formatterVersion == ContestExportInput.arrlDXSSBPreviewFormatterVersion {
+                guard rule.metadata.entry.cabrilloFormatterVersion == formatterVersion,
+                      rule.metadata.entry.cabrilloProjectionFormatterVersion == formatterVersion else {
+                    throw CabrilloExportError.invalidHeader("formatterVersion")
+                }
+                if formatterVersion == ContestExportInput.arrlRTTYPreviewFormatterVersion {
+                    try validateARRLCabrilloLocation(header: header, session: session)
+                }
+                if formatterVersion == ContestExportInput.arrlDXCWPreviewFormatterVersion ||
+                    formatterVersion == ContestExportInput.arrlDXSSBPreviewFormatterVersion {
+                    try validateARRLCabrilloLocation(header: header, session: session)
+                }
+                let projection = try ContestSubmissionProjection.make(qsos: qsos, session: session,
+                                                                       header: header, rule: rule)
+                recomputed = projection.score
+                renderedQSOs = projection.renderedQSOs
+            } else {
+                switch formatterVersion {
+                case rule.metadata.entry.cabrilloFormatterVersion:
+                    let categoryBand = header.categoryBand.uppercased()
+                    let usedBands = Set(qsos.map(\.band))
+                    if categoryBand != "ALL" {
+                        let expectedBand = categoryBand.lowercased()
+                        guard rule.metadata.supportedBands.contains(expectedBand),
+                              usedBands.allSatisfy({ $0 == expectedBand }) else {
+                            throw CabrilloExportError.invalidHeader("categoryBand")
+                        }
+                    }
+                    recomputed = try ContestEngine.score(qsos, session: session, rule: rule)
+                    renderedQSOs = qsos
+                case rule.metadata.entry.cabrilloProjectionFormatterVersion:
+                    let projection = try ContestSubmissionProjection.make(qsos: qsos, session: session,
+                                                                           header: header, rule: rule)
+                    recomputed = projection.score
+                    renderedQSOs = projection.renderedQSOs
+                default:
+                    throw CabrilloExportError.invalidHeader("formatterVersion")
+                }
+            }
+        } catch let error as CabrilloExportError { throw error }
+        catch { throw CabrilloExportError.invalidHeader("score") }
+        guard recomputed == score else { throw CabrilloExportError.invalidHeader("score") }
+        if formatterVersion == ContestExportInput.jidxPreviewFormatterVersion {
+            return try jidxDocument(header: header, score: score, qsos: renderedQSOs,
+                                    session: session, rule: rule, createdBy: createdBy)
+        }
+        let call = try token(header.callsign, field: "callsign")
+        var lines = ["START-OF-LOG: 3.0", "CREATED-BY: \(try safe(createdBy, field: "createdBy", required: true))",
+                     "CONTEST: \(try token(rule.metadata.cabrilloName, field: "contest"))"]
+        if let projection = (rule as? any ContestRuleDeclarativeExportPolicy)?.declarativeExportProjection {
+            guard projection.purpose == .operatorArchive else {
+                throw CabrilloExportError.invalidHeader("exportPurpose")
+            }
+            lines.append("X-OM0RXXLOG-PURPOSE: OPERATOR-ARCHIVE")
+        }
+        if let club = header.club, !club.isEmpty { lines.append("CLUB: \(try safe(club, field: "club"))") }
+        lines += [
+            "CALLSIGN: \(call)",
+            "LOCATION: \(try safe(header.location, field: "location"))",
+            "CATEGORY-OPERATOR: \(try token(header.categoryOperator, field: "categoryOperator"))",
+            "CATEGORY-ASSISTED: \(try token(header.categoryAssisted, field: "categoryAssisted"))",
+            "CATEGORY-BAND: \(try token(header.categoryBand, field: "categoryBand"))",
+            "CATEGORY-MODE: \(try token(header.categoryMode, field: "categoryMode"))",
+            "CATEGORY-TRANSMITTER: \(try token(header.categoryTransmitter, field: "categoryTransmitter"))",
+        ]
+        if let overlay = header.categoryOverlay, !overlay.isEmpty { lines.append("CATEGORY-OVERLAY: \(try safe(overlay, field: "categoryOverlay"))") }
+        lines += ["CATEGORY-POWER: \(try token(header.categoryPower, field: "categoryPower"))",
+                  "CLAIMED-SCORE: \(score.claimedScore)"]
+        let operators = header.operators.isEmpty ? ["@\(call)"] : header.operators
+        guard operators.allSatisfy({ $0.range(of: #"^@?[A-Z0-9]+(?:/[A-Z0-9]+)*$"#, options: .regularExpression) != nil }) else {
+            throw CabrilloExportError.invalidHeader("operators")
+        }
+        lines.append("OPERATORS: \(try safe(operators.joined(separator: ", "), field: "operators", required: true))")
+        lines.append("NAME: \(try safe(header.name, field: "name"))")
+        for address in header.addressLines { lines.append("ADDRESS: \(try safe(address, field: "address"))") }
+        lines.append("EMAIL: \(try safe(header.email, field: "email"))")
+        for qso in renderedQSOs.sorted(by: deterministicOrder) {
+            lines.append(try qsoLine(qso, session: session, rule: rule))
+        }
+        lines.append("END-OF-LOG:")
+        return lines.joined(separator: "\r\n") + "\r\n"
+    }
+
+    public static func qsoLine(_ qso: ContestQSO, session: ContestSessionSnapshot,
+                               rule: any ContestRule) throws -> String {
+        if let projection = (rule as? any ContestRuleDeclarativeExportPolicy)?.declarativeExportProjection {
+            return try declarativeArchiveQsoLine(qso, session: session, rule: rule, projection: projection)
+        }
+        if rule.metadata.entry.cabrilloFormatterVersion == ContestExportInput.naqpPreviewFormatterVersion {
+            return try naqpQsoLine(qso, session: session, rule: rule)
+        }
+        if rule.metadata.entry.cabrilloFormatterVersion == ContestExportInput.arrlRTTYPreviewFormatterVersion {
+            return try arrlRTTYQsoLine(qso, session: session, rule: rule)
+        }
+        if rule.metadata.entry.cabrilloFormatterVersion == ContestExportInput.jidxPreviewFormatterVersion {
+            return try jidxQsoLine(qso, session: session, rule: rule)
+        }
+        if rule.metadata.entry.cabrilloFormatterVersion == ContestExportInput.arrlDXCWPreviewFormatterVersion ||
+            rule.metadata.entry.cabrilloFormatterVersion == ContestExportInput.arrlDXSSBPreviewFormatterVersion {
+            return try arrlDXQsoLine(qso, session: session, rule: rule)
+        }
+        return try standardQsoLine(qso, session: session, rule: rule)
+    }
+
+    private static func declarativeArchiveQsoLine(
+        _ qso: ContestQSO, session: ContestSessionSnapshot, rule: any ContestRule,
+        projection: ContestDeclarativeExportProjection
+    ) throws -> String {
+        guard qso.sessionID == session.id, session.rule == rule.metadata.identity,
+              projection.purpose == .operatorArchive, projection.duplicateRecords == .retainAll,
+              qso.timestampUTC.timeIntervalSinceReferenceDate.isFinite else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "rule")
+        }
+        if let issue = rule.evaluate(qso, in: session).validation.first(where: { $0.severity == .error }) {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: issue.field)
+        }
+        guard qso.frequencyHz > 0, let profile = rule.metadata.entry.modeProfile(for: qso.mode) else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "frequencyHz")
+        }
+        let wholeKHz = qso.frequencyHz / 1_000
+        let remainder = qso.frequencyHz % 1_000
+        let frequency = remainder < 500 ? wholeKHz : remainder > 500 ? wholeKHz + 1 :
+            (wholeKHz.isMultiple(of: 2) ? wholeKHz : wholeKHz + 1)
+        guard frequency > 0 else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "frequencyHz")
+        }
+        let rendered = try projection.columns.map { column -> String in
+            let value: String
+            switch column.source {
+            case .frequencyKHz: value = String(frequency)
+            case .mode: value = profile.cabrilloQSOType
+            case .date: value = date(qso.timestampUTC)
+            case .time: value = time(qso.timestampUTC)
+            case .stationCallsign: value = session.station.callsign
+            case .contactedCallsign: value = qso.callsign
+            case .sentReport: value = qso.rstSent
+            case .receivedReport: value = qso.rstReceived
+            case let .sentField(id): value = qso.exchange.sentFields[id]?.normalized ?? ""
+            case let .receivedField(id): value = qso.exchange.receivedFields[id]?.normalized ?? ""
+            }
+            let bytes = Array(value.utf8)
+            guard bytes.count <= column.width, (!column.required || !bytes.isEmpty),
+                  bytes.allSatisfy({ (32...126).contains($0) }) else {
+                throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "archiveColumn")
+            }
+            let renderedWidth = column.minimumWidth.map { max($0, bytes.count) } ?? column.width
+            return column.alignment == .right ? leftPad(value, renderedWidth) : rightPad(value, renderedWidth)
+        }
+        return "QSO: " + rendered.joined(separator: " ")
+    }
+
+    private static func jidxDocument(header: CabrilloHeader, score: ContestScore,
+                                     qsos: [ContestQSO], session: ContestSessionSnapshot,
+                                     rule: any ContestRule, createdBy: String) throws -> String {
+        let call = try token(header.callsign, field: "callsign")
+        let category = try jidxCategory(header: header, callsign: call)
+        let operators = header.operators.isEmpty ? ["@\(call)"] : header.operators
+        guard operators.allSatisfy({ $0.range(of: #"^@?[A-Z0-9]+(?:/[A-Z0-9]+)*$"#,
+                                                    options: .regularExpression) != nil }) else {
+            throw CabrilloExportError.invalidHeader("operators")
+        }
+        guard let sentNumber = session.station.sentExchangeFields["number"]?.normalized,
+              sentNumber == session.station.sentExchange,
+              sentNumber.range(of: #"^[0-9]{2}$"#, options: .regularExpression) != nil else {
+            throw CabrilloExportError.invalidHeader("sentNumber")
+        }
+        let entity: String
+        if call.split(separator: "/").last == "MM" {
+            entity = "MARITIME-MOBILE"
+        } else if let stationEntity = session.station.entity {
+            entity = stationEntity.name
+        } else {
+            throw CabrilloExportError.invalidHeader("entity")
+        }
+        var lines = [
+            "START-OF-LOG: 2.0",
+            "CALLSIGN: \(call)",
+            "CONTEST: \(rule.metadata.cabrilloName)",
+            "CATEGORY: \(category)",
+            "CLAIMED-SCORE: \(score.claimedScore)",
+            "OPERATORS: \(try safe(operators.joined(separator: ","), field: "operators", required: true))",
+            "ENTITY: \(try safe(entity, field: "entity", required: true))",
+            "CREATED-BY: \(try safe(createdBy, field: "createdBy", required: true))",
+        ]
+        if !header.name.isEmpty { lines.append("NAME: \(try safe(header.name, field: "name"))") }
+        for address in header.addressLines { lines.append("ADDRESS: \(try safe(address, field: "address"))") }
+        if !header.email.isEmpty { lines.append("EMAIL: \(try safe(header.email, field: "email"))") }
+        lines.append("SENTNR: \(sentNumber)")
+        for qso in qsos.sorted(by: deterministicOrder) {
+            lines.append(try jidxQsoLine(qso, session: session, rule: rule))
+        }
+        lines.append("END-OF-LOG:")
+        return lines.joined(separator: "\r\n") + "\r\n"
+    }
+
+    private static func jidxCategory(header: CabrilloHeader, callsign: String) throws -> String {
+        guard header.categoryOperator == "SINGLE-OP",
+              header.categoryTransmitter == "ONE",
+              header.categoryOverlay?.isEmpty != false,
+              ["ASSISTED", "NON-ASSISTED"].contains(header.categoryAssisted) else {
+            throw CabrilloExportError.invalidHeader("category")
+        }
+        if callsign.split(separator: "/").last == "MM" {
+            guard header.categoryBand == "ALL",
+                  ["HIGH", "LOW"].contains(header.categoryPower) else {
+                throw CabrilloExportError.invalidHeader("category")
+            }
+            return "MM"
+        }
+        guard let base = ["ALL": "AB", "10M": "28", "15M": "21", "20M": "14",
+                          "40M": "7", "80M": "3.5", "160M": "1.8"][header.categoryBand],
+              ["HIGH", "LOW"].contains(header.categoryPower) else {
+            throw CabrilloExportError.invalidHeader("category")
+        }
+        return header.categoryPower == "LOW" ? (base == "AB" ? "ABL" : "\(base)L") : base
+    }
+
+    private static func jidxQsoLine(_ qso: ContestQSO, session: ContestSessionSnapshot,
+                                    rule: any ContestRule) throws -> String {
+        guard ["JIDX-CW", "JIDX-PH"].contains(rule.metadata.cabrilloName),
+              rule.metadata.entry.cabrilloFormatterVersion == ContestExportInput.jidxPreviewFormatterVersion else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "rule")
+        }
+        let evaluation: ContestRuleEvaluation
+        do { evaluation = try ContestEngine.evaluate(qso, session: session, rule: rule, allowIncomplete: false) }
+        catch { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "qso") }
+        if let issue = evaluation.validation.first(where: { $0.severity == .error }) {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: issue.field)
+        }
+        guard let sent = qso.exchange.sentFields["number"]?.normalized,
+              let received = qso.exchange.receivedFields["number"]?.normalized,
+              sent == qso.exchange.normalizedSent, received == qso.exchange.normalizedReceived,
+              sent.range(of: #"^[0-9]{2}$"#, options: .regularExpression) != nil,
+              received.range(of: #"^[0-9]{2}$"#, options: .regularExpression) != nil else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "exchange")
+        }
+        return try standardQsoLine(qso, session: session, rule: rule)
+    }
+
+    private static func standardQsoLine(_ qso: ContestQSO, session: ContestSessionSnapshot,
+                                        rule: any ContestRule, sentExchange: String? = nil,
+                                        receivedExchange: String? = nil) throws -> String {
+        guard qso.sessionID == session.id else { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "sessionID") }
+        guard session.rule == rule.metadata.identity else { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "rule") }
+        guard qso.timestampUTC.timeIntervalSinceReferenceDate.isFinite else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "timestampUTC")
+        }
+        if let issue = rule.evaluate(qso, in: session).validation.first(where: { $0.severity == .error }) {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: issue.field)
+        }
+        guard qso.frequencyHz > 0 else { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "frequencyHz") }
+        let wholeKHz = qso.frequencyHz / 1_000
+        let remainder = qso.frequencyHz % 1_000
+        let frequency = remainder < 500 ? wholeKHz : remainder > 500 ? wholeKHz + 1 :
+            (wholeKHz.isMultiple(of: 2) ? wholeKHz : wholeKHz + 1)
+        guard frequency > 0 && frequency <= 99_999 else { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "frequencyHz") }
+        let mode = rule.metadata.entry.cabrilloQSOType
+        let values = [session.station.callsign, qso.rstSent, sentExchange ?? qso.exchange.normalizedSent,
+                      qso.callsign, qso.rstReceived,
+                      receivedExchange ?? rule.cabrilloReceivedExchange(for: qso)]
+        let limits = [13, 3, 6, 13, 3, 6]
+        for (index, value) in values.enumerated() where value.isEmpty || value.count > limits[index] ||
+            value.range(of: #"^[A-Z0-9/]+$"#, options: .regularExpression) == nil {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: ["stationCallsign", "rstSent", "sentExchange", "callsign", "rstReceived", "receivedExchange"][index])
+        }
+        return "QSO: \(leftPad(String(frequency), 5)) \(mode) \(date(qso.timestampUTC)) \(time(qso.timestampUTC)) " +
+            "\(rightPad(values[0], 13)) \(rightPad(values[1], 3)) \(rightPad(values[2], 6)) " +
+            "\(rightPad(values[3], 13)) \(rightPad(values[4], 3)) \(rightPad(values[5], 6))"
+    }
+
+    private static func arrlRTTYQsoLine(_ qso: ContestQSO, session: ContestSessionSnapshot,
+                                        rule: any ContestRule) throws -> String {
+        guard rule.metadata.cabrilloName == "ARRL-RTTY",
+              rule.metadata.entry.modeProfile(for: qso.mode)?.cabrilloQSOType == "RY" else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "rule")
+        }
+        let evaluation: ContestRuleEvaluation
+        do { evaluation = try ContestEngine.evaluate(qso, session: session, rule: rule, allowIncomplete: false) }
+        catch { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "qso") }
+        if let issue = evaluation.validation.first(where: { $0.severity == .error }) {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: issue.field)
+        }
+        return try standardQsoLine(qso, session: session, rule: rule)
+    }
+
+    private static func arrlDXQsoLine(_ qso: ContestQSO, session: ContestSessionSnapshot,
+                                      rule: any ContestRule) throws -> String {
+        guard ["ARRL-DX-CW", "ARRL-DX-SSB"].contains(rule.metadata.cabrilloName),
+              [ContestExportInput.arrlDXCWPreviewFormatterVersion,
+               ContestExportInput.arrlDXSSBPreviewFormatterVersion]
+                .contains(rule.metadata.entry.cabrilloFormatterVersion) else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "rule")
+        }
+        let evaluation: ContestRuleEvaluation
+        do { evaluation = try ContestEngine.evaluate(qso, session: session, rule: rule, allowIncomplete: false) }
+        catch { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "qso") }
+        if let issue = evaluation.validation.first(where: { $0.severity == .error }) {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: issue.field)
+        }
+        let sent = try arrlDXCabrilloExchange(raw: qso.exchange.rawSent,
+                                               fields: qso.exchange.sentFields, qsoID: qso.id)
+        let received = try arrlDXCabrilloExchange(raw: qso.exchange.rawReceived,
+                                                   fields: qso.exchange.receivedFields, qsoID: qso.id)
+        return try standardQsoLine(qso, session: session, rule: rule,
+                                   sentExchange: sent, receivedExchange: received)
+    }
+
+    private static func arrlDXCabrilloExchange(raw: String,
+                                                fields: [String: ContestExchangeFieldValue],
+                                                qsoID: UUID) throws -> String {
+        guard raw.count > 6 else { return raw }
+        guard let power = fields["power"], power.raw == raw, !power.normalized.isEmpty,
+              power.normalized.count <= 6 else {
+            throw CabrilloExportError.invalidQSO(qsoID: qsoID, field: "exchange")
+        }
+        return power.normalized
+    }
+
+    private static func validateARRLCabrilloLocation(header: CabrilloHeader,
+                                                      session: ContestSessionSnapshot) throws {
+        let value = header.location
+        guard value == session.station.location else {
+            throw CabrilloExportError.invalidHeader("location")
+        }
+        guard let entity = session.station.entity,
+              arrlRTTYCabrilloLocationIsValid(value, entityADIF: entity.adif) else {
+            throw CabrilloExportError.invalidHeader("location")
+        }
+    }
+
+    private static func naqpQsoLine(_ qso: ContestQSO, session: ContestSessionSnapshot,
+                                    rule: any ContestRule) throws -> String {
+        guard qso.sessionID == session.id else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "sessionID")
+        }
+        guard session.rule == rule.metadata.identity else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "rule")
+        }
+        guard qso.timestampUTC.timeIntervalSinceReferenceDate.isFinite else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "timestampUTC")
+        }
+        let evaluation: ContestRuleEvaluation
+        do { evaluation = try ContestEngine.evaluate(qso, session: session, rule: rule, allowIncomplete: false) }
+        catch { throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "qso") }
+        if let issue = evaluation.validation.first(where: { $0.severity == .error }) {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: issue.field)
+        }
+        guard qso.frequencyHz > 0 else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "frequencyHz")
+        }
+        let wholeKHz = qso.frequencyHz / 1_000
+        let remainder = qso.frequencyHz % 1_000
+        let frequency = remainder < 500 ? wholeKHz : remainder > 500 ? wholeKHz + 1 :
+            (wholeKHz.isMultiple(of: 2) ? wholeKHz : wholeKHz + 1)
+        guard frequency > 0 && frequency <= 99_999,
+              let profile = rule.metadata.entry.modeProfile(for: qso.mode) else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "frequencyHz")
+        }
+        let sentName = qso.exchange.sentFields["name"]?.normalized ?? ""
+        let sentLocation = qso.exchange.sentFields["location"]?.normalized ?? "DX"
+        let receivedName = qso.exchange.receivedFields["name"]?.normalized ?? ""
+        let receivedLocation = qso.exchange.receivedFields["location"]?.normalized ?? ""
+        guard naqpRawExchangeIsSafe(qso.exchange.rawSent), naqpRawExchangeIsSafe(qso.exchange.rawReceived) else {
+            throw CabrilloExportError.invalidQSO(qsoID: qso.id, field: "exchange")
+        }
+        try requireNAQPASCII(session.station.callsign, maximum: 13, field: "stationCallsign", qsoID: qso.id,
+                             allowsSlash: true)
+        try requireNAQPASCII(qso.callsign, maximum: 13, field: "callsign", qsoID: qso.id, allowsSlash: true)
+        try requireNAQPASCII(sentName, maximum: 32, field: "sentName", qsoID: qso.id, allowsPunctuation: true)
+        try requireNAQPASCII(sentLocation, maximum: 8, field: "sentLocation", qsoID: qso.id, allowsSlash: true)
+        try requireNAQPASCII(receivedName, maximum: 32, field: "receivedName", qsoID: qso.id, allowsPunctuation: true)
+        try requireNAQPASCII(receivedLocation, maximum: 8, field: "receivedLocation", qsoID: qso.id, allowsSlash: true)
+        return "QSO: \(leftPad(String(frequency), 5)) \(profile.cabrilloQSOType) \(date(qso.timestampUTC)) \(time(qso.timestampUTC)) " +
+            "\(rightPad(session.station.callsign, 13)) \(rightPad(sentName, 10)) \(rightPad(sentLocation, 3)) " +
+            "\(rightPad(qso.callsign, 13)) \(rightPad(receivedName, 10)) \(rightPad(receivedLocation, 3))"
+    }
+
+    private static func requireNAQPASCII(_ value: String, maximum: Int, field: String, qsoID: UUID,
+                                         allowsSlash: Bool = false, allowsPunctuation: Bool = false) throws {
+        let bytes = Array(value.utf8)
+        guard !bytes.isEmpty, bytes.count <= maximum, bytes.allSatisfy({ byte in
+            (65...90).contains(byte) || (48...57).contains(byte) ||
+                (allowsSlash && byte == 47) || (allowsPunctuation && (byte == 39 || byte == 45))
+        }) else {
+            throw CabrilloExportError.invalidQSO(qsoID: qsoID, field: field)
+        }
+    }
+
+    private static func naqpRawExchangeIsSafe(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 41 && value.unicodeScalars.allSatisfy { (32...126).contains($0.value) }
+    }
+
+    private static func safe(_ value: String, field: String, required: Bool = false) throws -> String {
+        if (required && value.trimmingCharacters(in: .whitespaces).isEmpty) || hasUnsafeCharacters(value) {
+            throw CabrilloExportError.invalidHeader(field)
+        }
+        return value
+    }
+
+    private static func token(_ value: String, field: String) throws -> String {
+        guard !value.isEmpty, value.range(of: #"^[A-Z0-9][A-Z0-9/@-]*$"#, options: .regularExpression) != nil else {
+            throw CabrilloExportError.invalidHeader(field)
+        }
+        return value
+    }
+
+    private static func hasUnsafeCharacters(_ value: String) -> Bool {
+        value.unicodeScalars.contains { CharacterSet.newlines.contains($0) || CharacterSet.controlCharacters.contains($0) }
+    }
+
+    private static func deterministicOrder(_ lhs: ContestQSO, _ rhs: ContestQSO) -> Bool {
+        lhs.timestampUTC == rhs.timestampUTC ? lhs.id.uuidString < rhs.id.uuidString : lhs.timestampUTC < rhs.timestampUTC
+    }
+    private static func leftPad(_ value: String, _ width: Int) -> String { String(repeating: " ", count: max(0, width - value.count)) + value }
+    private static func rightPad(_ value: String, _ width: Int) -> String { value + String(repeating: " ", count: max(0, width - value.count)) }
+    private static func date(_ value: Date) -> String { formatter("yyyy-MM-dd").string(from: value) }
+    private static func time(_ value: Date) -> String { formatter("HHmm").string(from: value) }
+    private static func formatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = format
+        return formatter
+    }
+}
+
+internal func arrlRTTYCabrilloLocationIsValid(_ value: String, entityADIF: Int) -> Bool {
+    switch entityADIF {
+    case 291: return arrlUSSectionAbbreviations.contains(value)
+    case 1: return arrlCanadaSectionAbbreviations.contains(value)
+    case 6: return value == "AK"
+    case 202: return value == "PR"
+    case 285: return value == "VI"
+    case let code where arrlPacificSectionEntityCodes.contains(code): return value == "PAC"
+    default: return value == "DX"
+    }
+}

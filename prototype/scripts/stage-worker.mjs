@@ -1,0 +1,43 @@
+// Stage only the prototype's own release worker, never an installed application.
+import { cpSync, existsSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { swiftWorkerBuildInvocation } from './swift-worker-build-system.mjs';
+import { stageWorkerExecutable } from './stage-worker-executable.mjs';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const executable = `xlog-prototype-worker${process.platform === 'win32' ? '.exe' : ''}`;
+const invocation = swiftWorkerBuildInvocation(process.platform, root,
+  ['--scratch-path', '.build/prototype-worker', '-c', 'release', '--show-bin-path']);
+const binDir = execFileSync(invocation.executable, invocation.args, {
+  cwd: root, env: { ...process.env, XLOG_PORTABLE_ONLY: '1' }, encoding: 'utf8',
+}).trim();
+const source = join(binDir, executable);
+if (!existsSync(source)) throw new Error('Build the prototype worker before staging.');
+const resourceNames = process.platform === 'darwin'
+  ? ['OM0RXXLogPrototype_XLogCore.bundle', 'OM0RXXLogPrototype_XContestCore.bundle']
+  : ['OM0RXXLogPrototype_XLogPortableCore.resources', 'OM0RXXLogPrototype_XContestCore.resources'];
+for (const resourceName of resourceNames) {
+  if (!existsSync(join(binDir, resourceName))) throw new Error(`Required worker resources are missing: ${resourceName}`);
+}
+const target = execFileSync('rustc', ['-vV'], { encoding: 'utf8' }).match(/^host: (.+)$/m)?.[1];
+if (!target) throw new Error('Cannot resolve Rust host triple.');
+const binaries = join(root, 'prototype/src-tauri/binaries');
+mkdirSync(binaries, { recursive: true });
+stageWorkerExecutable(source, join(binaries, `xlog-prototype-worker-${target}${process.platform === 'win32' ? '.exe' : ''}`), process.platform, target);
+
+// Cargo-run/development location; release bundlers use externalBin instead.
+for (const mode of ['debug', 'release']) {
+  const destination = join(root, 'prototype/src-tauri/target', mode);
+  mkdirSync(destination, { recursive: true });
+  stageWorkerExecutable(source, join(destination, executable), process.platform, target);
+  for (const resourceName of resourceNames) {
+    rmSync(join(destination, resourceName), { recursive: true, force: true });
+    cpSync(join(binDir, resourceName), join(destination, resourceName), { recursive: true });
+  }
+  if (process.platform === 'win32' && existsSync(join(binDir, 'sqlite3.dll'))) {
+    cpSync(join(binDir, 'sqlite3.dll'), join(destination, 'sqlite3.dll'));
+  }
+}
+console.log(`Staged ${executable} for ${target}. Runtime dependency packaging is a separate acceptance gate.`);

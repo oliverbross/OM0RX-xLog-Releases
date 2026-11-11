@@ -1,0 +1,846 @@
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+#if os(macOS)
+import zlib
+#endif
+
+public struct ReferenceDataValidator: Codable, Equatable, Sendable {
+    public var eTag: String?
+    public var lastModified: String?
+    /// SHA-256 of the exact requested source URL (and credential scope where
+    /// applicable). No URL, query value, API key or token is persisted.
+    public var sourceIdentity: String?
+
+    public init(eTag: String? = nil, lastModified: String? = nil, sourceIdentity: String? = nil) {
+        self.eTag = eTag
+        self.lastModified = lastModified
+        self.sourceIdentity = sourceIdentity
+    }
+}
+
+/// Only successful 200 responses establish a downloaded date. A 304 is a
+/// successful check of an existing validated cache, not a new download.
+public struct ReferenceSourceMetadata: Codable, Equatable, Sendable {
+    /// An explicit version or revision supplied by the source. HTTP validators
+    /// and timestamps are deliberately not promoted into this field.
+    public var sourceVersion: String?
+    public var downloadedAt: Date?
+    public var checkedAt: Date?
+    public var lastAttemptAt: Date?
+    public var status: String
+    public var lastError: String?
+
+    public init(sourceVersion: String? = nil, downloadedAt: Date? = nil, checkedAt: Date? = nil,
+                lastAttemptAt: Date? = nil, status: String = "never_checked",
+                lastError: String? = nil) {
+        self.sourceVersion = sourceVersion
+        self.downloadedAt = downloadedAt
+        self.checkedAt = checkedAt
+        self.lastAttemptAt = lastAttemptAt
+        self.status = status
+        self.lastError = lastError
+    }
+}
+
+public struct ReferenceDataState: Codable, Equatable, Sendable {
+    public var clubLogUpdatedAt: Date?
+    public var lotwUpdatedAt: Date?
+    public var clubLogBytes = 0
+    public var lotwBytes = 0
+    public var wavelogCatalogUpdatedAt: Date?
+    public var wavelogCatalogBytes = 0
+    public var activationUpdatedAt: [String: Date] = [:]
+    public var activationBytes: [String: Int] = [:]
+    public var activationCounts: [String: Int] = [:]
+    public var validators: [String: ReferenceDataValidator] = [:]
+    public var sourceMetadata: [String: ReferenceSourceMetadata] = [:]
+
+    public init(clubLogUpdatedAt: Date? = nil, lotwUpdatedAt: Date? = nil, clubLogBytes: Int = 0, lotwBytes: Int = 0, wavelogCatalogUpdatedAt: Date? = nil, wavelogCatalogBytes: Int = 0, activationUpdatedAt: [String: Date] = [:], activationBytes: [String: Int] = [:], activationCounts: [String: Int] = [:], validators: [String: ReferenceDataValidator] = [:], sourceMetadata: [String: ReferenceSourceMetadata] = [:]) {
+        self.clubLogUpdatedAt = clubLogUpdatedAt
+        self.lotwUpdatedAt = lotwUpdatedAt
+        self.clubLogBytes = clubLogBytes
+        self.lotwBytes = lotwBytes
+        self.wavelogCatalogUpdatedAt = wavelogCatalogUpdatedAt
+        self.wavelogCatalogBytes = wavelogCatalogBytes
+        self.activationUpdatedAt = activationUpdatedAt
+        self.activationBytes = activationBytes
+        self.activationCounts = activationCounts
+        self.validators = validators
+        self.sourceMetadata = sourceMetadata
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case clubLogUpdatedAt, lotwUpdatedAt, clubLogBytes, lotwBytes, wavelogCatalogUpdatedAt, wavelogCatalogBytes
+        case activationUpdatedAt, activationBytes, activationCounts, validators, sourceMetadata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        clubLogUpdatedAt = try values.decodeIfPresent(Date.self, forKey: .clubLogUpdatedAt)
+        lotwUpdatedAt = try values.decodeIfPresent(Date.self, forKey: .lotwUpdatedAt)
+        clubLogBytes = try values.decodeIfPresent(Int.self, forKey: .clubLogBytes) ?? 0
+        lotwBytes = try values.decodeIfPresent(Int.self, forKey: .lotwBytes) ?? 0
+        wavelogCatalogUpdatedAt = try values.decodeIfPresent(Date.self, forKey: .wavelogCatalogUpdatedAt)
+        wavelogCatalogBytes = try values.decodeIfPresent(Int.self, forKey: .wavelogCatalogBytes) ?? 0
+        activationUpdatedAt = try values.decodeIfPresent([String: Date].self, forKey: .activationUpdatedAt) ?? [:]
+        activationBytes = try values.decodeIfPresent([String: Int].self, forKey: .activationBytes) ?? [:]
+        activationCounts = try values.decodeIfPresent([String: Int].self, forKey: .activationCounts) ?? [:]
+        validators = try values.decodeIfPresent([String: ReferenceDataValidator].self, forKey: .validators) ?? [:]
+        sourceMetadata = try values.decodeIfPresent([String: ReferenceSourceMetadata].self, forKey: .sourceMetadata) ?? [:]
+    }
+}
+
+public enum ReferenceDataUpdaterError: Error, LocalizedError {
+    case refreshFailed
+
+    public var errorDescription: String? {
+        "One or more reference sources could not be updated; available validated cache was retained."
+    }
+}
+
+/// Never let URLSession forward a ClubLog query key or Wavelog bearer token to
+/// an origin selected by an HTTP redirect (including a TLS downgrade).
+final class CredentialRedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+public actor ReferenceDataUpdater {
+    private struct DownloadResult {
+        var bytes: Int
+        var validator: ReferenceDataValidator
+        var downloaded: Bool
+        var sourceVersion: String?
+    }
+
+    private struct ActivationDownloadResult {
+        var bytes: Int
+        var count: Int
+        var validator: ReferenceDataValidator
+        var downloaded: Bool
+        var sourceVersion: String?
+    }
+
+    private struct ValidatedCache {
+        var data: Data
+        var activationCount: Int = 0
+    }
+
+    private let directory: URL
+    private let session: URLSession
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
+
+    public static let activationSourceURLs: [ActivationReferenceKind: URL] = [
+        .pota: URL(string: "https://pota.app/all_parks_ext.csv")!,
+        .sota: URL(string: "https://www.sotadata.org.uk/summitslist.csv")!,
+        .iota: URL(string: "https://www.iota-world.org/islands-on-the-air/downloads/download-file.html?path=groups.json")!,
+        .wwff: URL(string: "https://wwff.co/wwff-data/wwff_directory.csv")!,
+    ]
+
+    public static func clubLogRequestURL(_ base: URL, apiKey: String) -> URL? {
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        guard components?.scheme?.lowercased() == "https", components?.host != nil,
+              components?.user == nil, components?.password == nil else { return nil }
+        if !apiKey.isEmpty {
+            var items = components?.queryItems ?? []
+            items.removeAll { $0.name == "api" }
+            items.append(URLQueryItem(name: "api", value: apiKey))
+            components?.queryItems = items
+        }
+        return components?.url
+    }
+
+    public static func wavelogCatalogURL(_ base: URL) -> URL? {
+        // Share the QSO client's normalization for a pasted API v2 URL. The
+        // original URL still supplies the stricter catalogue credential guards.
+        guard let normalized = try? WavelogConfiguration(baseURL: base, token: "wl2_catalog_url", stationID: 1).baseURL,
+              let original = URLComponents(url: base, resolvingAgainstBaseURL: false),
+              original.user == nil, original.password == nil,
+              original.query == nil, original.fragment == nil else { return nil }
+        var components = URLComponents(url: normalized, resolvingAgainstBaseURL: false)
+        let path = components?.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
+        guard components?.scheme?.lowercased() == "https", components?.host != nil,
+              components?.user == nil, components?.password == nil,
+              components?.query == nil, components?.fragment == nil else { return nil }
+        let rootPath = path.lowercased().hasSuffix("/index.php")
+            ? String(path.dropLast("/index.php".count))
+            : (path.lowercased() == "index.php" ? "" : path)
+        components?.path = "/" + [rootPath, "index.php/api/v2/catalog"].filter { !$0.isEmpty }.joined(separator: "/")
+        return components?.url
+    }
+
+    /// Opaque source identity only; never persist the underlying URL/key.
+    public static func sourceIdentity(for url: URL, credential: String = "") -> String {
+        let digest = SHA256.hash(data: Data((url.absoluteString + "\u{0}" + credential).utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func defaultDirectory() throws -> URL {
+        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        return support.appendingPathComponent("OM0RX-xLog/Reference Data", isDirectory: true)
+    }
+
+    public init(directory: URL? = nil, session: URLSession = .shared) throws {
+        if let directory { self.directory = directory }
+        else { self.directory = try Self.defaultDirectory() }
+        self.session = session
+        try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+    }
+
+    public func currentState() -> ReferenceDataState {
+        let url = directory.appendingPathComponent("state.json")
+        guard let data = try? Data(contentsOf: url), let state = try? decoder.decode(ReferenceDataState.self, from: data) else { return .init() }
+        return state
+    }
+
+    /// Metadata alone cannot establish cache availability: files may have been
+    /// removed or damaged since their last successful check.
+    public func unavailableCachedSources(sources: Set<String>? = nil) -> Set<String> {
+        var unavailable = Set<String>()
+        for (name, minimumBytes) in [("cty.xml", 10_000), ("lotw-user-activity.csv", 1_000)]
+            where sources?.contains(name) ?? true {
+            if validatedCache(name: name, minimumBytes: minimumBytes) == nil { unavailable.insert(name) }
+        }
+        let catalogName = "wavelog-catalog.json"
+        if (sources?.contains(catalogName) ?? true), validatedCache(name: catalogName, minimumBytes: 0) == nil {
+            unavailable.insert(catalogName)
+        }
+        for kind in Self.activationSourceURLs.keys where sources?.contains(kind.fileName) ?? true {
+            if validatedCache(name: kind.fileName, minimumBytes: 10_000, activationKind: kind) == nil {
+                unavailable.insert(kind.fileName)
+            }
+        }
+        return unavailable
+    }
+
+    public func refresh(clubLogURL: URL, clubLogAPIKey: String, lotwURL: URL) async throws -> ReferenceDataState {
+        var state = currentState()
+        guard let resolvedClubURL = Self.clubLogRequestURL(clubLogURL, apiKey: clubLogAPIKey) else {
+            markAttempt("cty.xml", in: &state)
+            markFailure("cty.xml", in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        markAttempt("cty.xml", in: &state)
+        markAttempt("lotw-user-activity.csv", in: &state)
+        try persist(state)
+        let clubValidator = matchingValidator(state.validators["cty.xml"], for: resolvedClubURL)
+        let lotwValidator = matchingValidator(state.validators["lotw-user-activity.csv"], for: lotwURL)
+        async let club = downloadOutcome(resolvedClubURL, minimumBytes: 10_000, name: "cty.xml", decompressGzip: true, validator: clubValidator, credentialBearing: true)
+        async let lotw = downloadOutcome(lotwURL, minimumBytes: 1_000, name: "lotw-user-activity.csv", validator: lotwValidator)
+        let (clubOutcome, lotwOutcome) = await (club, lotw)
+        state = currentState()
+        switch clubOutcome {
+        case .success(let result):
+            state.clubLogUpdatedAt = Date() // Legacy field means checked, not necessarily downloaded.
+            state.clubLogBytes = result.bytes
+            state.validators["cty.xml"] = identified(result.validator, for: resolvedClubURL)
+            markSuccess("cty.xml", downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+        case .failure: markFailure("cty.xml", in: &state)
+        }
+        switch lotwOutcome {
+        case .success(let result):
+            state.lotwUpdatedAt = Date()
+            state.lotwBytes = result.bytes
+            state.validators["lotw-user-activity.csv"] = identified(result.validator, for: lotwURL)
+            markSuccess("lotw-user-activity.csv", downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+        case .failure: markFailure("lotw-user-activity.csv", in: &state)
+        }
+        try persist(state)
+        guard case .success = clubOutcome, case .success = lotwOutcome else {
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        return state
+    }
+
+    /// Scheduled CTY checks must not also touch LoTW when its own weekly TTL
+    /// has not elapsed. Manual combined refresh retains its original behavior.
+    public func refreshClubLog(_ clubLogURL: URL, apiKey: String) async throws -> ReferenceDataState {
+        var state = currentState()
+        guard let url = Self.clubLogRequestURL(clubLogURL, apiKey: apiKey) else {
+            markAttempt("cty.xml", in: &state)
+            markFailure("cty.xml", in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        markAttempt("cty.xml", in: &state)
+        try persist(state)
+        let result: DownloadResult
+        do {
+            result = try await download(url, minimumBytes: 10_000, name: "cty.xml",
+                decompressGzip: true,
+                validator: matchingValidator(state.validators["cty.xml"], for: url),
+                credentialBearing: true)
+        } catch {
+            state = currentState()
+            markFailure("cty.xml", in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        state = currentState()
+        state.clubLogUpdatedAt = Date()
+        state.clubLogBytes = result.bytes
+        state.validators["cty.xml"] = identified(result.validator, for: url)
+        markSuccess("cty.xml", downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+        try persist(state)
+        return state
+    }
+
+    public func refreshLoTW(_ url: URL) async throws -> ReferenceDataState {
+        var state = currentState()
+        markAttempt("lotw-user-activity.csv", in: &state)
+        try persist(state)
+        let result: DownloadResult
+        do {
+            result = try await download(url, minimumBytes: 1_000, name: "lotw-user-activity.csv",
+                                        validator: matchingValidator(state.validators["lotw-user-activity.csv"], for: url))
+        } catch {
+            state = currentState()
+            markFailure("lotw-user-activity.csv", in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        state = currentState()
+        state.lotwUpdatedAt = Date()
+        state.lotwBytes = result.bytes
+        state.validators["lotw-user-activity.csv"] = identified(result.validator, for: url)
+        markSuccess("lotw-user-activity.csv", downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+        try persist(state)
+        return state
+    }
+
+    public func refreshWavelogCatalog(baseURL: URL, token: String) async throws -> ReferenceDataState {
+        var state = currentState()
+        markAttempt("wavelog-catalog.json", in: &state)
+        try persist(state)
+        // Settings may contain either the installation root or its index.php
+        // front controller. Append the catalogue route exactly once.
+        guard let url = Self.wavelogCatalogURL(baseURL) else {
+            markFailure("wavelog-catalog.json", in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 20)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("OM0RX-xLog/0.2.3", forHTTPHeaderField: "User-Agent")
+        let scopedIdentity = Self.sourceIdentity(for: url, credential: token)
+        let matchedValidator = matchingValidator(state.validators["wavelog-catalog.json"], identity: scopedIdentity)
+        let cached = matchedValidator == nil ? nil : validatedCache(name: "wavelog-catalog.json", minimumBytes: 0)
+        let priorValidator = cached == nil ? nil : matchedValidator
+        apply(priorValidator, to: &request)
+        let result: DownloadResult
+        do {
+            try Task.checkCancellation()
+            let (data, response) = try await session.data(for: request, delegate: CredentialRedirectBlocker())
+            try Task.checkCancellation()
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            let destination = directory.appendingPathComponent("wavelog-catalog.json")
+            if http.statusCode == 304 {
+                guard priorValidator != nil, let cached,
+                      cacheUnchanged(cached, at: destination) else { throw URLError(.cannotParseResponse) }
+                try Task.checkCancellation()
+                result = DownloadResult(bytes: cached.data.count,
+                                        validator: mergedValidator(from: http, fallback: priorValidator),
+                                        downloaded: false,
+                                        sourceVersion: sourceVersion(from: http, payload: nil, name: "wavelog-catalog.json"))
+            } else {
+                guard 200..<300 ~= http.statusCode,
+                      (try? JSONSerialization.jsonObject(with: data)) != nil else { throw URLError(.cannotParseResponse) }
+                try Task.checkCancellation()
+                try data.write(to: destination, options: .atomic)
+                result = DownloadResult(bytes: data.count,
+                                        validator: mergedValidator(from: http, fallback: priorValidator),
+                                        downloaded: true,
+                                        sourceVersion: sourceVersion(from: http, payload: data, name: "wavelog-catalog.json"))
+            }
+        } catch {
+            state = currentState()
+            markFailure("wavelog-catalog.json", in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        state = currentState()
+        state.wavelogCatalogBytes = result.bytes
+        state.wavelogCatalogUpdatedAt = Date()
+        var scopedValidator = result.validator
+        scopedValidator.sourceIdentity = scopedIdentity
+        state.validators["wavelog-catalog.json"] = scopedValidator
+        markSuccess("wavelog-catalog.json", downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+        try persist(state)
+        return state
+    }
+
+    public func refreshActivationDirectories() async throws -> ReferenceDataState {
+        var failed = false
+        for kind in [ActivationReferenceKind.pota, .sota, .iota, .wwff] {
+            do { _ = try await refreshActivationDirectory(kind) }
+            catch { failed = true }
+        }
+        if failed { throw ReferenceDataUpdaterError.refreshFailed }
+        return currentState()
+    }
+
+    public func refreshActivationDirectory(_ kind: ActivationReferenceKind) async throws -> ReferenceDataState {
+        var state = currentState()
+        markAttempt(kind.fileName, in: &state)
+        try persist(state)
+        guard let url = Self.activationSourceURLs[kind] else {
+            markFailure(kind.fileName, in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        let result: ActivationDownloadResult
+        do {
+            result = try await downloadActivationDirectory(url, kind: kind,
+                validator: matchingValidator(state.validators[kind.fileName], for: url))
+        } catch {
+            state = currentState()
+            markFailure(kind.fileName, in: &state)
+            try persist(state)
+            throw ReferenceDataUpdaterError.refreshFailed
+        }
+        state = currentState()
+        let key = kind.rawValue
+        state.activationUpdatedAt[key] = Date()
+        state.activationBytes[key] = result.bytes
+        state.activationCounts[key] = result.count
+        state.validators[kind.fileName] = identified(result.validator, for: url)
+        markSuccess(kind.fileName, downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+        try persist(state)
+        return state
+    }
+
+    /// One normalized whole-pack publication path for imports and downloads.
+    /// Previous and content-addressed snapshots are retained before activation;
+    /// a failed validation/write cannot replace the active pack or edit QSOs.
+    @discardableResult public func importCountryPack(_ data: Data) throws -> String {
+        try CountryReferencePack.withPublicationLock { try publishCountryPack(data) }
+    }
+
+    private func publishCountryPack(_ data: Data) throws -> String {
+        let resolver = try CTYResolver(countryPack: data)
+        let active = directory.appendingPathComponent("country-reference-pack.json")
+        let snapshots = directory.appendingPathComponent("Country Snapshots", isDirectory: true)
+        try FileManager.default.createDirectory(at: snapshots, withIntermediateDirectories: true)
+        func retain(_ bytes: Data, _ value: CTYResolver) throws {
+            let target = snapshots.appendingPathComponent(value.contentDigest + ".json")
+            if !FileManager.default.fileExists(atPath: target.path) { try bytes.write(to: target, options: .atomic) }
+        }
+        try retain(data, resolver)
+        let selection = try CountryReferenceSelection.read(directory: directory)
+        let xmlURL = directory.appendingPathComponent("cty.xml")
+        let xml = try? CTYResolver(xmlURL: xmlURL)
+        let existingPack = (try? Data(contentsOf: active)).flatMap { try? CTYResolver(countryPack: $0) }
+        if let xml, selection?.source == .clubLogXML || existingPack == nil {
+            let bytes = try Data(contentsOf: xmlURL)
+            try bytes.write(to: snapshots.appendingPathComponent(xml.contentDigest + ".xml"), options: .atomic)
+            try bytes.write(to: directory.appendingPathComponent("country-reference-pack.previous.xml"), options: .atomic)
+            try CountryReferenceSelection(source: .clubLogXML, sourceVersion: currentState().sourceMetadata["cty.xml"]?.sourceVersion)
+                .save(directory: directory, previous: true)
+        } else if let bytes = try? Data(contentsOf: active), let previous = try? CTYResolver(countryPack: bytes) {
+            try retain(bytes, previous)
+            if previous.contentDigest != resolver.contentDigest {
+                try bytes.write(to: directory.appendingPathComponent("country-reference-pack.previous.json"), options: .atomic)
+                try CountryReferenceSelection(source: .normalizedPack).save(directory: directory, previous: true)
+            }
+        } else if !FileManager.default.fileExists(atPath: active.path) {
+            let bytes = try CTYResolver.bundledCountryPackBytes(), previous = try CTYResolver(countryPack: bytes)
+            try retain(bytes, previous)
+            if previous.contentDigest != resolver.contentDigest {
+                try bytes.write(to: directory.appendingPathComponent("country-reference-pack.previous.json"), options: .atomic)
+                try CountryReferenceSelection(source: .normalizedPack).save(directory: directory, previous: true)
+            }
+        }
+        let desired = CountryReferenceSelection(source: .normalizedPack, sourceVersion: resolver.countryPack?.sourceVersion)
+        if selection?.source != .clubLogXML { try desired.save(directory: directory) }
+        try data.write(to: active, options: .atomic)
+        if selection?.source == .clubLogXML { try desired.save(directory: directory) }
+        return resolver.snapshotIdentity
+    }
+
+    @discardableResult public func rollbackCountryPack() throws -> String {
+        if let previous = try CountryReferenceSelection.read(directory: directory, previous: true), previous.source == .clubLogXML {
+            return try CountryReferencePack.withPublicationLock {
+                let priorURL = directory.appendingPathComponent("country-reference-pack.previous.xml")
+                let resolver = try CTYResolver(xmlURL: priorURL), bytes = try Data(contentsOf: priorURL)
+                let destination = directory.appendingPathComponent("cty.xml")
+                if let current = try? CTYResolver(xmlURL: destination), let currentBytes = try? Data(contentsOf: destination) {
+                    try currentBytes.write(to: directory.appendingPathComponent("Country Snapshots/\(current.contentDigest).xml"), options: .atomic)
+                }
+                // The restored bytes must not inherit validators/timestamps from
+                // a different download. Clear those before the source switches.
+                var state = currentState()
+                state.validators["cty.xml"] = nil
+                state.sourceMetadata["cty.xml"] = ReferenceSourceMetadata(sourceVersion: previous.sourceVersion, status: "restored")
+                try bytes.write(to: destination, options: .atomic)
+                try persist(state)
+                try previous.save(directory: directory)
+                return resolver.snapshotIdentity
+            }
+        }
+        let previous = directory.appendingPathComponent("country-reference-pack.previous.json")
+        return try importCountryPack(Data(contentsOf: previous))
+    }
+
+    public func refreshCountryPack(_ url: URL) async throws -> ReferenceDataState {
+        // No credential/query-bearing location can enter the manifest/status.
+        guard url.scheme == "https", url.host != nil, url.user == nil, url.password == nil,
+              url.query == nil, url.fragment == nil else { throw URLError(.unsupportedURL) }
+        let name = "country-reference-pack.json"
+        var state = currentState()
+        markAttempt(name, in: &state); try persist(state)
+        do {
+            let result = try await download(url, minimumBytes: 100, name: name,
+                validator: matchingValidator(state.validators[name], for: url), credentialBearing: true)
+            state = currentState(); state.validators[name] = identified(result.validator, for: url)
+            markSuccess(name, downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+            try persist(state); return state
+        } catch {
+            state = currentState(); markFailure(name, in: &state); try persist(state); throw error
+        }
+    }
+
+    private func download(_ url: URL, minimumBytes: Int, name: String, decompressGzip: Bool = false,
+                          validator: ReferenceDataValidator? = nil,
+                          credentialBearing: Bool = false) async throws -> DownloadResult {
+        if credentialBearing {
+            guard url.scheme?.lowercased() == "https", url.host != nil,
+                  url.user == nil, url.password == nil else { throw URLError(.unsupportedURL) }
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 30)
+        request.setValue("OM0RX-xLog/0.2.3", forHTTPHeaderField: "User-Agent")
+        let cached = validator == nil ? nil : validatedCache(name: name, minimumBytes: minimumBytes)
+        let effectiveValidator = cached == nil ? nil : validator
+        apply(effectiveValidator, to: &request)
+        try Task.checkCancellation()
+        let (data, response) = try await (credentialBearing
+            ? session.data(for: request, delegate: CredentialRedirectBlocker())
+            : session.data(for: request))
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let destination = directory.appendingPathComponent(name)
+        if http.statusCode == 304 {
+            guard effectiveValidator != nil, let cached, cacheUnchanged(cached, at: destination) else {
+                throw URLError(.cannotParseResponse)
+            }
+            try Task.checkCancellation()
+            return DownloadResult(bytes: cached.data.count,
+                                  validator: mergedValidator(from: http, fallback: effectiveValidator),
+                                  downloaded: false,
+                                  sourceVersion: sourceVersion(from: http, payload: nil, name: name))
+        }
+        guard 200..<300 ~= http.statusCode, data.count >= minimumBytes else {
+            throw URLError(.cannotParseResponse)
+        }
+        let payload = decompressGzip && data.starts(with: [0x1f, 0x8b]) ? try gunzip(data) : data
+        let temporary = directory.appendingPathComponent(".\(name).download")
+        try payload.write(to: temporary, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try validateReference(payload, name: name, xmlURL: temporary)
+        try Task.checkCancellation()
+        if name == "country-reference-pack.json" {
+            _ = try importCountryPack(payload)
+        } else if name == "cty.xml" {
+            try CountryReferencePack.withPublicationLock {
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+                } else { try FileManager.default.moveItem(at: temporary, to: destination) }
+            }
+        } else if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+        } else {
+            try FileManager.default.moveItem(at: temporary, to: destination)
+        }
+        return DownloadResult(bytes: payload.count,
+                              validator: mergedValidator(from: http, fallback: effectiveValidator),
+                              downloaded: true,
+                              sourceVersion: sourceVersion(from: http, payload: payload, name: name))
+    }
+
+    /// A conditional request is useful only when its local representation is
+    /// usable. Keep its validated bytes so a 304 need not parse it a second time.
+    private func validatedCache(name: String, minimumBytes: Int,
+                                activationKind: ActivationReferenceKind? = nil) -> ValidatedCache? {
+        let url = directory.appendingPathComponent(name)
+        guard let data = try? Data(contentsOf: url), data.count >= minimumBytes else { return nil }
+        do {
+            if let activationKind {
+                let records = try ActivationReferenceDirectory.parse(data: data, kind: activationKind)
+                guard records.count >= minimumActivationCount(for: activationKind) else { return nil }
+                return ValidatedCache(data: data, activationCount: records.count)
+            }
+            if name == "wavelog-catalog.json" {
+                _ = try JSONSerialization.jsonObject(with: data)
+            } else {
+                try validateReference(data, name: name, xmlURL: url)
+            }
+            return ValidatedCache(data: data)
+        } catch {
+            return nil
+        }
+    }
+
+    private func cacheUnchanged(_ cache: ValidatedCache, at url: URL) -> Bool {
+        // The actor yields during download; an external edit/removal must not
+        // let a 304 bless bytes different from the representation we validated.
+        (try? Data(contentsOf: url)) == cache.data
+    }
+
+    private func validateReference(_ data: Data, name: String, xmlURL: URL) throws {
+        if name == "country-reference-pack.json" {
+            _ = try CTYResolver(countryPack: data)
+        } else if name == "cty.xml" {
+            // XML well-formedness alone is not enough: the resolver accepts an
+            // empty document. Demand usable rules from three independent DXCC
+            // regions so an error page or partial XML cannot replace the cache.
+            guard let resolver = try? CTYResolver(xmlURL: xmlURL),
+                  let us = resolver.resolve("K1ABC"),
+                  let germany = resolver.resolve("DL1ABC"),
+                  let japan = resolver.resolve("JA1ABC"),
+                  Set([us.adif, germany.adif, japan.adif]).count == 3 else {
+                throw URLError(.cannotParseResponse)
+            }
+        } else if name == "lotw-user-activity.csv" {
+            guard let text = String(data: data, encoding: .utf8) else { throw URLError(.cannotParseResponse) }
+            let lines = text.split(whereSeparator: \.isNewline)
+            var calls = Set<String>()
+            var records = 0
+            for line in lines {
+                let first = line.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+                let call = first.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\""))).uppercased()
+                guard call.count >= 3, call.count <= 16,
+                      call.contains(where: \.isLetter), call.contains(where: \.isNumber),
+                      call.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "/") }),
+                      line.contains(",") else { continue }
+                records += 1
+                calls.insert(call)
+            }
+            // The public activity file is a large callsign table, not an
+            // arbitrary text response or a repeated header line.
+            guard calls.count >= 20, records * 4 >= lines.count * 3 else {
+                throw URLError(.cannotParseResponse)
+            }
+        }
+    }
+
+    private func downloadActivationDirectory(_ url: URL, kind: ActivationReferenceKind, validator: ReferenceDataValidator?) async throws -> ActivationDownloadResult {
+        var request = URLRequest(url: url, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 90)
+        request.setValue("OM0RX-xLog/0.2.3", forHTTPHeaderField: "User-Agent")
+        let cached = validator == nil ? nil : validatedCache(name: kind.fileName, minimumBytes: 10_000, activationKind: kind)
+        let effectiveValidator = cached == nil ? nil : validator
+        apply(effectiveValidator, to: &request)
+        try Task.checkCancellation()
+        let (data, response) = try await session.data(for: request)
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let destination = directory.appendingPathComponent(kind.fileName)
+        let payload: Data
+        let count: Int
+        if http.statusCode == 304 {
+            guard effectiveValidator != nil, let cached, cacheUnchanged(cached, at: destination) else {
+                throw URLError(.cannotParseResponse)
+            }
+            payload = cached.data
+            count = cached.activationCount
+        } else {
+            guard 200..<300 ~= http.statusCode, data.count >= 10_000 else {
+                throw URLError(.cannotParseResponse)
+            }
+            payload = data
+            let records = try ActivationReferenceDirectory.parse(data: payload, kind: kind)
+            guard records.count >= minimumActivationCount(for: kind) else { throw URLError(.cannotParseResponse) }
+            count = records.count
+        }
+        try Task.checkCancellation()
+
+        if http.statusCode != 304 {
+            let temporary = directory.appendingPathComponent(".\(kind.fileName).download")
+            try payload.write(to: temporary, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            try Task.checkCancellation()
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        }
+        return ActivationDownloadResult(
+            bytes: payload.count,
+            count: count,
+            validator: mergedValidator(from: http, fallback: effectiveValidator),
+            downloaded: http.statusCode != 304,
+            sourceVersion: sourceVersion(from: http, payload: http.statusCode == 304 ? nil : payload,
+                                         name: kind.fileName)
+        )
+    }
+
+    private func downloadOutcome(_ url: URL, minimumBytes: Int, name: String,
+                                 decompressGzip: Bool = false,
+                                 validator: ReferenceDataValidator?,
+                                 credentialBearing: Bool = false) async -> Result<DownloadResult, Error> {
+        do {
+            return .success(try await download(url, minimumBytes: minimumBytes, name: name,
+                                               decompressGzip: decompressGzip, validator: validator,
+                                               credentialBearing: credentialBearing))
+        } catch { return .failure(error) }
+    }
+
+    private func markAttempt(_ source: String, in state: inout ReferenceDataState) {
+        var metadata = state.sourceMetadata[source] ?? .init()
+        metadata.lastAttemptAt = Date()
+        state.sourceMetadata[source] = metadata
+    }
+
+    private func markSuccess(_ source: String, downloaded: Bool, sourceVersion: String?,
+                             in state: inout ReferenceDataState) {
+        var metadata = state.sourceMetadata[source] ?? .init()
+        let now = Date()
+        metadata.lastAttemptAt = metadata.lastAttemptAt ?? now
+        metadata.checkedAt = now
+        if downloaded { metadata.downloadedAt = now }
+        if downloaded || sourceVersion != nil { metadata.sourceVersion = sourceVersion }
+        metadata.status = downloaded ? "downloaded" : "up_to_date"
+        metadata.lastError = nil
+        state.sourceMetadata[source] = metadata
+    }
+
+    private func markFailure(_ source: String, in state: inout ReferenceDataState) {
+        var metadata = state.sourceMetadata[source] ?? .init()
+        metadata.lastAttemptAt = metadata.lastAttemptAt ?? Date()
+        metadata.status = "failed"
+        // Never persist an Error description: URLSession errors can include
+        // source URLs, query-string API keys or server-supplied text.
+        metadata.lastError = "download_or_validation_failed"
+        state.sourceMetadata[source] = metadata
+    }
+
+    private func persist(_ state: ReferenceDataState) throws {
+        try encoder.encode(state).write(to: directory.appendingPathComponent("state.json"), options: .atomic)
+    }
+
+    private func minimumActivationCount(for kind: ActivationReferenceKind) -> Int {
+        switch kind {
+        case .iota: return 1_000
+        case .pota, .sota, .wwff: return 10_000
+        case .castle: return 1
+        }
+    }
+
+    private func matchingValidator(_ validator: ReferenceDataValidator?, for url: URL) -> ReferenceDataValidator? {
+        matchingValidator(validator, identity: Self.sourceIdentity(for: url))
+    }
+
+    private func matchingValidator(_ validator: ReferenceDataValidator?, identity: String) -> ReferenceDataValidator? {
+        guard validator?.sourceIdentity == identity else { return nil }
+        return validator
+    }
+
+    private func identified(_ validator: ReferenceDataValidator, for url: URL) -> ReferenceDataValidator {
+        var value = validator
+        value.sourceIdentity = Self.sourceIdentity(for: url)
+        return value
+    }
+
+    private func apply(_ validator: ReferenceDataValidator?, to request: inout URLRequest) {
+        if let eTag = validator?.eTag, !eTag.isEmpty {
+            request.setValue(eTag, forHTTPHeaderField: "If-None-Match")
+        }
+        if let lastModified = validator?.lastModified, !lastModified.isEmpty {
+            request.setValue(lastModified, forHTTPHeaderField: "If-Modified-Since")
+        }
+    }
+
+    private func mergedValidator(from response: HTTPURLResponse, fallback: ReferenceDataValidator?) -> ReferenceDataValidator {
+        ReferenceDataValidator(
+            eTag: response.value(forHTTPHeaderField: "ETag") ?? fallback?.eTag,
+            lastModified: response.value(forHTTPHeaderField: "Last-Modified") ?? fallback?.lastModified
+        )
+    }
+
+    /// Accept only bounded, printable values from an explicit source field.
+    /// ETag, Last-Modified and download dates remain separate evidence and are
+    /// never converted into a version. Generic X-Version/X-Revision headers are
+    /// ignored because they can identify an API server or proxy rather than the
+    /// validated dataset representation.
+    private func sourceVersion(from response: HTTPURLResponse, payload: Data?, name: String) -> String? {
+        for header in ["X-Reference-Version", "X-Dataset-Version", "X-Data-Version"] {
+            if let value = sanitizedSourceVersion(response.value(forHTTPHeaderField: header)) { return value }
+        }
+        guard let payload else { return nil }
+        if name.hasSuffix(".json"),
+           let object = try? JSONSerialization.jsonObject(with: payload),
+           let dictionary = object as? [String: Any] {
+            let candidates = ["version", "revision", "release", "datasetVersion", "dataVersion"]
+            for candidate in candidates {
+                guard let key = dictionary.keys.first(where: { $0.caseInsensitiveCompare(candidate) == .orderedSame }) else { continue }
+                let raw = dictionary[key]
+                if raw is Bool { continue }
+                if let value = sanitizedSourceVersion(raw as? String ?? (raw as? NSNumber)?.stringValue) { return value }
+            }
+        }
+        if name == "cty.xml",
+           let prefix = String(data: payload.prefix(65_536), encoding: .utf8),
+           let expression = try? NSRegularExpression(
+               pattern: #"<clublog\b[^>]*\b(?:version|revision|release)\s*=\s*[\"']([^\"']+)[\"']"#,
+               options: [.caseInsensitive]
+           ),
+           let match = expression.firstMatch(in: prefix, range: NSRange(prefix.startIndex..., in: prefix)),
+           let range = Range(match.range(at: 1), in: prefix) {
+            return sanitizedSourceVersion(String(prefix[range]))
+        }
+        return nil
+    }
+
+    private func sanitizedSourceVersion(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              (1...80).contains(trimmed.utf8.count),
+              trimmed.unicodeScalars.allSatisfy({ (0x20...0x7e).contains($0.value) }) else { return nil }
+        return trimmed
+    }
+
+    private func gunzip(_ data: Data) throws -> Data {
+        #if os(macOS)
+        var stream = z_stream()
+        guard inflateInit2_(&stream, 15 + 32, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+            throw URLError(.cannotDecodeContentData)
+        }
+        defer { inflateEnd(&stream) }
+        return try data.withUnsafeBytes { input in
+            guard let base = input.bindMemory(to: Bytef.self).baseAddress else { return Data() }
+            stream.next_in = UnsafeMutablePointer(mutating: base)
+            stream.avail_in = uInt(data.count)
+            var output = Data()
+            var status: Int32 = Z_OK
+            repeat {
+                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+                let produced = buffer.withUnsafeMutableBytes { target -> Int in
+                    stream.next_out = target.bindMemory(to: Bytef.self).baseAddress
+                    stream.avail_out = uInt(target.count)
+                    status = inflate(&stream, Z_NO_FLUSH)
+                    return target.count - Int(stream.avail_out)
+                }
+                output.append(contentsOf: buffer.prefix(produced))
+            } while status == Z_OK
+            guard status == Z_STREAM_END else { throw URLError(.cannotDecodeContentData) }
+            return output
+        }
+        #else
+        // The portable worker advertises only Wavelog catalogue refresh. Its
+        // JSON transport needs no gzip/CTY provider or extra native dependency.
+        throw URLError(.cannotDecodeContentData)
+        #endif
+    }
+}

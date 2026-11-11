@@ -1,0 +1,4373 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { BookOpen, Download, Radio, Trophy } from "lucide-react";
+import { flushUnfinishedEditors, UnfinishedEditorWarning } from "./unfinishedEditors";
+import BandMaps, { deduplicateBandMapSpots, type BandMapSpot } from "../live/BandMaps";
+import ClusterPanel from "../live/ClusterPanel";
+import { bearingAndDistance } from "../MapGeography";
+import { contestSchedule } from "./contestSchedule";
+import { selectContestLog } from "./contestLogSelection";
+import { validReviewCall } from "./logReview";
+import { connectMapContext, type MapContext } from "../live/mapContext";
+import { useSharedCW } from "../live/useSharedCW";
+import CWComposition from "../live/CWComposition";
+import { ContestAssistancePanel, type ContestSCPPanelSurface, type SCPSelectionScope } from "./ContestAssistancePanel";
+import { ContestSetupPanel, newContestSetup, restoredESMPreferences, type ContestSetupCatalogEntry, type ContestSetupDocument, type ContestSetupMacro, type SetupView } from "./ContestSetupPanel";
+import { canonicalJSON, ContestMutationUncertain, ContestServerError, type ContestMutation } from "./client";
+import { ContestEntryFields, ContestLogTable, ContestScoreSummary, ContestTextField, type ContestLogRow } from "./ContestPresentation";
+import { nativeContestExportSave, type ContestExportSavePrepared } from "./contestExportSave";
+import { not1mmHistoryCandidate } from "./contestCallHistory";
+import type { ContestRequest } from "./types";
+import { contestInputFieldIDs, contestSurfacePanelIDs, type ContestInputFieldID, type ContestSurfaceActionEnvelope, type ContestSurfacePanelID,
+  type ContestSurfaceProjection, type ContestLogInlineEdit, type ContestManualRow, type ContestManualContext, type ContestPluginLogRow,
+  type ContestCQWWStatisticsRow, type ContestStatisticsRow, type ContestSurfaceSpot, validContestSurfaceProjection, validLegacyMultiplierScope } from "./contestSurfaceProtocol";
+import type { ContestTransitionController } from "./ContestWorkspace";
+import { useContestSurfaceOwner, advanceContestDraftRevision, type ContestDraftRevision } from "./useContestSurfaceOwner";
+import { openContestCallHistoryWindow, openContestSurfaceWindow } from "./contestSurfaceNative";
+import { openContestSetupService } from "./contestSetupServices";
+import { openContestSetupDialog, useContestSetupDialogs, type ContestDigitalSave, type ContestDigitalSnapshot } from "./contestSetupDialogs";
+import { digitalPlatformLimitation } from "../live/digitalPlatform";
+import { defaultContestKeyBindings, encodeContestKeyBindings, readContestKeyBindings, validateContestKeyBindings } from "./contestKeyBindings";
+import { contestModeForSpot, contestSpotWithinModeRange, decodeContestBandPlan, encodeContestBandPlan,
+  type ContestBandMode } from "./contestBandPlan";
+import { setContestCWSpeed, requestContestLaneOutput, type ContestLaneOutputContext } from "./contestStationControl";
+import { configureContestGroupChat, openContestGroupChatWindow, publishContestGroupContact,
+  readContestGroupNetwork, takeContestGroupUnverifiedAcknowledgements,
+  requestContestGroupAuthority, syncContestGroupReplicaPage,
+  type ContestGroupChatSnapshot } from "./contestGroupChat";
+import { ContestVoiceOutput, captureContestVoiceTarget, type ContestVoiceAction } from "./contestVoiceOutput";
+import "./ContestWorkspace.css";
+import { ContestCallStackOwner } from "./ContestCallStackOwner";
+import { ContestCallStack, callStackStorageKey, type CallStackDraft, type ParkedCallStackDraft, type CallStackOperation, type CallStackResult } from "./contestCallStack";
+import { ContestReverseHistoryPanel } from "./ContestReverseHistoryPanel";
+import { ContestVisibleDupesheet } from "./ContestVisibleDupesheet";
+import { ContestNotesPanel, ContestSubmissionPanel, type NoteTarget } from "./ContestProductivityTools";
+import { ContestHistoricalImport } from "./ContestHistoricalImport";
+import "./ContestProductivityTools.css";
+import { ContestReminders, type Sked, type PlannedMove } from "./ContestReminders";
+import { ContestQTC } from "./ContestQTC";
+import { bookmarkQTC, reviewQTC } from "./contestRecorder";
+import { useQTCOpportunities } from "./contestQTCOpportunities";
+import { readDirectedPass, executeDirectedPass } from "./contestDirectedPass";
+import { ContestVHFDesk } from "./ContestVHFDesk";
+import { ContestDeveloperKit } from "./ContestDeveloperKit";
+import { ContestOpportunities } from "./ContestOpportunities";
+import { ContestMessageWorkbench } from "./ContestMessageWorkbench";
+import { ContestOperatingInfo } from "./ContestOperatingInfo";
+import { ContestIntegrationDelivery } from "./ContestIntegrationDelivery";
+import { ContestDigitalOperating } from "./ContestDigitalOperating";
+import { RatesClock } from "./ContestSecondaryPanels";
+import { planningMutation, planningRecoveryKey } from "./contestPlanningRecovery";
+import { occupiedStackDraft } from "./contestCallStack";
+import { tuneContestReminder } from "./contestSpotTune";
+import type {CapturedContestTune} from "./contestSpotTune";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { ContestOperatingLanes, type ContestLaneAction, type ContestOperatingLane } from "./ContestOperatingLanes";
+import { ContestCWCorrectionPanel } from "./ContestCWCorrectionPanel";
+import { assertContestLaneScope, captureContestLaneScope, contestLaneParams, contestLaneProjection, contestLaneSnapshot, contestLaneTuningBlockReason,
+  dualContestLanes, mergeContestLaneBuffer, type CapturedContestLaneScope, type ContestLaneBuffer,
+  type ContestLaneID, type ContestLaneProjectionSource } from "./contestLaneScope";
+
+type Data = Record<string, any>;
+type RTCStatus={configured:boolean;enabled:boolean;service:string|null;username:string;interval_minutes:number;posting:boolean;
+  consecutive_failures:number;last_outcome:string;last_attempt:string|null;next_attempt:string|null};
+export function rtcReportState(status:RTCStatus|null):"disabled"|"scheduled"|"posting"|"sent"|"failed"|"paused" {
+  if(status?.posting)return "posting";
+  if(status?.consecutive_failures===3&&!status.enabled)return "paused";
+  if(status?.last_attempt&&status.consecutive_failures>0)return "failed";
+  if(status?.last_attempt&&status.consecutive_failures===0)return "sent";
+  return status?.enabled?"scheduled":"disabled";
+}
+export function rtcConfigurationRequired(currentKey:string,nextKey:string,status:RTCStatus|null):boolean {
+  return currentKey!==nextKey||status?.configured===false;
+}
+type ClientAction="commit"|"correct"|"delete";
+type PendingClientMutation={schemaVersion:1;localSessionID:string;localWorkspaceGeneration:string;authoritySessionID:string;
+  authorityWorkspaceGeneration:string;draftID:string;action:ClientAction;baseRevision:number;requestID:string;qsoID:string;
+  params:Record<string,unknown>;createdAt:number};
+const pendingClientPrefix="xlog.contest.pending-client-mutation.v1/";
+const pendingClientQuarantinePrefix="xlog.contest.pending-client-mutation-quarantine.v1/";
+const uuidPattern=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const exactKeys=(value:Record<string,unknown>,keys:string[])=>Object.keys(value).length===keys.length&&keys.every(key=>key in value);
+function validClientParams(action:ClientAction,value:unknown,qsoID:string,baseRevision:number){
+  if(!value||typeof value!=="object"||Array.isArray(value))return false;const params=value as Record<string,unknown>;
+  const common=typeof params.action==="string"&&params.action===action&&params.qsoID===qsoID;
+  if(!common)return false;
+  if(action==="delete")return exactKeys(params,["action","qsoID","baseRevision","reason"])&&
+    params.baseRevision===baseRevision&&typeof params.reason==="string"&&params.reason.length<=1024;
+  const fields=params.fields;
+  if(!fields||typeof fields!=="object"||Array.isArray(fields)||Object.keys(fields).length>64||
+      !Object.values(fields).every(item=>typeof item==="string"&&new TextEncoder().encode(item).length<=4096))return false;
+  if(action==="correct")return exactKeys(params,["action","qsoID","baseRevision","timestamp","frequencyHz","receiveFrequencyHz","power","operator","fields","reason"])&&
+    params.baseRevision===baseRevision&&typeof params.timestamp==="string"&&params.timestamp.length<=64&&
+    Number.isSafeInteger(params.frequencyHz)&&Number(params.frequencyHz)>0&&Number.isSafeInteger(params.receiveFrequencyHz)&&
+    Number(params.receiveFrequencyHz)>=0&&Number(params.receiveFrequencyHz)<=100_000_000_000&&
+    typeof params.power==="string"&&/^\d{0,8}$/.test(params.power)&&typeof params.operator==="string"&&
+    typeof params.reason==="string"&&params.reason.length<=1024;
+  const keys=Object.keys(params),allowed=["action","qsoID","timestamp","frequencyHz","mode","operator","fields","serialRequestID"];
+  return keys.every(key=>allowed.includes(key))&&keys.length===(params.serialRequestID===undefined?7:8)&&
+    typeof params.timestamp==="string"&&params.timestamp.length<=64&&Number.isSafeInteger(params.frequencyHz)&&Number(params.frequencyHz)>0&&
+    typeof params.mode==="string"&&typeof params.operator==="string"&&
+    (params.serialRequestID===undefined||uuidPattern.test(String(params.serialRequestID)));
+}
+function validPendingClientMutation(value:unknown):value is PendingClientMutation{
+  if(!value||typeof value!=="object"||Array.isArray(value))return false;const item=value as Record<string,unknown>;
+  if(!exactKeys(item,["schemaVersion","localSessionID","localWorkspaceGeneration","authoritySessionID","authorityWorkspaceGeneration",
+      "draftID","action","baseRevision","requestID","qsoID","params","createdAt"])||item.schemaVersion!==1||
+      ![item.localSessionID,item.localWorkspaceGeneration,item.authoritySessionID,item.authorityWorkspaceGeneration,item.draftID,item.requestID,item.qsoID]
+        .every(value=>uuidPattern.test(String(value)))||!["commit","correct","delete"].includes(String(item.action))||
+      !Number.isSafeInteger(item.baseRevision)||Number(item.baseRevision)<0||!Number.isSafeInteger(item.createdAt)||Number(item.createdAt)<=0)return false;
+  return validClientParams(item.action as ClientAction,item.params,item.qsoID as string,item.baseRevision as number);
+}
+function pendingScope(localSessionID:string,localWorkspaceGeneration:string,draftID:string,action:ClientAction,baseRevision:number){
+  return `${pendingClientPrefix}${localSessionID}/${localWorkspaceGeneration}/${draftID}/${action}/${baseRevision}/`;
+}
+function pendingStorageKey(item:PendingClientMutation){return `${pendingScope(item.localSessionID,item.localWorkspaceGeneration,item.draftID,item.action,item.baseRevision)}${item.qsoID}/${item.authoritySessionID}/${item.authorityWorkspaceGeneration}`;}
+function quarantinePendingClientMutation(key:string,raw:string|null,reason:"invalid"|"stale"):never{
+  const warning=`This pending contest operation is ${reason} and may already be logged by the master. Quarantine the preserved record now? You must review the master log before retrying.`;
+  if(!window.confirm(warning))throw new Error(`The ${reason} pending contest operation remains blocked; no new operation was sent.`);
+  const quarantineKey=`${pendingClientQuarantinePrefix}${Date.now()}/${crypto.randomUUID()}`;
+  localStorage.setItem(quarantineKey,raw??"");localStorage.removeItem(key);
+  throw new Error("The pending contest operation was quarantined with its raw evidence. Review the master log before retrying; this attempt was stopped.");
+}
+export function storedPendingClientMutation(scope:string,authoritySessionID:string,authorityWorkspaceGeneration:string){
+  for(let index=0;index<localStorage.length;index+=1){const key=localStorage.key(index);if(!key?.startsWith(scope))continue;
+    const raw=localStorage.getItem(key);let value:unknown;try{value=JSON.parse(raw??"");}catch{return quarantinePendingClientMutation(key,raw,"invalid");}
+    if(!validPendingClientMutation(value)||pendingStorageKey(value)!==key)return quarantinePendingClientMutation(key,raw,"invalid");
+    if(value.authoritySessionID===authoritySessionID&&value.authorityWorkspaceGeneration===authorityWorkspaceGeneration)return value;
+    return quarantinePendingClientMutation(key,raw,"stale");
+  }
+  return null;
+}
+function persistPendingClientMutation(item:PendingClientMutation){
+  const key=pendingStorageKey(item),encoded=JSON.stringify(item);localStorage.setItem(key,encoded);
+  let restored:unknown;try{restored=JSON.parse(localStorage.getItem(key)??"");}catch{restored=null;}
+  if(!validPendingClientMutation(restored)||canonicalJSON(restored)!==canonicalJSON(item))throw new Error("The pending contest operation could not be durably saved; no network operation was sent.");
+  return item;
+}
+export function authoritativeChangeRevision(row:Record<string,unknown>):number{
+  const revision=Number(row.change_revision);
+  if(!Number.isSafeInteger(revision)||revision<=0)throw new Error("Synchronise this contact's authoritative revision before changing it.");
+  return revision;
+}
+type ContestFunctionKey = "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12";
+type Request = (method: string, params?: Record<string, unknown>) => Promise<unknown>;
+type Field = { id: string; label: string; accessibleName: string; value: string; visible: boolean; readOnly: boolean; enabled: boolean };
+type Score = { qsos: number; points: number; countries: number; zones: number; multipliers?: number; uniqueCalls?: number; prefixes?: number; sections?: number; headquarters?: number; gridSquares?: number; states?: number; exchangeBandMultipliers?: number; rdaDistricts?: number; oblasts?: number; prefectures?: number; multiplierSummaryLabels?: string[]; total: number; scoringComplete?: boolean; scoringLimitations?: string[] };
+type ContestBandDefinition = { id: string; lowHz: number; highHz: number; value: number };
+type ContestSurfaceMode = "CW" | "SSB" | "RTTY" | "AM" | "FM";
+type PythonContestExportFormat = "cabrillo" | "adif" | "edi";
+type StatisticsState = { sessionID: string; revision: number } & (
+  { layout: "generic"; rows: ContestStatisticsRow[]; total: ContestStatisticsRow } |
+  { layout: "cq_ww"; rows: ContestCQWWStatisticsRow[]; total: ContestCQWWStatisticsRow });
+type AuxiliaryLane = "log" | "score" | "rates";
+type Projection = ContestLaneProjectionSource & {
+  practice?: {sourceSessionID:string;sourceRevision:number;nativeOutputDisabled:boolean;publicPostingDisabled:boolean}|null;
+  sessionID: string; engine: "not1mm-python"; pluginID: string; pluginName?: string; reservedSerial?: number | null; allocatedSerialFieldID?: string | null; sourceRevision: string; referenceID: string;
+  workspaceGeneration: string; revision: number; spotScoreRevision?: number; draftID: string; fields: Field[]; frequencyHz: number; mode: string; band: number;
+  focus: string; tabNext: Record<string, string>; tabPrevious: Record<string, string>; advanceOnSpace?: string[]; run: boolean;
+  functionKeys: Array<{ id: string; highlighted: boolean; label?: string; template?: string }>; dupe: boolean; dupeExplanation?: string; countryResolved: boolean;
+  entryMultiplierStatus?: import("./contestSurfaceProtocol").ContestEntryMultiplierStatus;
+  matrixTrackers?: Array<"countries" | "zones">;
+  multiplierViewStatus?: Record<string,"supported"|"not-implemented"|"not-applicable">;
+  entryPolicy?: {enter:"manual"|"esm";clearOnVFOChange:boolean;leaveRunOnRetune:boolean};
+  duplicateChecking?: boolean; spaceNext?: Record<string,string>; nextField?: string;
+  filterSpotRanges?: boolean; spotModeCategory?: string;
+  exportFormats?: PythonContestExportFormat[];
+  ruleIdentity?: { id: string; version: string; edition: string; sourceRevision: string };
+  supportedBands?: string[]; supportedModes?: string[]; allowDuplicateCommit?: boolean;
+  fldigiReceiveSupported?: boolean; fldigiTransmitSupported?: boolean; fldigiTransmitAvailable?: boolean;
+  digitalLoggingSupported?: boolean;
+  columns?: string[];
+  exchangeWarnings?:import("./contestSurfaceProtocol").ContestExchangeWarning[];
+  history: string; score: Score; operator?: string; roverLocation?: string; cwSpeedWpm?: number | null;
+  callContext?: Partial<ContestManualContext> & {callsign?:string;primaryPrefix?:string};
+  replicaCursor?: { revision:number; sequence:number } | null;
+  replicaAuthority?: { sessionID:string; workspaceGeneration:string } | null;
+  authoritySerialRequestID?: string | null;
+};
+type ContestPathContext = { callsign: string; country: string | null; cqZone: number | null; ituZone: number | null;
+  latitude: number | null; longitude: number | null; headingDegrees: number | null;
+  longPathHeadingDegrees: number | null; distanceKm: number | null };
+type ContestPathTarget = Pick<ContestPathContext, "latitude" | "longitude">;
+export function contestPathMetrics(home: MapContext["metadata"]["home"], target: ContestPathTarget | null) {
+  if (!home || !target || target.latitude === null || target.longitude === null ||
+      !Number.isFinite(target.latitude) || !Number.isFinite(target.longitude)) return null;
+  const route = bearingAndDistance([home.lon, home.lat], [target.longitude, target.latitude]);
+  return { headingDegrees:Math.round(route.shortBearing), longPathHeadingDegrees:Math.round(route.longBearing),
+    distanceKm:Math.round(route.distanceKm) };
+}
+type Session = { sessionID: string; workspaceGeneration: string; name: string; pluginID: string; sourceRevision: string; revision: number };
+type MutationResult = { operationID?: string; revision?: number; projection: Projection; actions?: Data[]; messages?: string[]; replayed?: boolean; outputError?: string; effectiveMacros?: ContestSetupMacro[] };
+type PhoneIntentOrigin = Pick<Projection, "sessionID" | "workspaceGeneration" | "draftID" | "revision" | "sourceRevision">;
+type PhoneSimulationTrace = { operationID: string; mode: "SSB"; macro: string; text: string; status: "confirmed" };
+class PhoneSimulationStopped extends Error {
+  constructor() { super("The contest phone simulation was stopped."); this.name = "PhoneSimulationStopped"; }
+}
+class PhoneSimulationClaimUncertain extends Error {
+  constructor() {
+    super("The phone output claim could not be confirmed. Reopen the contest session to reconcile its revision before sending another key.");
+    this.name = "PhoneSimulationClaimUncertain";
+  }
+}
+const phoneClaimReplyTimeoutMs = 2_000;
+function abortPhoneWait<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new PhoneSimulationStopped());
+  return new Promise<T>((resolve, reject) => {
+    const stopped = () => reject(new PhoneSimulationStopped());
+    signal.addEventListener("abort", stopped, { once: true });
+    promise.then(value => { signal.removeEventListener("abort", stopped); resolve(value); },
+      cause => { signal.removeEventListener("abort", stopped); reject(cause); });
+  });
+}
+type Props = {
+  request: Request;
+  serviceRequest: Request;
+  stationTune: (frequencyHz: number, mode: string) => Promise<unknown>;
+  captureStationTune?:()=>Promise<CapturedContestTune>;
+  stationStep?: (direction: "up" | "down") => Promise<unknown>;
+  rotorStop?: () => Promise<unknown>;
+  contestSpot: (callsign: string, frequencyHz: number) => Promise<unknown>;
+  operatingContext: string;
+  workspaceGeneration: string;
+  stationCall: string;
+  contestingTest?: boolean;
+  radioFrequencyHz?: number;
+  spots: BandMapSpot[];
+  cluster: any;
+  selectedSpotId?: string | null;
+  onSelectedSpot?: (id: string) => void;
+  onSetupViewChange?: (view: SetupView | null) => void;
+  onSessionOpened?: (session: Pick<Session, "sessionID" | "workspaceGeneration">) => void;
+  registerTransition?: (controller: ContestTransitionController | null) => void;
+  registerMenuRoute?: (handler: ((route: string) => boolean | Promise<boolean>) | null) => void;
+  strictHostActive?: { sessionID: string; workspaceGeneration: string } | null;
+  setupOnly?: boolean;
+};
+
+const activeSessionKey = "xlog.contesting.not1mm.active-session.v1";
+const setupDraftKey = "xlog.contesting.not1mm.setup-draft.v1";
+const spotWorkflowKey = "xlog.contesting.not1mm.spot-workflow.v2";
+export const contestSpotWorkflowMaxEntries = 2_000;
+export const contestSpotWorkflowMaxBytes = 1_048_576;
+export const contestSpotWorkflowTTLms = 7 * 24 * 60 * 60 * 1_000;
+const initialLogPageSize = 20;
+const contestBands = ["160m", "80m", "40m", "20m", "15m", "10m"];
+// Compatibility for protocol-v1/older test catalogs. The current host supplies
+// these definitions from the pinned Not1MM plan and remains the authority.
+const fallbackBandDefinitions: ContestBandDefinition[] = [
+  ["160m",1_800_000,2_000_000,1.8],["80m",3_500_000,4_000_000,3.5],["40m",7_000_000,7_300_000,7],
+  ["20m",14_000_000,14_350_000,14],["15m",21_000_000,21_450_000,21],["10m",28_000_000,29_700_000,28],
+  ["6m",50_000_000,54_000_000,50],["2m",144_000_000,148_000_000,144],["1.25m",222_000_000,225_000_000,222],
+  ["70cm",420_000_000,450_000_000,432],["33cm",902_000_000,928_000_000,902],["23cm",1_240_000_000,1_300_000_000,1296],
+  ["13cm",2_300_000_000,2_450_000_000,2300],["9cm",3_300_000_000,3_500_000_000,3300],
+  ["6cm",5_650_000_000,5_925_000_000,5650],["3cm",10_000_000_000,10_500_000_000,10000],
+  ["1.25cm",24_000_000_000,24_250_000_000,24000],["6mm",47_000_000_000,47_200_000_000,47000],
+  ["4mm",75_500_000_000,81_000_000_000,75500],["2.5mm",119_980_000_000,123_000_000_000,119980],
+  ["2mm",134_000_000_000,149_000_000_000,134000],["1mm",241_000_000_000,250_000_000_000,241000],
+  ["submm",300_000_000_000,7_500_000_000_000,300000],
+].map(([id, lowHz, highHz, value]) => ({ id: String(id), lowHz: Number(lowHz), highHz: Number(highHz), value: Number(value) }));
+const validBandDefinitions = (value: unknown): ContestBandDefinition[] => Array.isArray(value) ? value.filter((item): item is ContestBandDefinition => {
+  const band = item as Partial<ContestBandDefinition>;
+  return typeof band?.id === "string" && band.id.length > 0 && Number.isSafeInteger(band.lowHz) && Number.isSafeInteger(band.highHz) &&
+    Number(band.lowHz) >= 0 && Number(band.highHz) > Number(band.lowHz) && typeof band.value === "number" && Number.isFinite(band.value);
+}) : [];
+const defaultBandLabels: Record<string, string> = Object.fromEntries(fallbackBandDefinitions.map(band => [String(band.value), band.id]));
+const contestPhoneIntentPlugins = new Set(["arrl_ss_phone", "cq_wpx_ssb", "cq_ww_ssb", "euhfc", "iaru_hf", "arrl_10m", "wae_ssb"]);
+const serialPrefixPlugins = new Set(["cq_wpx_cw", "cq_wpx_ssb", "trans_tasman", "oceania_dx_cw", "oceania_dx_ssb"]);
+const sweepstakesPlugins = new Set(["arrl_ss_cw", "arrl_ss_phone"]);
+const contestInputFieldID = (value: unknown): value is ContestInputFieldID =>
+  typeof value === "string" && contestInputFieldIDs.includes(value as ContestInputFieldID);
+const contestTabMap = (value: Record<string, string>) => Object.fromEntries(Object.entries(value)
+  .filter(([from, to]) => contestInputFieldID(from) && contestInputFieldID(to))) as Partial<Record<ContestInputFieldID, ContestInputFieldID>>;
+const activeContestKeyBindings = (value: unknown) => {
+  try { return validateContestKeyBindings(encodeContestKeyBindings(readContestKeyBindings(value))); }
+  catch { return structuredClone(defaultContestKeyBindings); }
+};
+const rttyContestModeAliases = new Set(["RTTY", "RTTY-R", "LSB-D", "USB-D", "AM-D", "FM-D",
+  "DIGI-U", "DIGI-L", "RTTYR", "PKTLSB", "PKTUSB"]);
+const canonicalContestSurfaceMode = (value: unknown): ContestSurfaceMode | null => {
+  const mode = typeof value === "string" ? value.trim().toUpperCase() : "";
+  if (mode === "CW" || mode === "SSB" || mode === "AM" || mode === "FM") return mode;
+  if (mode === "LSB" || mode === "USB" || mode === "PH" || mode === "PHONE") return "SSB";
+  return rttyContestModeAliases.has(mode) ? "RTTY" : null;
+};
+const contestSurfaceModes = (values: readonly unknown[], fallback: unknown): ContestSurfaceMode[] => {
+  const modes = values.map(canonicalContestSurfaceMode).filter((mode): mode is ContestSurfaceMode => mode !== null);
+  const fallbackMode = canonicalContestSurfaceMode(fallback);
+  return [...new Set(modes.length ? modes : fallbackMode ? [fallbackMode] : ["CW"] as ContestSurfaceMode[])];
+};
+const contestSpotSurfaceModes = (_pluginID: unknown, values: readonly unknown[], configuredMode: unknown): ContestSurfaceMode[] => {
+  const allowed=contestSurfaceModes(values,configuredMode),category=canonicalContestSurfaceMode(configuredMode);
+  if(configuredMode==="DIGITAL")return allowed.filter(mode=>mode==="RTTY");
+  if(configuredMode==="SSB+CW")return allowed.filter(mode=>mode==="SSB"||mode==="CW");
+  return category?allowed.filter(mode=>mode===category):allowed;
+};
+const contestBandMode = (value: unknown): ContestBandMode => {
+  const mode = canonicalContestSurfaceMode(value);
+  return mode === "CW" ? "cw" : mode === "RTTY" ? "data" : "phone";
+};
+const contestBandModeLabel = (mode: ContestBandMode) => mode === "cw" ? "CW" : mode === "data" ? "RTTY" : "SSB";
+const errorMessage = (cause: unknown) => cause instanceof Error ? cause.message :
+  typeof cause === "string" && cause.trim() ? cause : "Contest operation failed.";
+const contestFrequency = (value: unknown, supportedBands: readonly string[], bandDefinitions: readonly ContestBandDefinition[]): number | null => {
+  const frequency = typeof value === "number" ? Math.round(value) : NaN;
+  if (!Number.isSafeInteger(frequency)) return null;
+  const band = bandDefinitions.find(definition => frequency >= definition.lowHz && frequency < definition.highHz)?.id;
+  return band && supportedBands.includes(band) ? frequency : null;
+};
+const manualFrequency = (value: string, supportedBands: readonly string[], bandDefinitions: readonly ContestBandDefinition[]): number | null => {
+  const mhz = Number(value.trim());
+  return Number.isFinite(mhz) ? contestFrequency(mhz * 1_000_000, supportedBands, bandDefinitions) : null;
+};
+const correctedReceiveFrequency = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!/^\d{1,12}$/.test(trimmed)) return null;
+  const frequency = Number(trimmed);
+  return Number.isSafeInteger(frequency) && frequency >= 0 && frequency <= 100_000_000_000 ? frequency : null;
+};
+const correctedPower = (value: string): string | null => {
+  const trimmed = value.trim();
+  return trimmed === "" || /^\d{1,8}$/.test(trimmed) ? trimmed : null;
+};
+const clearedContestFields = (projection: Projection, mode: string) => {
+  const defaultReport = ["SSB", "AM", "FM"].includes(canonicalContestSurfaceMode(mode) ?? "") ? "59" : "599";
+  return Object.fromEntries(projection.fields.map(field => [field.id,
+    field.id === "callsign" ? "" : field.readOnly ? field.value
+      : field.id === "sent" || field.id === "receive" ? defaultReport : ""]));
+};
+
+function restoredSetup(stationCall: string): ContestSetupDocument {
+  const defaults = newContestSetup(stationCall);
+  try {
+    const raw = localStorage.getItem(setupDraftKey);
+    if (!raw) return defaults;
+    const saved = JSON.parse(raw) as Partial<ContestSetupDocument>;
+    if (!saved || typeof saved !== "object" || Array.isArray(saved)) return defaults;
+    const preferences={ ...defaults.preferences, ...restoredESMPreferences(saved.preferences ?? {}) };
+    delete preferences.rtcPassword;
+    return { ...defaults, ...saved,
+      station: { ...defaults.station, ...(saved.station ?? {}) },
+      settings: { ...defaults.settings, ...(saved.settings ?? {}) },
+      preferences,
+      network: { ...defaults.network, ...(saved.network ?? {}) },
+      macros: Array.isArray(saved.macros) ? saved.macros : defaults.macros };
+  } catch { return defaults; }
+}
+
+function unwrap<T>(value: unknown): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The contest host returned an invalid response.");
+  const frame = value as Data;
+  if (typeof frame.id !== "string" || typeof frame.ok !== "boolean") throw new Error("The contest host response could not be correlated.");
+  if (!frame.ok) throw new ContestServerError(typeof frame.error?.code === "string" ? frame.error.code : "contest_rejected",
+    typeof frame.error?.message === "string" ? frame.error.message : "The contest host rejected the operation.",
+    frame.error?.outcome === "uncertain" ? "uncertain" : "confirmed");
+  if (!frame.result || typeof frame.result !== "object" || Array.isArray(frame.result)) throw new Error("The contest host returned no result.");
+  return frame.result as T;
+}
+
+async function payloadDigest(payload: Record<string, unknown>) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJSON(payload)));
+  return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
+}
+
+function projectionFields(projection: Projection | null) {
+  return Object.fromEntries((projection?.fields ?? []).map(field => [field.id, field.value]));
+}
+
+function scoreSummary(score: Score | null, pluginID?: string) {
+  if (!score) return null;
+  const multiplierLabels = score.multiplierSummaryLabels ? [...score.multiplierSummaryLabels] : (score.uniqueCalls !== undefined ? [`${score.uniqueCalls} unique calls`]
+    : score.prefixes !== undefined ? [`${score.prefixes} prefixes`] : score.sections !== undefined ? [`${score.sections} sections`]
+    : pluginID === "nac_vhf" ? [`${score.gridSquares ?? 0} grid squares`]
+    : pluginID === "cq_ww_rtty" ? [`${score.countries} countries`, `${score.zones} zones`, `${score.states ?? 0} states/provinces`]
+    : pluginID === "arrl_dx_cw" || pluginID === "arrl_dx_ssb" ? [`${score.countries} countries`, `${score.states ?? 0} states/provinces`]
+    : pluginID === "cqws" ? [`${score.countries} countries`, `${score.exchangeBandMultipliers ?? 0} Brazilian units by band`]
+    : pluginID === "rda_contest" ? [`${score.countries} countries`, `${score.rdaDistricts ?? 0} RDA districts`]
+    : pluginID === "rdxc" ? [`${score.countries} countries`, `${score.oblasts ?? 0} oblasts`]
+    : pluginID === "euhfc" ? [`${score.multipliers ?? 0} license years`]
+    : pluginID === "iaru_hf" ? [`${score.headquarters ?? 0} headquarters`, `${score.zones} zones`]
+    : pluginID?.startsWith("cq_ww_") ? [`${score.countries} countries`, `${score.zones} zones`]
+    : [`${score.multipliers ?? 0} multipliers (plugin)`]);
+  if (score.scoringComplete === false) multiplierLabels.push(...(score.scoringLimitations ?? ["Some scoring information is unavailable."]));
+  return { claimedScore: score.total, qsos: score.qsos, points: score.points,
+    ...(score.scoringComplete === false ? {scoringComplete:false} : {}),
+    multipliers: score.multipliers ?? score.countries + score.zones, multiplierLabels,
+    multiplierDisplayLabels: multiplierLabels, sourceVerification: score.scoringComplete === false ? "unverified" as const : "verified" as const };
+}
+
+function sameFields(left: Record<string, string>, right: Record<string, string>) {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every(key => (left[key] ?? "") === (right[key] ?? ""));
+}
+
+const groupContestIdentity = (value: ContestSetupDocument) => [value.pluginID.trim().toLowerCase(),
+  String(value.settings.StartDate ?? "").trim(), String(value.station.Call ?? "").trim().toUpperCase()].join("|");
+
+function canonicalWorkedAt(value: unknown) {
+  const normalized = `${String(value ?? "").replace(" ", "T")}Z`;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? normalized : parsed.toISOString();
+}
+
+function receivedExchange(row: Data, pluginID?: string): string {
+  if (pluginID === "euhfc") return String(row.NR ?? "");
+  if (pluginID === "icwc_mst") return `${row.Name ?? ""} ${row.NR ?? ""}`.trim();
+  if (pluginID === "cwo") return `${row.NR ?? ""} ${row.Name ?? ""}`.trim();
+  if (pluginID && sweepstakesPlugins.has(pluginID)) return [row.NR, row.Prec, row.Call, row.CK, row.Sect].filter(value => value !== undefined && value !== "").join(" ");
+  return String(pluginID && serialPrefixPlugins.has(pluginID) ? row.NR ?? "" : row.ZN ?? row.Exchange1 ?? "");
+}
+function correctionExchangeValues(row: Data, pluginID?: string) {
+  if (pluginID === "cwt") {
+    const name = String(row.Name ?? ""), packed = String(row.NR ?? "");
+    const prefix = `${name} `;
+    return { other_1: name, other_2: name && packed.toUpperCase().startsWith(prefix.toUpperCase()) ? packed.slice(prefix.length) : packed };
+  }
+  if (pluginID === "k1usn_sst") return { other_1: String(row.Name ?? ""), other_2: String(row.Sect ?? "") };
+  return { other_1: String(row.SentNr ?? ""), other_2: receivedExchange(row, pluginID) };
+}
+function correctionFieldValue(row: Data, raw: Record<string, unknown>, fieldID: "other_1" | "other_2", pluginID?: string): string {
+  const rawValue = raw[fieldID];
+  if (rawValue !== undefined && rawValue !== null && !(pluginID === "cq_ww_ssb" && fieldID === "other_2" && String(rawValue).trim() === ""))
+    return String(rawValue);
+  return correctionExchangeValues(row, pluginID)[fieldID];
+}
+function logRows(rows: Data[], pluginID?: string, labels: Record<string, string> = defaultBandLabels): ContestLogRow[] {
+  return rows.map(row => ({
+    qsoID: String(row.ID ?? ""), workedAt: canonicalWorkedAt(row.TS), callsign: String(row.Call ?? ""),
+    band: labels[String(row.Band)] ?? String(row.Band ?? ""), mode: String(row.Mode ?? "CW"),
+    sentExchange: String(row.SentNr ?? ""), receivedExchange: receivedExchange(row, pluginID),
+    points: Number(row.Points ?? 0), multiplierLabels: pluginID === "icwc_mst" || pluginID === "cwo" ? []
+      : pluginID && serialPrefixPlugins.has(pluginID) ? [String(row.WPXPrefix ?? "")].filter(Boolean)
+      : pluginID && sweepstakesPlugins.has(pluginID) ? [row.Sect ? `Section ${row.Sect}` : ""].filter(Boolean)
+      : [String(row.CountryPrefix ?? ""), row.ZN ? `Zone ${row.ZN}` : ""].filter(Boolean),
+  }));
+}
+function manualRows(rows: Data[]): ContestManualRow[] {
+  return rows.map(row => ({ qsoID: String(row.ID ?? ""), TS: String(row.TS ?? ""), Call: String(row.Call ?? ""),
+    Freq: String(row.Freq ?? ""), SNT: String(row.SNT ?? ""), RCV: String(row.RCV ?? ""),
+    M1: row.IsMultiplier1 && row.IsMultiplier1 !== "0" ? "✓" : "", ZN: String(row.ZN ?? ""),
+    M2: row.IsMultiplier2 && row.IsMultiplier2 !== "0" ? "✓" : "",
+    prefix: String(row.WPXPrefix || row.CountryPrefix || ""), Points: String(row.Points ?? "") }));
+}
+const textValue = (value: unknown) => String(value ?? "");
+const multiplierValue = (value: unknown) => value === undefined || value === null || value === "" ? "" : value && value !== "0" ? "Yes" : "No";
+function logEditDetails(row: Data) {
+  return {
+    rxFrequency: textValue(row.QSXFreq), contest: textValue(row.ContestName), country: textValue(row.CountryPrefix),
+    stationCall: textValue(row.StationPrefix), name: textValue(row.Name), qth: textValue(row.QTH), comment: textValue(row.Comment),
+    receivedNumber: textValue(row.NR), sentNumber: textValue(row.SentNr), points: textValue(row.Points), power: textValue(row.Power),
+    zone: textValue(row.ZN), section: textValue(row.Sect), check: textValue(row.CK), precedence: textValue(row.Prec),
+    multiplier1: multiplierValue(row.IsMultiplier1), multiplier2: multiplierValue(row.IsMultiplier2),
+    multiplier3: multiplierValue(row.isMultiplier3), wpx: textValue(row.WPXPrefix), exchange: textValue(row.Exchange1),
+    run: textValue(row.Run1Run2), radio: textValue(row.RadioNR), grid: textValue(row.GridSquare), misc: textValue(row.MiscText),
+    roverQTH: textValue(row.RoverLocation),
+  };
+}
+const contactMetadataColumns = { name: "Name", qth: "QTH", comment: "Comment" } as const;
+function pluginContactMetadataColumns(fields: { label?: string; visible?: boolean }[]): Set<string> {
+  const labels = new Set(fields.filter(field => field.visible !== false).map(field => String(field.label ?? "").trim().toLowerCase()));
+  return new Set(Object.entries(contactMetadataColumns).filter(([label]) => labels.has(label)).map(([, column]) => column));
+}
+const pluginColumnFields: Record<string, string> = {
+  "YYYY-MM-DD HH:MM:SS": "TS", Snt: "SNT", Rcv: "RCV", RcvNr: "NR", WPX: "WPXPrefix",
+  M1: "IsMultiplier1", M2: "IsMultiplier2", PTS: "Points",
+};
+const cqWwSsbLogColumns = ["YYYY-MM-DD HH:MM:SS", "Call", "Freq", "Snt", "Rcv", "M1", "ZN", "M2", "PFX", "PTS"];
+function not1mmLogColumns(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 32) return [];
+  const columns = value.map(column => typeof column === "string" ? column : "");
+  return columns.every(column => column.trim() && column === column.trim() && new TextEncoder().encode(column).length <= 64) &&
+    new Set(columns).size === columns.length && columns.filter(column => column === "Call").length === 1 ? columns : [];
+}
+function contestLogColumnLabels(columns: string[], pluginID?: string): string[] {
+  if (pluginID !== "cq_ww_ssb") return columns;
+  const labels: Record<string, string> = {
+    M1: "M1", ZN: "CQ Zone", M2: "M2", PFX: "Country",
+  };
+  return columns.map(column => labels[column] ?? column);
+}
+function not1mmLogRows(rows: Data[], columns: string[], fields: Field[], pluginID?: string): ContestPluginLogRow[] {
+  const editableFields = new Map(fields.filter(field => field.visible && field.enabled && !field.readOnly).map(field => [field.id, field]));
+  return rows.map(row => {
+    const raw = row.raw_fields && typeof row.raw_fields === "object" && !Array.isArray(row.raw_fields)
+      ? row.raw_fields as Record<string, unknown> : {};
+    const editableValue = (fieldID: "other_1" | "other_2") => correctionFieldValue(row, raw, fieldID, pluginID);
+    const values = columns.map(column => {
+      const field = column === "PFX" ? pluginID === "cq_ww_ssb" ? "CountryPrefix" : "WPXPrefix" : pluginColumnFields[column] ?? column;
+      const value = row[field];
+      if (column === "M1" || column === "M2") return value && value !== "0" ? "✓" : "";
+      return String(value ?? "");
+    });
+    const inlineEdits = columns.map((column, index): ContestLogInlineEdit | null => {
+      if (column === "YYYY-MM-DD HH:MM:SS" || column === "TS")
+        return { kind:"text", field:"timestamp", value:String(row.TS ?? ""), maximumUTF8Bytes:32 };
+      if (column === "Call" && editableFields.has("callsign"))
+        return { kind:"text", field:"callsign", value:String(raw.callsign ?? row.Call ?? ""), maximumUTF8Bytes:32 };
+      if (column === "Freq") {
+        const frequencyHz = Number(row.Freq ?? 0) * 1_000;
+        return Number.isSafeInteger(frequencyHz) && frequencyHz > 0
+          ? { kind:"frequency", value:String(frequencyHz), maximumUTF8Bytes:11 } : null;
+      }
+      if ((column === "Snt" || column === "SNT") && editableFields.has("sent"))
+        return { kind:"text", field:"sentReport", value:String(raw.sent ?? row.SNT ?? ""), maximumUTF8Bytes:160 };
+      if ((column === "Rcv" || column === "RCV") && editableFields.has("receive"))
+        return { kind:"text", field:"receivedReport", value:String(raw.receive ?? row.RCV ?? ""), maximumUTF8Bytes:160 };
+      for (const fieldID of ["other_1", "other_2"] as const) {
+        const field = editableFields.get(fieldID), value = editableValue(fieldID);
+        if (field && values[index] === value) return { kind:"exchange", fieldID, value,
+          maximumUTF8Bytes:fieldID === "other_1" ? 32 : 128 };
+      }
+      return null;
+    });
+    return { qsoID:String(row.ID ?? ""), values, isDupe:row.is_dupe === 1 || row.is_dupe === true, inlineEdits,
+      ...(Array.isArray(row.exchangeWarnings)?{exchangeWarnings:row.exchangeWarnings}:{} ) };
+  });
+}
+
+function partialCallMatches(call:string,query:string){
+  if(!/^[A-Z0-9/]{3,32}$/.test(query)||call.length<query.length)return false;
+  if(call.includes(query))return true;
+  let differences=0;for(let index=0;index<query.length;index+=1)if(call[index]!==query[index]&&++differences>1)return false;
+  return true;
+}
+function partialCandidates(kind: "log" | "cluster", calls: unknown[], query: string) {
+  if (!/^[A-Z0-9/]{3,32}$/.test(query)) return [];
+  return [...new Set(calls.map(call => String(call ?? "").trim().toUpperCase())
+    .filter(call => /^[A-Z0-9/]{1,32}$/.test(call) && partialCallMatches(call,query)))].slice(0, 500)
+    .map(callsign => ({ candidateID: `${kind}:${callsign}`, callsign }));
+}
+
+function contestSurfaceSpots(spots: BandMapSpot[]) {
+  const ids = new Set<string>();
+  return spots.slice(0, 2_000).flatMap(spot => {
+    const id=String(spot.id??""),callsign=String(spot.callsign??"").trim().toUpperCase(),frequencyKHz=Number(spot.frequencyKHz),
+      band=String(spot.band??"").trim(),mode=String(spot.mode??"").trim();
+    if(!id.trim()||new TextEncoder().encode(id).length>128||ids.has(id)||!callsign||new TextEncoder().encode(callsign).length>32||
+        !band||new TextEncoder().encode(band).length>16||!mode||new TextEncoder().encode(mode).length>16||
+        !Number.isFinite(frequencyKHz)||frequencyKHz<0)return [];
+    ids.add(id);
+    const bounded=(value:unknown,maximum=512)=>{const text=String(value??"");return new TextEncoder().encode(text).length<=maximum?text:"";};
+    const uintOrNull=(value:unknown)=>Number.isSafeInteger(value)&&Number(value)>=0?Number(value):null;
+    const coordinate=(value:unknown,maximum:number)=>typeof value==="number"&&Number.isFinite(value)&&Math.abs(value)<=maximum?value:null;
+    const strings=(value:unknown,maximum:number,bytes:number)=>Array.isArray(value)?value.filter(item=>typeof item==="string").slice(0,maximum).map(item=>bounded(item,bytes)):[];
+    return [{id,receivedAt:Math.max(0,Number(spot.receivedAt)||0),clusterName:bounded(spot.clusterName),spotter:bounded(spot.spotter),
+      spotterContinent:spot.spotterContinent==null?null:bounded(spot.spotterContinent,32),frequencyKHz,
+      frequencyText:bounded(spot.frequencyText),callsign,comment:bounded(spot.comment),band,mode,
+      country:bounded(spot.country),adif:uintOrNull(spot.adif),continent:bounded(spot.continent),cqZone:uintOrNull(spot.cqZone),
+      ituZone:uintOrNull(spot.ituZone),latitude:coordinate(spot.latitude,90),longitude:coordinate(spot.longitude,180),
+      callStatus:bounded(spot.callStatus),dxccStatus:bounded(spot.dxccStatus),
+      workedBefore:uintOrNull(spot.workedBefore),specialTags:strings(spot.specialTags,32,64),score:Math.max(0,Number(spot.score)||0),
+      contestPoints:null,contestDupe:null,contestMultiplierCount:null,contestCountryMultiplier:null,contestZoneMultiplier:null,
+      scoreReasons:strings(spot.scoreReasons,64,160),aggregateCount:uintOrNull(spot.aggregateCount)??0,
+      aggregateSpotters:strings(spot.aggregateSpotters,64,64),source:bounded(spot.source),statusHex:bounded(spot.statusHex),
+      bandHex:bounded(spot.bandHex),modeHex:bounded(spot.modeHex),marked:false}];
+  });
+}
+
+export function observedContestSpot<T extends BandMapSpot>(spots: T[], frequencyHz: number, toleranceHz = 300): T | null {
+  if (!Number.isSafeInteger(frequencyHz) || frequencyHz < 0 || !Number.isFinite(toleranceHz) || toleranceHz < 0) return null;
+  return spots.map(spot => ({ spot, distance:Math.abs(Math.round(Number(spot.frequencyKHz) * 1_000) - frequencyHz) }))
+    .filter(item => Number.isFinite(item.distance) && item.distance <= toleranceHz)
+    .sort((left, right) => left.distance - right.distance || Number(right.spot.receivedAt ?? 0) - Number(left.spot.receivedAt ?? 0))[0]?.spot ?? null;
+}
+
+export function localContestHeardSpot({ callsign, frequencyHz, mode, stationCall, bandDefinitions, callContext, receivedAt = Date.now() / 1_000 - 978_307_200 }: {
+  callsign: string; frequencyHz: number; mode: string; stationCall: string; bandDefinitions: readonly ContestBandDefinition[];
+  callContext?: Projection["callContext"]; receivedAt?: number;
+}): ContestSurfaceSpot | null {
+  const normalized = callsign.trim().toUpperCase();
+  const band = bandDefinitions.find(definition => frequencyHz >= definition.lowHz && frequencyHz < definition.highHz)?.id;
+  if (!/^[A-Z0-9/]{3,32}$/.test(normalized) || !Number.isSafeInteger(frequencyHz) || frequencyHz <= 0 || !band) return null;
+  const context = callContext?.callsign?.trim().toUpperCase() === normalized ? callContext : undefined;
+  const frequencyKHz = frequencyHz / 1_000;
+  return { id:`contest-heard:${frequencyHz}:${normalized}`, receivedAt, clusterName:"Contest", spotter:stationCall,
+    spotterContinent:null, frequencyKHz, frequencyText:frequencyKHz.toFixed(3), callsign:normalized,
+    comment:"Heard while tuning", band, mode, country:context?.country??"", adif:null, continent:"",
+    cqZone:context?.cqZone??null, ituZone:context?.ituZone??null, callStatus:"", dxccStatus:"", workedBefore:null,
+    specialTags:[], score:0, contestPoints:null, contestDupe:null, contestMultiplierCount:null,
+    contestCountryMultiplier:null, contestZoneMultiplier:null, scoreReasons:[], aggregateCount:1,
+    aggregateSpotters:stationCall?[stationCall]:[], source:"Contest S&P", statusHex:"", bandHex:"", modeHex:"", marked:true };
+}
+
+function contestSpotPreviewCandidate(spot:ContestSurfaceSpot){
+  const mode=canonicalContestSurfaceMode(spot.mode),frequencyHz=Math.round(spot.frequencyKHz*1_000),
+    callsign=spot.callsign.trim().toUpperCase();
+  if(!mode||!/^[A-Z0-9/]{3,32}$/.test(callsign)||!Number.isSafeInteger(frequencyHz)||frequencyHz<100_000||frequencyHz>100_000_000_000)return null;
+  return {spotID:spot.id,callsign,frequencyHz,mode,inputSignature:`${callsign}\u001f${frequencyHz}\u001f${mode}`};
+}
+
+type SpotPointsPreview = { sessionID:string; workspaceGeneration:string; revision:number;
+  spots:{spotID:string;points:number|null;dupe:boolean|null;multiplierCount:number|null;countryMultiplier:boolean|null;zoneMultiplier:boolean|null;
+    reason:"unresolved_callsign"|"unsupported_band"|"unsupported_mode"|"exchange_required"|"scoring_unavailable"|null}[] };
+function validSpotPointsPreview(value:unknown,sessionID:string,workspaceGeneration:string,revision:number):value is SpotPointsPreview{
+  if(!value||typeof value!=="object"||Array.isArray(value))return false;const row=value as Data;
+  if(row.sessionID!==sessionID||row.workspaceGeneration!==workspaceGeneration||row.revision!==revision||!Array.isArray(row.spots)||row.spots.length>256)return false;
+  const ids=new Set<string>();return row.spots.every(item=>item&&typeof item==="object"&&!Array.isArray(item)&&
+    Object.keys(item).length===7&&typeof item.spotID==="string"&&new TextEncoder().encode(item.spotID).length<=128&&!ids.has(item.spotID)&&
+    (item.points===null||typeof item.points==="number"&&Number.isFinite(item.points)&&item.points>=0)&&
+    (item.dupe===null||typeof item.dupe==="boolean")&&(item.multiplierCount===null||Number.isSafeInteger(item.multiplierCount)&&item.multiplierCount>=0)&&
+    (item.countryMultiplier===null||typeof item.countryMultiplier==="boolean")&&
+    (item.zoneMultiplier===null||typeof item.zoneMultiplier==="boolean")&&
+      [null,"unresolved_callsign","unsupported_band","unsupported_mode","exchange_required","scoring_unavailable"].includes(item.reason)&&!!ids.add(item.spotID));
+}
+
+type SpotWorkflowScope = { operatingContext: string; sessionID: string; workspaceGeneration: string };
+type SpotWorkflowEntry = { spot: ContestSurfaceSpot; deleted: boolean; updatedAt: number };
+type SpotWorkflow = SpotWorkflowScope & { markedOnly: boolean; showWorked: boolean; entries: Record<string, SpotWorkflowEntry> };
+const emptySpotWorkflow = (scope:SpotWorkflowScope={operatingContext:"",sessionID:"",workspaceGeneration:""}):SpotWorkflow =>
+  ({...scope,markedOnly:false,showWorked:false,entries:{}});
+const sameSpotWorkflowScope=(workflow:SpotWorkflow,scope:SpotWorkflowScope)=>workflow.operatingContext===scope.operatingContext&&
+  workflow.sessionID===scope.sessionID&&workflow.workspaceGeneration===scope.workspaceGeneration;
+export const contestSpotWorkflowStorageKey=(scope:SpotWorkflowScope)=>`${spotWorkflowKey}:${encodeURIComponent(scope.operatingContext)}:${encodeURIComponent(scope.workspaceGeneration)}:${encodeURIComponent(scope.sessionID)}`;
+export function compactContestSpotWorkflow(workflow:SpotWorkflow,authoritativeSpotIDs?:ReadonlySet<string>,nowMs=Date.now()):SpotWorkflow{
+  const originalRows=Object.entries(workflow.entries);
+  let rows=originalRows.filter(([,entry])=>Number.isFinite(entry.updatedAt)&&entry.updatedAt>=0&&
+    nowMs-entry.updatedAt<=contestSpotWorkflowTTLms&&(!authoritativeSpotIDs||entry.spot.marked||authoritativeSpotIDs.has(entry.spot.id)))
+    .sort(([leftID,left],[rightID,right])=>right.updatedAt-left.updatedAt||leftID.localeCompare(rightID)).slice(0,contestSpotWorkflowMaxEntries);
+  const unchanged=rows.length===originalRows.length&&rows.every(([id,entry],index)=>originalRows[index]?.[0]===id&&originalRows[index]?.[1]===entry);
+  let compacted=unchanged?workflow:{...workflow,entries:Object.fromEntries(rows)};
+  while(rows.length&&new TextEncoder().encode(JSON.stringify(compacted)).length>contestSpotWorkflowMaxBytes){
+    rows=rows.slice(0,Math.floor(rows.length/2));compacted={...workflow,entries:Object.fromEntries(rows)};
+  }
+  return compacted;
+}
+export const encodeContestSpotWorkflow=(workflow:SpotWorkflow,nowMs=Date.now())=>JSON.stringify(compactContestSpotWorkflow(workflow,undefined,nowMs));
+export function decodeContestSpotWorkflow(raw:string|null,scope:SpotWorkflowScope,nowMs=Date.now()):SpotWorkflow{
+  try{
+    if(raw!==null&&new TextEncoder().encode(raw).length>contestSpotWorkflowMaxBytes)return emptySpotWorkflow(scope);
+    const value=JSON.parse(raw??"null") as SpotWorkflow|null,entries=value?.entries;
+    if(!value||!sameSpotWorkflowScope(value,scope)||typeof value.markedOnly!=="boolean"||
+        value.showWorked!==undefined&&typeof value.showWorked!=="boolean"||!entries||typeof entries!=="object"||Array.isArray(entries))
+      return emptySpotWorkflow(scope);
+    const spots:ContestSurfaceSpot[]=[];
+    for(const [id,entry] of Object.entries(entries)){
+      if(!entry||typeof entry!=="object"||typeof entry.deleted!=="boolean"||typeof entry.updatedAt!=="number"||entry.spot?.id!==id)return emptySpotWorkflow(scope);
+      spots.push(entry.spot);
+    }
+    const projection={schemaVersion:2,status:"ready",draftID:"persistence-check",draftRevision:0,radioFrequencyHz:null,
+      connectedClusters:0,loadedSpots:spots.length,selectedSpotID:null,configuredClusters:[],connections:[],
+      markedOnly:value.markedOnly,spots,busy:false};
+    const restored={...value,showWorked:value.showWorked===true};
+    return validContestSurfaceProjection("band-maps",projection)?compactContestSpotWorkflow(restored,undefined,nowMs):emptySpotWorkflow(scope);
+  }catch{return emptySpotWorkflow(scope);}
+}
+export function persistContestSpotWorkflow(storage:Pick<Storage,"setItem">,workflow:SpotWorkflow,nowMs=Date.now()):boolean{
+  let compacted=compactContestSpotWorkflow(workflow,undefined,nowMs);
+  for(;;){try{storage.setItem(contestSpotWorkflowStorageKey(compacted),JSON.stringify(compacted));return true;}
+    catch{const rows=Object.entries(compacted.entries);if(!rows.length)return false;
+      compacted={...compacted,entries:Object.fromEntries(rows.slice(0,Math.floor(rows.length/2)))};}}
+}
+function restoredSpotWorkflow(scope: SpotWorkflowScope): SpotWorkflow {
+  try {
+    return decodeContestSpotWorkflow(localStorage.getItem(contestSpotWorkflowStorageKey(scope)),scope);
+  } catch { /* A malformed or unavailable preference starts a fresh session overlay. */ }
+  return emptySpotWorkflow(scope);
+}
+export function projectContestSpotWorkflow(spots: ContestSurfaceSpot[],workflow:SpotWorkflow,includeOnlyMarked=workflow.markedOnly):ContestSurfaceSpot[]{
+  const projected=new Map(spots.map(spot=>[spot.id,spot]));
+  for(const [id,entry] of Object.entries(workflow.entries)){
+    if(entry.deleted){projected.delete(id);continue;}
+    const current=projected.get(id);if(current)projected.set(id,{...current,receivedAt:entry.spot.receivedAt,marked:entry.spot.marked});
+    else if(entry.spot.marked)projected.set(id,entry.spot);
+  }
+  const values=deduplicateBandMapSpots([...projected.values()],true);return includeOnlyMarked?values.filter(spot=>spot.marked):values;
+}
+export function updateContestSpotWorkflow(workflow:SpotWorkflow,spots:ContestSurfaceSpot[],spotID:string,
+    operation:"confirm"|"delete"|"mark",marked=false,now=Date.now()/1000-978_307_200,updatedAt=Date.now()):SpotWorkflow{
+  const target=spots.find(spot=>spot.id===spotID);if(!target)return workflow;
+  const entries={...workflow.entries};
+  if(operation==="delete")entries[spotID]={spot:target,deleted:true,updatedAt};
+  else{
+    for(const spot of spots)if(spot.id!==spotID&&Math.abs(Math.round(spot.frequencyKHz*1000)-Math.round(target.frequencyKHz*1000))<=100)
+      entries[spot.id]={spot,deleted:true,updatedAt};
+    entries[spotID]={spot:{...target,receivedAt:now,marked:operation==="mark"?marked:target.marked},deleted:false,updatedAt};
+  }
+  return compactContestSpotWorkflow({...workflow,entries},undefined,updatedAt);
+}
+
+function multiplierMatrix(title: string, tracker: "dxcc" | "zone", values: Data[], busy: boolean,
+    current: { dxcc: string | null; cqZone: number | null; ituZone: number | null }, zoneSystem: "cq" | "itu" | null,
+    configuredBands: string[], currentBand: string | null,
+    opportunities?:{universe:Data[];spots:ContestSurfaceSpot[];draftID:string;draftRevision:number}) {
+  const rows = new Map<string, Record<string, number>>();
+  const universe=opportunities?.universe??[];
+  if(tracker==="dxcc")for(const item of universe)rows.set(String(item.value),Object.fromEntries(contestBands.map(value=>[value,0])));
+  if (tracker === "zone" && zoneSystem === "cq") for (let zone = 1; zone <= 40; zone += 1)
+    rows.set(String(zone), Object.fromEntries(contestBands.map(value => [value, 0])));
+  for (const item of values) {
+    const label = String(item.value ?? "").trim() || "Unknown";
+    const band = defaultBandLabels[String(item.band)] ?? String(item.band ?? "");
+    if (!contestBands.includes(band)) continue;
+    const counts = rows.get(label) ?? Object.fromEntries(contestBands.map(value => [value, 0]));
+    counts[band] = Number(item.qsos ?? 0); rows.set(label, counts);
+  }
+  const workedRows=[...rows.values()].filter(counts=>Object.values(counts).some(value=>value>0)).length;
+  const available=new Map<string,Record<string,import("./contestSurfaceProtocol").ContestAvailableMultiplierSpot[]>>();
+  for(const spot of opportunities?.spots??[]){
+    const country=universe.find(item=>String(item.label).toUpperCase()===spot.country.toUpperCase()||String(item.value).toUpperCase()===spot.country.toUpperCase());
+    const key=tracker==="zone"?String(zoneSystem==="itu"?spot.ituZone:spot.cqZone):country?String(country.value):spot.country;
+    if(!rows.has(key)||!contestBands.includes(spot.band))continue;
+    const bands=available.get(key)??{};
+    const bandSpots=bands[spot.band]??=[];
+    if(bandSpots.length>=500)continue;
+    bandSpots.push({spotID:spot.id,callsign:spot.callsign,frequencyKHz:spot.frequencyKHz,mode:spot.mode,
+      contestDupe:spot.contestDupe,contestMultiplierCount:spot.contestMultiplierCount,
+      contestCountryMultiplier:spot.contestCountryMultiplier,contestZoneMultiplier:spot.contestZoneMultiplier});
+    available.set(key,bands);
+  }
+  const currentCountry=universe.find(item=>String(item.label).toUpperCase()===(current.dxcc??"").toUpperCase()||String(item.value).toUpperCase()===(current.dxcc??"").toUpperCase());
+  return { schemaVersion: 4 as const, status: "ready" as const, title, tracker, zoneSystem,
+    current:currentCountry?{...current,dxcc:String(currentCountry.value)}:current, bands: contestBands,
+    ...(opportunities?{draftID:opportunities.draftID,draftRevision:opportunities.draftRevision}:{}),
+    configuredBands: configuredBands.filter(band => contestBands.includes(band)),
+    currentBand: currentBand && contestBands.includes(currentBand) ? currentBand : null,
+    rows: [...rows.entries()].map(([label, counts]) => ({ label, counts,
+      ...(opportunities?{continent:tracker==="dxcc"?universe.find(item=>String(item.value)===label)?.continent??null:null,availableSpots:available.get(label)??{}}:{}),
+      total: Object.values(counts).reduce((sum, value) => sum + value, 0) })), total: workedRows, busy };
+}
+
+/** Keep volatile decoder counters/activity out of the setup mailbox revision fence. */
+function boundedDigitalSnapshot(value: unknown): ContestDigitalSnapshot | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Record<string, unknown>, configuration = source.configuration as Record<string, unknown> | undefined;
+  if (!configuration || typeof configuration.enabled !== "boolean" || typeof configuration.address !== "string" ||
+      typeof configuration.port !== "number" || typeof source.running !== "boolean" || typeof source.status !== "string" ||
+      typeof source.receive_only !== "boolean") return undefined;
+  const destination = configuration.destination === "active_contest" ? "active_contest" : "ordinary_logbook";
+  const active = source.active_contest as Record<string, unknown> | null | undefined;
+  return { configuration: { enabled: configuration.enabled, address: configuration.address, port: configuration.port, destination },
+    running: source.running, status: source.status, receive_only: source.receive_only,
+    contest_target_supported: source.contest_target_supported === true,
+    active_contest: active && typeof active.session_id === "string" && typeof active.plugin_id === "string"
+      ? { session_id: active.session_id, plugin_id: active.plugin_id } : null };
+}
+
+function boundedFldigiSnapshot(value: unknown): NonNullable<ContestDigitalSnapshot["fldigi"]> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Record<string, unknown>, configuration = source.configuration as Record<string, unknown> | undefined;
+  if (!configuration || typeof configuration.receive_enabled !== "boolean" || typeof configuration.transmit_enabled !== "boolean" ||
+      typeof source.receive_running !== "boolean" || typeof source.status !== "string" ||
+      source.transmit_release_required !== undefined && typeof source.transmit_release_required !== "boolean" ||
+      source.transmit_release_uncertain !== undefined && typeof source.transmit_release_uncertain !== "boolean" ||
+      source.configuration_error !== undefined && source.configuration_error !== null && typeof source.configuration_error !== "string" ||
+      typeof source.udp_endpoint !== "string" || typeof source.xmlrpc_endpoint !== "string") return undefined;
+  return { configuration: { receive_enabled: configuration.receive_enabled, transmit_enabled: configuration.transmit_enabled },
+    receive_supported: source.receive_supported === true, transmit_supported: source.transmit_supported === true,
+    receive_running: source.receive_running, status: source.status,
+    udp_endpoint: source.udp_endpoint, xmlrpc_endpoint: source.xmlrpc_endpoint,
+    ...(typeof source.transmit_release_required === "boolean" ? {transmit_release_required:source.transmit_release_required} : {}),
+    ...(typeof source.transmit_release_uncertain === "boolean" ? {transmit_release_uncertain:source.transmit_release_uncertain} : {}),
+    ...(source.configuration_error === null || typeof source.configuration_error === "string" ? {configuration_error:source.configuration_error} : {}) };
+}
+
+export function Not1MMContestWorkspace({ request, serviceRequest, stationTune: stationTunePort,captureStationTune, stationStep: stationStepPort, rotorStop, contestSpot: contestSpotPort, operatingContext, workspaceGeneration, stationCall, radioFrequencyHz, spots, cluster,
+  selectedSpotId, onSelectedSpot, onSetupViewChange, onSessionOpened, registerTransition, registerMenuRoute, strictHostActive = null, setupOnly = false, contestingTest = false }: Props) {
+  const [catalog, setCatalog] = useState<Data[]>([]), [sessions, setSessions] = useState<Session[]>([]);
+  const groupPresenceRef=useRef({bootID:crypto.randomUUID(),sequence:0});
+  const [bandDefinitions, setBandDefinitions] = useState<ContestBandDefinition[]>(fallbackBandDefinitions);
+  const bandLabels = useMemo<Record<string, string>>(() => Object.fromEntries(
+    bandDefinitions.map(band => [String(band.value), band.id])), [bandDefinitions]);
+  const [projection, setProjection] = useState<Projection | null>(null), projectionRef = useRef<Projection | null>(null);
+  const [productivityOpen,setProductivityOpen]=useState(false),[productivityTab,setProductivityTab]=useState("Entry & stack");
+  const [qtcOpportunityIntent,setQTCOpportunityIntent]=useState<{sessionID:string;callsign:string;requestID:string}|null>(null);
+  const passStackAdmissionRef=useRef<{sessionID:string;workspaceGeneration:string;draftID:string}|null>(null);
+  const passStationStateRef=useRef({retiring:false,configuredClient:false,authorityClientReady:false});
+  const stackControllerRef=useRef<ContestCallStack|null>(null);
+  const stackControllerWaitersRef=useRef(new Set<{key:string;resolve:(controller:ContestCallStack)=>void;reject:(cause:Error)=>void;timer:number}>());
+  const onStackController=useCallback((controller:ContestCallStack|null)=>{
+    stackControllerRef.current=controller;
+    if(controller){const key=callStackStorageKey(controller.snapshot());for(const waiter of stackControllerWaitersRef.current)
+      if(waiter.key===key){window.clearTimeout(waiter.timer);stackControllerWaitersRef.current.delete(waiter);waiter.resolve(controller);}}
+  },[]);
+  useEffect(()=>()=>{for(const waiter of stackControllerWaitersRef.current){window.clearTimeout(waiter.timer);waiter.reject(new Error("Contest workspace closed before Call Stack was available."));}
+    stackControllerWaitersRef.current.clear();stackControllerRef.current=null;},[]);
+  const [reminderPrefill,setReminderPrefill]=useState<Partial<Sked>>({});
+  const [,refreshPlanningRecovery]=useState(0);
+  const practiceTransitionRef=useRef(false);
+  const logOrderRef=useRef({sort:"utc",direction:"descending"}),[logOrder,setLogOrder]=useState(logOrderRef.current);
+  const typedFieldsRef=useRef<{draftID:string;fields:Set<string>}>({draftID:"",fields:new Set()});
+  const assertStationAction=()=>{if(projectionRef.current?.practice||practiceTransitionRef.current)throw new Error("Practice sessions have station actions and public posting disabled. Resolve any pending Practice creation before using the station.");};
+  const assertNoPendingStack=(captured?:CapturedContestLaneScope)=>{const current=projectionRef.current;if(!current)return;
+    const raw=localStorage.getItem(callStackStorageKey(captured??(dualContestLanes(current)?captureContestLaneScope(current):current)));if(raw&&JSON.parse(raw).pending)
+      throw new Error("Resolve the pending Call Stack receipt in Productivity desk before logging or sending another message.");};
+  const stationTune:Props["stationTune"]=(...args)=>{assertStationAction();if(dualContestLanes(projectionRef.current))throw Error("Choose an explicit operating lane before tuning; active-radio fallback is unavailable.");return stationTunePort(...args);};
+  const stationStep:Props["stationStep"]=stationStepPort?(...args)=>{assertStationAction();if(dualContestLanes(projectionRef.current))throw Error("VFO stepping requires an exact qualified lane route; active-radio fallback is unavailable.");return stationStepPort(...args);}:undefined;
+  const contestSpot:Props["contestSpot"]=(...args)=>{assertStationAction();return contestSpotPort(...args);};
+  const [fields, setFields] = useState<Record<string, string>>({}), fieldsRef = useRef<Record<string, string>>({});
+  const laneBuffersRef = useRef<Partial<Record<ContestLaneID, ContestLaneBuffer>>>({});
+  const [, renderLaneBuffers] = useState(0), laneQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const laneFlushTimersRef = useRef<Partial<Record<ContestLaneID, number>>>({});
+  const [laneCapabilities, setLaneCapabilities] = useState<Data | null>(null), [laneNative, setLaneNative] = useState<Data | null>(null);
+  const [laneModeChoice, setLaneModeChoice] = useState<"SO1V"|"SO2V"|"SO2R">("SO1V");
+  const [laneRouteChoices, setLaneRouteChoices] = useState({laneA:"0",laneB:"2"});
+  const [laneTransitionBusy,setLaneTransitionBusy]=useState<Partial<Record<ContestLaneID,boolean>>>({});
+  const [rows, setRows] = useState<Data[]>([]), [score, setScore] = useState<Score | null>(null), [matrices, setMatrices] = useState<Data>({});
+  const [statistics, setStatistics] = useState<StatisticsState | null | undefined>(null);
+  const [rates, setRates] = useState<Data | null>(null);
+  const [auxiliaryReads, setAuxiliaryReads] = useState<Partial<Record<AuxiliaryLane, string>>>({});
+  const [partial, setPartial] = useState<{sessionID:string;revision:number;query:string;rows:Data[]} | null>(null);
+  const [manager, setManager] = useState(true), [busy, setBusy] = useState(false), busyRef = useRef(false);
+  const [startupPending, setStartupPending] = useState(true);
+  const [startupOpenError, setStartupOpenError] = useState("");
+  const [catalogReady, setCatalogReady] = useState(false), [catalogLoadError, setCatalogLoadError] = useState("");
+  const [catalogLoadAttempt, setCatalogLoadAttempt] = useState(0);
+  const [retiring, setRetiring] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
+  const auxiliaryErrorRef = useRef("");
+  const [create, setCreate] = useState({ name: "CQ WW CW", cqZone: "15" });
+  const [setup, setSetup] = useState<ContestSetupDocument>(() => restoredSetup(stationCall));
+  const effectiveStationCall = String(setup.station.Call || stationCall).trim().toUpperCase();
+  const [rtcStatus,setRTCStatus]=useState<RTCStatus|null>(null),[rtcCredentialSaved,setRTCCredentialSaved]=useState(false);
+  const rtcConfigurationRef=useRef("");
+  const [digitalSnapshot, storeDigitalSnapshot] = useState<ContestDigitalSnapshot | undefined>();
+  const [fldigiSnapshot,storeFldigiSnapshot] = useState<ContestDigitalSnapshot["fldigi"]>();
+  const fldigiSnapshotRef = useRef(fldigiSnapshot); fldigiSnapshotRef.current = fldigiSnapshot;
+  const digitalSnapshotRef = useRef(digitalSnapshot); digitalSnapshotRef.current = digitalSnapshot;
+  const setDigitalSnapshot = (update: ContestDigitalSnapshot | undefined | ((current: ContestDigitalSnapshot | undefined) => ContestDigitalSnapshot | undefined),
+      fldigiUpdate?: ContestDigitalSnapshot["fldigi"]) => {
+    const next = typeof update === "function" ? update(digitalSnapshotRef.current) : update;
+    const fldigi = fldigiUpdate ?? next?.fldigi ?? fldigiSnapshotRef.current;
+    if (fldigi) { fldigiSnapshotRef.current=fldigi; storeFldigiSnapshot(fldigi); }
+    digitalSnapshotRef.current = next ? {...next,fldigi} : next;
+    storeDigitalSnapshot(digitalSnapshotRef.current);
+  };
+  const digitalGenerationRef = useRef(0), fldigiStopRef = useRef<Promise<void> | null>(null);
+  const [fldigiStopPending,setFldigiStopPending] = useState(false);
+  const fldigiReleaseBlocking = fldigiStopPending || fldigiSnapshot?.transmit_release_uncertain === true ||
+    Boolean(fldigiSnapshot?.transmit_release_required && !fldigiSnapshot.configuration.transmit_enabled);
+  const [groupNetwork, setGroupNetwork] = useState<ContestGroupChatSnapshot | null>(null), groupNetworkRef=useRef<ContestGroupChatSnapshot|null>(null);
+  const [authorityDupe,setAuthorityDupe]=useState<{key:string;isDupe:boolean}|null>(null);
+  const authorityGenerationRef = useRef(0), authorityBusyRef=useRef(false), editingRef=useRef<Data|null>(null);
+  const setupCatalog = useMemo<ContestSetupCatalogEntry[]>(() => catalog.map(item => ({ id: String(item.id), name: String(item.name),
+    modes: item.modes, supportedBands: item.supportedBands,
+    sentExchangeHint: item.sentExchangeHint, overlayChoices: item.overlayChoices })), [catalog]);
+  const setupBandChoices = useMemo(() => bandDefinitions.map(band => band.id), [bandDefinitions]);
+  const setupSupportedBands = useMemo(() => {
+    const bands = catalog.find(item => item.id === setup.pluginID)?.supportedBands;
+    return Array.isArray(bands) && bands.length ? bands as string[] : setupBandChoices;
+  }, [catalog, setup.pluginID, setupBandChoices]);
+  const activeSupportedBands = projection?.supportedBands?.length ? projection.supportedBands : setupSupportedBands;
+  const configuredBands = useMemo(() => {
+    const selected = Array.isArray(setup.preferences.bands) ? setup.preferences.bands : contestBands;
+    const supported = projection?.supportedBands?.length ? projection.supportedBands : setupSupportedBands;
+    const configured = setupBandChoices.filter(band => selected.includes(band) && supported.includes(band));
+    return configured.length ? configured : setupBandChoices.filter(band => supported.includes(band));
+  }, [setup.preferences.bands, projection?.supportedBands, setupBandChoices, setupSupportedBands]);
+  const [effectiveMacros, setEffectiveMacros] = useState<ContestSetupMacro[] | undefined>();
+  const [phoneSimulationArmed, setPhoneSimulationArmed] = useState(false);
+  const [phoneSimulationPending, setPhoneSimulationPending] = useState(false);
+  const [phoneReleaseUncertain, setPhoneReleaseUncertain] = useState("");
+  const [phoneSimulationTrace, setPhoneSimulationTrace] = useState<PhoneSimulationTrace[]>([]);
+  const phoneSimulationControllerRef = useRef<AbortController | null>(null);
+  const qtcOutputOwnerRef=useRef<{controller:AbortController;mode:string;bridgeGeneration?:string}|null>(null);
+  const phoneSimulationRecoveryRef = useRef<Promise<boolean> | null>(null);
+  const phoneReleaseGenerationRef = useRef(0);
+  const voiceOutput = useMemo(() => new ContestVoiceOutput(!contestingTest), [contestingTest]);
+  const [autoCQDeadlineMs, setAutoCQDeadlineMs] = useState<number | null>(null);
+  const [autoCQNowMs, setAutoCQNowMs] = useState(() => Date.now());
+  const autoCQActiveRef = useRef(false), autoCQTimerRef = useRef<number | null>(null);
+  const autoCQHostActionRef = useRef<(method: string, extra?: Record<string, unknown>, throwFailures?: boolean,
+    contestSurfaceRequestID?: string) => Promise<unknown>>(async () => null);
+  const [manualFrequencyMHz, setManualFrequencyMHz] = useState("");
+  const [lookupPathContext, setLookupPathContext] = useState<ContestPathContext | null>(null);
+  const [mapHome,setMapHome]=useState<MapContext["metadata"]["home"]>(null);
+  const [editing, setEditing] = useState<Data | null>(null), [editCall, setEditCall] = useState(""), [editZone, setEditZone] = useState("");
+  const [editTimestamp, setEditTimestamp] = useState(""), [editFrequencyMHz, setEditFrequencyMHz] = useState("");
+  const [editReceiveFrequencyHz, setEditReceiveFrequencyHz] = useState("0"), [editPower, setEditPower] = useState("0");
+  const [editOperator, setEditOperator] = useState(""), [editSent, setEditSent] = useState(""), [editReceived, setEditReceived] = useState("");
+  const [editSentExchange, setEditSentExchange] = useState("");
+  const [editName, setEditName] = useState(""), [editQTH, setEditQTH] = useState(""), [editComment, setEditComment] = useState("");
+  const [correctionReason, setCorrectionReason] = useState("Operator correction"), [deletionReason, setDeletionReason] = useState("Operator deletion");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [logOffset, setLogOffset] = useState(0), [logTotal, setLogTotal] = useState(0);
+  const [logPageSize, setLogPageSize] = useState(initialLogPageSize);
+  const [logQuery,setLogQuery]=useState(""),[logFocus,setLogFocus]=useState("");
+  const logQueryRef=useRef("");
+  const [scpSurface, setSCPSurface] = useState<ContestSCPPanelSurface | null>(null);
+  const fieldRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const focusRef = useRef("callsign");
+  const spotCursorRef = useRef<{ context: string; spotID: string | null; externalSpotID: string | null }>(
+    { context: "", spotID: null, externalSpotID: null });
+  const contestRadioPublicationRef=useRef<{publisherID:string;publisherStartedAt:number;sequence:number;queueVersion:number;mountToken:number;mounted:boolean;key:string;identity:string;
+    base:null|{session_id:string;workspace_generation:string;revision:number;configured_bands:string[];allowed_mode_groups:ContestBandMode[]};
+    chain:Promise<void>}>({publisherID:crypto.randomUUID(),publisherStartedAt:Date.now(),sequence:0,queueVersion:0,mountToken:0,mounted:true,key:"",identity:"",base:null,chain:Promise.resolve()});
+  const contestRadioServiceRef=useRef(serviceRequest);contestRadioServiceRef.current=serviceRequest;
+  const [contestRadioRetryTick,setContestRadioRetryTick]=useState(0);
+  const [spotWorkflow,setSpotWorkflow]=useState<SpotWorkflow>(()=>emptySpotWorkflow());
+  const editVersionRef = useRef(0);
+  const [earlyCWEnabled,setEarlyCWEnabled]=useState(false),[earlyCWThreshold,setEarlyCWThreshold]=useState(3);
+  const [cwCorrectionPolicy,setCWCorrectionPolicy]=useState<"full"|"partial">("full");
+  const earlyCWRef=useRef<{sessionID:string;workspaceGeneration:string;draftID:string;streamID:string;call:string;finished:boolean}|null>(null);
+  const earlyCWQueueRef=useRef<Promise<void>>(Promise.resolve()),earlyCWFaultRef=useRef("");
+  useEffect(()=>{setEarlyCWEnabled(false);setCWCorrectionPolicy("full");earlyCWRef.current=null;earlyCWFaultRef.current="";},[projection?.sessionID,projection?.workspaceGeneration,projection?.draftID]);
+  const observedFrequencyRef = useRef<{ sessionID: string; frequencyHz: number | null }>({ sessionID: "", frequencyHz: null });
+  const tuningAnchorRef=useRef<{identity:string;frequencyHz:number}>({identity:"",frequencyHz:0});
+  const ssbTuningToleranceHz=Number.isFinite(Number(setup.preferences.ssbTuningToleranceHz))
+    ?Math.max(0,Math.min(20000,Number(setup.preferences.ssbTuningToleranceHz))):300;
+  const observedFrequencySyncRef=useRef("");
+  const observedFrequencyHzRef=useRef<number|null>(null),lastCQFrequencyRef=useRef<{
+    sessionID:string;workspaceGeneration:string;frequencyHz:number;mode:string}|null>(null);
+  type PendingRadioTune = { sessionID: string; sourceHz: number; targetHz: number; confirmedAt?:number };
+  const pendingRadioTuneRef = useRef<PendingRadioTune | null>(null);
+  const [radioTuneCompletionTick,setRadioTuneCompletionTick]=useState(0);
+  const manualHeardCallRef=useRef<{sessionID:string;draftID:string;callsign:string;frequencyHz:number}|null>(null);
+  const recordManualHeardCall=(value:string)=>{
+    const callsign=value.trim().toUpperCase(),active=projectionRef.current;
+    if(callsign===(fieldsRef.current.callsign??"").trim().toUpperCase())return;
+    manualHeardCallRef.current=active&&callsign?{sessionID:active.sessionID,draftID:active.draftID,callsign,
+      frequencyHz:observedFrequencyHzRef.current??active.frequencyHz}:null;
+  };
+  const finishRadioTune=(intent:PendingRadioTune)=>{
+    if(pendingRadioTuneRef.current!==intent)return;
+    intent.confirmedAt=Date.now();
+    const active=projectionRef.current;
+    if(active?.sessionID===intent.sessionID){
+      observedFrequencyRef.current={sessionID:intent.sessionID,frequencyHz:intent.targetHz};
+      tuningAnchorRef.current={identity:`${active.sessionID}/${active.draftID}/${fieldsRef.current.callsign??""}/${active.run}`,frequencyHz:intent.targetHz};
+    }
+    setRadioTuneCompletionTick(value=>value+1);
+  };
+  const cancelRadioTune=(intent:PendingRadioTune|null)=>{
+    if(intent&&pendingRadioTuneRef.current===intent){
+      pendingRadioTuneRef.current=null;
+      setRadioTuneCompletionTick(value=>value+1);
+    }
+  };
+  const flushDraftRef = useRef<() => Promise<Projection | null>>(async () => projectionRef.current);
+  const flushAllDraftsRef = useRef<() => Promise<void>>(async () => {});
+  const cw = useSharedCW(projection?.sessionID ?? "not1mm-no-session", retiring, setupOnly);
+  projectionRef.current = projection; fieldsRef.current = fields;groupNetworkRef.current=groupNetwork;editingRef.current=editing;
+  const selectedRadioFrequencyHz = !dualContestLanes(projection)&&!projection?.practice && typeof radioFrequencyHz === "number" && Number.isSafeInteger(radioFrequencyHz) &&
+    radioFrequencyHz >= 0 ? radioFrequencyHz : null;
+  const observedFrequencyHz = contestFrequency(selectedRadioFrequencyHz, activeSupportedBands, bandDefinitions);
+  observedFrequencyHzRef.current=observedFrequencyHz;
+  const fallbackFrequencyHz = manualFrequency(manualFrequencyMHz, activeSupportedBands, bandDefinitions);
+  const operationFrequencyHz = dualContestLanes(projection)?contestFrequency(Number(laneBuffersRef.current[projection!.operatingLanes!.keyboardLaneID]?.frequencyText),activeSupportedBands,bandDefinitions):observedFrequencyHz ?? fallbackFrequencyHz;
+
+  useEffect(()=>{
+    if(!projection||projection.practice||setupOnly||contestingTest)return;
+    const service=setup.preferences.rtcURL==="https://contestonlinescore.com/post/"?"contestonlinescore":"hamscore";
+    const url=service==="contestonlinescore"?"https://contestonlinescore.com/post/":"https://hamscore.com/postxml/";
+    const username=String(setup.preferences.rtcUsername??"").trim(),intervalMinutes=Math.max(1,Math.min(60,Number(setup.preferences.rtcIntervalMinutes)||2));
+    const enabled=setup.preferences.rtcEnabled===true,key=[projection.sessionID,projection.workspaceGeneration,service,username,intervalMinutes,enabled].join("|");
+    if(!rtcConfigurationRequired(rtcConfigurationRef.current,key,rtcStatus))return;
+    rtcConfigurationRef.current=key;let current=true;
+    void Promise.allSettled([request("secret_status"),request("contest_rtc_configure",{sessionID:projection.sessionID,
+      workspaceGeneration:projection.workspaceGeneration,service,url,username,intervalMinutes,enabled})]).then(results=>{
+      if(!current)return;const secret=results[0],configured=results[1];
+      if(secret.status==="fulfilled")setRTCCredentialSaved((secret.value as Record<string,unknown>)["rtc-score-password"]===true);
+      if(configured.status==="fulfilled")setRTCStatus(configured.value as RTCStatus);
+      else setRTCStatus({configured:false,enabled:false,service,username,interval_minutes:intervalMinutes,posting:false,
+        consecutive_failures:0,last_outcome:enabled?"Reporting could not start. Save credentials and enable it again.":"Score reporting is disabled.",last_attempt:null,next_attempt:null});
+    });return()=>{current=false;};
+  },[projection?.sessionID,projection?.workspaceGeneration,setupOnly,contestingTest,setup.preferences.rtcURL,
+    setup.preferences.rtcUsername,setup.preferences.rtcIntervalMinutes,setup.preferences.rtcEnabled,rtcStatus?.configured,request]);
+  useEffect(()=>{
+    if(!projection||projection.practice||setupOnly||contestingTest)return;
+    let current=true;
+    const refresh=()=>void request("contest_rtc_status").then(value=>{if(current)setRTCStatus(value as RTCStatus);},()=>{});
+    const timer=window.setInterval(refresh,5_000);return()=>{current=false;window.clearInterval(timer);};
+  },[projection?.sessionID,setupOnly,contestingTest,request]);
+  const sharedSpots=useMemo(()=>contestSurfaceSpots(spots),[spots]);
+  const contestBandPlan=useMemo(()=>decodeContestBandPlan(setup.preferences.contestBandSegments,configuredBands),
+    [setup.preferences.contestBandSegments,configuredBands]);
+  const allowedModeGroups=useMemo(()=>[...new Set(contestSpotSurfaceModes(projection?.pluginID,projection?.supportedModes??[],projection?.spotModeCategory??"MIXED")
+    .map(contestBandMode))],[projection?.pluginID,projection?.supportedModes,projection?.spotModeCategory]);
+  const contestRadioBand=projection?(bandLabels[String(projection.band)]??String(projection.band)):"";
+  const classifiedSharedSpots=useMemo(()=>deduplicateBandMapSpots(sharedSpots.map(spot=>{
+    const entry=contestBandPlan.find(item=>item.band===spot.band),frequency=Number(spot.frequencyKHz);
+    const group=entry&&Number.isFinite(frequency)
+      ?contestModeForSpot(entry,frequency,allowedModeGroups,spot.comment,spot.mode):contestBandMode(spot.mode);
+    return {...spot,mode:contestBandModeLabel(group)};
+  })),[allowedModeGroups,contestBandPlan,sharedSpots]);
+  const [spotPointPreview,setSpotPointPreview]=useState<{identity:string;revision:number;rows:Map<string,{inputSignature:string;points:number|null;dupe:boolean|null;multiplierCount:number|null;countryMultiplier:boolean|null;zoneMultiplier:boolean|null}>}>({identity:"",revision:0,rows:new Map()});
+  const [spotRadioPreview,setSpotRadioPreview]=useState(spotPointPreview);
+  const [spotPointRetryTick,setSpotPointRetryTick]=useState(0);
+  const spotPointPreviewRef=useRef(spotPointPreview);spotPointPreviewRef.current=spotPointPreview;
+  const spotPointProgressRef=useRef(spotPointPreview);
+  const spotPreviewRunRef=useRef<Promise<void>>(Promise.resolve());
+  const spotPointIdentity=projection?`${projection.sessionID}/${projection.workspaceGeneration}`:"";
+  const spotScoreRevision=projection?.spotScoreRevision??projection?.revision??0;
+  const spotWorkflowScope=useMemo<SpotWorkflowScope>(()=>({operatingContext,workspaceGeneration,
+    sessionID:projection?.sessionID??""}),[operatingContext,workspaceGeneration,projection?.sessionID]);
+  const authoritativeSpotIDs=useMemo(()=>new Set(classifiedSharedSpots.map(spot=>spot.id)),[classifiedSharedSpots]);
+  const effectiveSpotWorkflow=useMemo(()=>sameSpotWorkflowScope(spotWorkflow,spotWorkflowScope)
+    ?compactContestSpotWorkflow(spotWorkflow,authoritativeSpotIDs):emptySpotWorkflow(spotWorkflowScope),
+    [spotWorkflow,spotWorkflowScope,authoritativeSpotIDs]);
+  const allWorkflowSpots=useMemo(()=>projectContestSpotWorkflow(classifiedSharedSpots,effectiveSpotWorkflow,false),[classifiedSharedSpots,effectiveSpotWorkflow]);
+  const visibleWorkflowSpots=useMemo(()=>{
+    const projected=projectContestSpotWorkflow(classifiedSharedSpots,effectiveSpotWorkflow);
+    if(!projection)return projected;
+    const supported=new Set(contestSpotSurfaceModes(projection.pluginID,projection.supportedModes??[],projection.spotModeCategory??"MIXED"));
+    const supportedBands=new Set(configuredBands.map(band=>band.trim().toLowerCase()));
+    return projected.filter(spot=>{const mode=canonicalContestSurfaceMode(spot.mode);
+      return mode!==null&&supported.has(mode)&&supportedBands.has(spot.band.trim().toLowerCase())&&
+        (!projection.filterSpotRanges||contestSpotWithinModeRange(contestBandPlan.find(entry=>entry.band===spot.band),spot.frequencyKHz,contestBandMode(mode)));});
+  },[classifiedSharedSpots,effectiveSpotWorkflow,projection?.pluginID,projection?.supportedModes,projection?.mode,projection?.sessionID,projection?.filterSpotRanges,projection?.spotModeCategory,configuredBands,contestBandPlan]);
+  const qtcOpportunities=useQTCOpportunities(projection,visibleWorkflowSpots,request as ContestRequest);
+  const openQTCOpportunity=(spot:{callsign?:unknown})=>{
+    const active=projectionRef.current,callsign=typeof spot.callsign==="string"?spot.callsign.trim().toUpperCase():"";
+    if(!active||!["wae_cw","wae_ssb","wae_rtty"].includes(active.pluginID)||!/^[A-Z0-9/]{3,32}$/.test(callsign))throw Error("That QTC counterpart is no longer available in this WAE session.");
+    flushUnfinishedEditors();
+    setQTCOpportunityIntent({sessionID:active.sessionID,callsign,requestID:crypto.randomUUID()});
+    setProductivityOpen(true);setProductivityTab("QTC");
+  };
+  const currentEntryMapSpot=useMemo<ContestSurfaceSpot|null>(()=>{
+    if(!projection||operationFrequencyHz===null)return null;
+    const callsign=(fields.callsign??"").trim().toUpperCase();
+    if(!/^[A-Z0-9/]{3,32}$/.test(callsign))return null;
+    const matching=observedContestSpot(visibleWorkflowSpots.filter(spot=>spot.callsign.trim().toUpperCase()===callsign),operationFrequencyHz);
+    const path=lookupPathContext?.callsign===callsign?lookupPathContext:null;
+    if(matching)return path?{...matching,latitude:matching.latitude??path.latitude,longitude:matching.longitude??path.longitude}:matching;
+    if(!path||path.latitude===null||path.longitude===null)return null;
+    const spot=localContestHeardSpot({callsign,frequencyHz:operationFrequencyHz,mode:projection.mode,stationCall:effectiveStationCall,bandDefinitions,
+      callContext:{...projection.callContext,callsign,country:path.country,cqZone:path.cqZone,ituZone:path.ituZone}});
+    return spot?{...spot,id:`contest-entry:${projection.draftID}`,latitude:path.latitude,longitude:path.longitude,
+      comment:"Current contest entry",source:"Contest entry",marked:false}:null;
+  },[projection?.draftID,projection?.mode,projection?.callContext,operationFrequencyHz,fields.callsign,visibleWorkflowSpots,
+    lookupPathContext,effectiveStationCall,bandDefinitions]);
+  useEffect(()=>{const connection=connectMapContext(value=>setMapHome(current=>{
+    const next=value.metadata.home;
+    return current?.lat===next?.lat&&current?.lon===next?.lon&&current?.call===next?.call&&current?.grid===next?.grid?current:next;
+  }),()=>{});return()=>connection.dispose();},[]);
+  const entryPathMetrics=useMemo(()=>contestPathMetrics(mapHome,currentEntryMapSpot?{
+    latitude:currentEntryMapSpot.latitude??null,longitude:currentEntryMapSpot.longitude??null}:lookupPathContext),
+    [mapHome,currentEntryMapSpot?.latitude,currentEntryMapSpot?.longitude,lookupPathContext]);
+  const previewWorkflowSpots=useMemo(()=>currentEntryMapSpot&&
+    !visibleWorkflowSpots.some(spot=>spot.id===currentEntryMapSpot.id)?[...visibleWorkflowSpots,currentEntryMapSpot]:visibleWorkflowSpots,
+    [visibleWorkflowSpots,currentEntryMapSpot]);
+  const visibleSpotSignature=useMemo(()=>previewWorkflowSpots.map(spot=>
+    `${spot.id}\u001f${spot.callsign}\u001f${spot.frequencyKHz}\u001f${spot.mode}`).join("\u001e"),[previewWorkflowSpots]);
+  const previewCandidates=useMemo(()=>[...previewWorkflowSpots]
+    .sort((one,two)=>Number(two.band===contestRadioBand)-Number(one.band===contestRadioBand)).flatMap(spot=>{
+    const candidate=contestSpotPreviewCandidate(spot);return candidate?[candidate]:[];
+  }),[visibleSpotSignature,contestRadioBand]);
+  const previewCandidatesRef=useRef(previewCandidates);previewCandidatesRef.current=previewCandidates;
+  useEffect(()=>{
+    const updatePreview=(update:typeof spotPointPreview|((previous:typeof spotPointPreview)=>typeof spotPointPreview))=>{
+      const next=typeof update==="function"?update(spotPointPreviewRef.current):update;
+      spotPointPreviewRef.current=next;setSpotPointPreview(next);
+    };
+    if(!projection||!previewWorkflowSpots.length){const empty={identity:spotPointIdentity,revision:spotScoreRevision,rows:new Map()};spotPointProgressRef.current=empty;setSpotRadioPreview(empty);updatePreview(empty);return;}
+    const candidates=previewCandidates;
+    const candidateSignatures=new Map(candidates.map(candidate=>[candidate.spotID,candidate.inputSignature]));
+    let current=true,retryTimer:number|undefined;
+    const preceding=spotPreviewRunRef.current;
+    // Coalesce changing snapshots behind the one admitted host request. Obsolete
+    // effects retire without adding duplicate batches to the serialized worker.
+    const run=(async()=>{await preceding;if(!current)return;
+      const progress=spotPointProgressRef.current,
+      previous=progress.identity===spotPointIdentity&&progress.revision===spotScoreRevision?progress:spotPointPreviewRef.current,
+      rows=new Map<string,{inputSignature:string;points:number|null;dupe:boolean|null;multiplierCount:number|null;countryMultiplier:boolean|null;zoneMultiplier:boolean|null}>(
+        previous.identity===spotPointIdentity&&previous.revision===spotScoreRevision
+          ?[...previous.rows].filter(([id,row])=>candidateSignatures.get(id)===row.inputSignature):[]),
+      pending=candidates.filter(candidate=>!rows.has(candidate.spotID));
+      if(!pending.length){if(current){const next={identity:spotPointIdentity,revision:spotScoreRevision,rows:new Map(rows)};
+        setSpotRadioPreview(next);updatePreview(next);}return;}
+      // Preview shares the serialized Python lane with typing and QSO saves.
+      // Keep each non-preemptible request short enough for interactive entry.
+      const previewBatchSize=8;
+      for(let offset=0;offset<pending.length;offset+=previewBatchSize){
+        // A superseded list must not keep filling the serialized host queue.
+        if(!current)return;
+        const active=projectionRef.current;
+        if(!active||active.sessionID!==projection.sessionID||active.workspaceGeneration!==projection.workspaceGeneration||
+            (active.spotScoreRevision??active.revision)!==spotScoreRevision)return;
+        const batch=pending.slice(offset,offset+previewBatchSize);
+        const value=unwrap<unknown>(await request("contest_spot_points_preview",{sessionID:active.sessionID,
+          workspaceGeneration:active.workspaceGeneration,expectedRevision:active.revision,
+          spots:batch.map(({inputSignature:_,...candidate})=>candidate)}));
+        const observed=projectionRef.current;
+        if(!observed||observed.sessionID!==active.sessionID||observed.workspaceGeneration!==active.workspaceGeneration||
+            (observed.spotScoreRevision??observed.revision)!==spotScoreRevision)return;
+        if(!validSpotPointsPreview(value,active.sessionID,active.workspaceGeneration,active.revision))
+          throw new Error("The contest host returned an invalid spot points preview.");
+        for(const item of value.spots){const inputSignature=candidateSignatures.get(item.spotID);if(inputSignature)rows.set(item.spotID,{inputSignature,
+          points:item.points,dupe:item.dupe,multiplierCount:item.multiplierCount,
+          countryMultiplier:item.countryMultiplier,zoneMultiplier:item.zoneMultiplier});}
+        // Keep accepted work across superseding feed snapshots, independently
+        // from the last complete display. A score rebuild publishes atomically,
+        // but a new arrival must not restart its already completed batches.
+        const liveInputs=new Map(previewCandidatesRef.current.map(candidate=>[candidate.spotID,candidate.inputSignature]));
+        const progress=spotPointProgressRef.current;
+        const merged=new Map(progress.identity===spotPointIdentity&&progress.revision===spotScoreRevision
+          ?[...progress.rows].filter(([id,row])=>liveInputs.get(id)===row.inputSignature):[]);
+        for(const [id,row] of rows)if(liveInputs.get(id)===row.inputSignature)merged.set(id,row);
+        const next={identity:spotPointIdentity,revision:spotScoreRevision,rows:merged};
+        spotPointProgressRef.current=next;
+        // Radio readiness is active-band scoped. Keep accepted current-revision
+        // progress separate from the all-band atomic display snapshot.
+        setSpotRadioPreview(next);
+        const published=spotPointPreviewRef.current;
+        const rebuilding=published.identity===spotPointIdentity&&published.revision!==spotScoreRevision&&published.rows.size>0;
+        if(!rebuilding||
+            [...liveInputs.keys()].every(id=>merged.has(id)))updatePreview(next);
+        // Let typing/logging and newly arrived snapshots run between batches.
+        await new Promise<void>(resolve=>window.setTimeout(resolve,0));
+      }
+    })().catch(()=>{if(current){updatePreview(previous=>previous.identity===spotPointIdentity?previous:{identity:spotPointIdentity,revision:spotScoreRevision,rows:new Map()});
+      retryTimer=window.setTimeout(()=>setSpotPointRetryTick(value=>value+1),1_000);}});
+    spotPreviewRunRef.current=run;
+    return()=>{current=false;if(retryTimer!==undefined)window.clearTimeout(retryTimer);};
+  },[projection?.sessionID,projection?.workspaceGeneration,spotScoreRevision,request,visibleSpotSignature,spotPointIdentity,spotPointRetryTick,contestRadioBand]);
+  const contestRadioWorkflowSpots=useMemo(()=>configuredBands.includes(contestRadioBand)
+    ?visibleWorkflowSpots.filter(spot=>spot.band===contestRadioBand):[],[visibleWorkflowSpots,configuredBands,contestRadioBand]);
+  // Renew only accepted rows for the current scoring basis and exact input.
+  // A pending arrival must not starve existing spots of their radio lease.
+  const contestRadioPreviewCurrent=Boolean(projection&&spotRadioPreview.identity===spotPointIdentity&&
+    spotRadioPreview.revision===spotScoreRevision);
+  const contestRadioReadySpots=useMemo(()=>contestRadioPreviewCurrent?contestRadioWorkflowSpots.filter(spot=>{
+    const candidate=contestSpotPreviewCandidate(spot),row=spotRadioPreview.rows.get(spot.id);
+    return candidate!==null&&row?.inputSignature===candidate.inputSignature;
+  }):[],[contestRadioPreviewCurrent,contestRadioWorkflowSpots,spotRadioPreview]);
+  const contestRadioPreviewPending=Boolean(projection&&contestRadioWorkflowSpots.some(spot=>{
+    const candidate=contestSpotPreviewCandidate(spot);
+    return candidate!==null&&(!contestRadioPreviewCurrent||spotRadioPreview.rows.get(spot.id)?.inputSignature!==candidate.inputSignature);
+  }));
+  const contestRadioPublication=useMemo(()=>{
+    if(!projection||!contestRadioPreviewCurrent||spotRadioPreview.rows.size===0||
+      !contestRadioReadySpots.length&&contestRadioPreviewPending)return null;
+    const activeBand=bandLabels[String(projection.band)]??String(projection.band),activeBandConfigured=configuredBands.includes(activeBand),
+      radioBands=activeBandConfigured?[activeBand]:configuredBands;
+    const rows=contestRadioReadySpots.slice(0,500).flatMap(spot=>{
+      const preview=spotRadioPreview.rows.get(spot.id),candidate=contestSpotPreviewCandidate(spot),frequencyHz=Math.round(spot.frequencyKHz*1_000);
+      if(!candidate||!preview||preview.inputSignature!==candidate.inputSignature||preview.dupe===true&&!effectiveSpotWorkflow.showWorked)return [];
+      return [{spot_id:spot.id,callsign:spot.callsign,frequency_hz:frequencyHz,band:spot.band,
+        mode:canonicalContestSurfaceMode(spot.mode)??spot.mode,spotter:spot.spotter,comment:spot.comment,
+        timestamp:spot.receivedAt,points:preview.points,dupe:preview.dupe,multiplier_count:preview.multiplierCount,
+        country_multiplier:preview.countryMultiplier,zone_multiplier:preview.zoneMultiplier}];
+    });
+    return {session_id:projection.sessionID,workspace_generation:projection.workspaceGeneration,revision:projection.revision,
+      configured_bands:radioBands,allowed_mode_groups:allowedModeGroups,spots:rows};
+  },[projection?.sessionID,projection?.workspaceGeneration,projection?.revision,spotRadioPreview,contestRadioPreviewCurrent,
+    contestRadioPreviewPending,contestRadioReadySpots,configuredBands,allowedModeGroups,bandLabels,effectiveSpotWorkflow.showWorked]);
+  const contestRadioCurrentKey=contestingTest||projection?.practice||!contestRadioPublication?null:JSON.stringify(contestRadioPublication);
+  const contestRadioCurrentKeyRef=useRef(contestRadioCurrentKey);contestRadioCurrentKeyRef.current=contestRadioCurrentKey;
+  const contestRadioCurrentRef=useRef(contestRadioPublication);contestRadioCurrentRef.current=contestingTest||projection?.practice?null:contestRadioPublication;
+  const enqueueContestRadioPublication=(action:"replace"|"clear",base:NonNullable<typeof contestRadioPublication>)=>{
+    const state=contestRadioPublicationRef.current,queueVersion=++state.queueVersion,snapshotKey=JSON.stringify(base),
+      scoringRevision=spotScoreRevision,
+      spots=action==="clear"?[]:base.spots,chunkCount=Math.max(1,Math.ceil(spots.length/64));
+    const isQueuedCurrent=()=>state.queueVersion===queueVersion&&(action==="clear"||
+      state.mounted&&contestRadioCurrentKeyRef.current===snapshotKey);
+    const isAdmittedCurrent=()=>{
+      if(action==="clear")return state.queueVersion===queueVersion;
+      const active=projectionRef.current,latest=contestRadioCurrentRef.current;
+      if(!state.mounted||!active||!latest||active.sessionID!==base.session_id||
+        active.workspaceGeneration!==base.workspace_generation||(active.spotScoreRevision??active.revision)!==scoringRevision||
+        JSON.stringify(latest.configured_bands)!==JSON.stringify(base.configured_bands)||
+        JSON.stringify(latest.allowed_mode_groups)!==JSON.stringify(base.allowed_mode_groups))return false;
+      const currentRows=new Map(latest.spots.map(spot=>[spot.spot_id,JSON.stringify(spot)]));
+      return spots.every(spot=>currentRows.get(spot.spot_id)===JSON.stringify(spot));
+    };
+    const publish=async()=>{
+      if(!isQueuedCurrent()||!isAdmittedCurrent())return;
+      // Skipped queue entries consume no native sequence: a new publisher must
+      // start at one. Every chunk/retry of an admitted snapshot shares its number.
+      let sequence=++state.sequence,readmitting=false;
+      for(let chunkIndex=0;chunkIndex<chunkCount;chunkIndex++){
+        // Finish an admitted chunk set across harmless typing/additions, but
+        // never finish or retry it after scoring, selection or its inputs change.
+        if(!isAdmittedCurrent())return;
+        let delivered=false;
+        for(let attempt=0;attempt<3&&!delivered;attempt++){
+          if(!isAdmittedCurrent())return;
+          const params={publisher_id:state.publisherID,publisher_started_at:state.publisherStartedAt,publication_sequence:sequence,action,
+            session_id:base.session_id,workspace_generation:base.workspace_generation,revision:base.revision,
+            configured_bands:base.configured_bands,allowed_mode_groups:base.allowed_mode_groups,
+            chunk_index:chunkIndex,chunk_count:chunkCount,spots:spots.slice(chunkIndex*64,(chunkIndex+1)*64)};
+          try{
+            const result=await contestRadioServiceRef.current("cluster_contest_radio_spots_publish",params) as {stale?:boolean;rejected?:number};
+            if(result?.stale===true){
+              // Startup cleanup can fail before native learns this publisher,
+              // or the worker can restart. Retry admission once with the same
+              // identity and timestamp; retired/superseded owners remain fenced.
+              if(action==="replace"&&chunkIndex===0&&sequence>1&&!readmitting){sequence=1;readmitting=true;continue;}
+              return;
+            }
+            // A non-stale receipt admits the publisher even if delivery is
+            // rejected and must retry. Stale receipts never reset the counter.
+            if(readmitting&&result?.stale===false)state.sequence=sequence;
+            if(!(Number(result?.rejected??0)>0)){delivered=true;break;}
+          }catch{/* A bounded retry preserves ordering without surfacing optional radio output in the logging window. */}
+          if(!delivered)await new Promise(resolve=>setTimeout(resolve,50*(attempt+1)));
+        }
+        if(!delivered)throw new Error("Contest radio spot reconciliation was not accepted.");
+      }
+    };
+    state.chain=state.chain.catch(()=>{}).then(publish).catch(()=>{
+      if(state.mounted&&contestRadioPublicationRef.current.publisherID===state.publisherID&&state.queueVersion===queueVersion){
+        state.key="";setTimeout(()=>setContestRadioRetryTick(value=>value+1),1_000);
+      }
+    });
+  };
+  useEffect(()=>{
+    if(contestingTest)return;
+    const timer=window.setInterval(()=>{
+      contestRadioPublicationRef.current.key="";
+      setContestRadioRetryTick(value=>value+1);
+    },60_000);
+    return()=>window.clearInterval(timer);
+  },[contestingTest]);
+  useEffect(()=>{
+    const state=contestRadioPublicationRef.current;
+    if(contestingTest){state.key="";state.identity="";state.base=null;return;}
+    if(!contestRadioPublication){
+      if(contestRadioPreviewPending)return;
+      if(state.base){enqueueContestRadioPublication("clear",{...state.base,spots:[]});state.key="";state.identity="";state.base=null;}
+      return;
+    }
+    const key=JSON.stringify(contestRadioPublication),identity=`${contestRadioPublication.session_id}/${contestRadioPublication.workspace_generation}`;
+    if(state.key===key)return;
+    state.key=key;state.identity=identity;state.base={session_id:contestRadioPublication.session_id,
+      workspace_generation:contestRadioPublication.workspace_generation,revision:contestRadioPublication.revision,
+      configured_bands:contestRadioPublication.configured_bands,allowed_mode_groups:contestRadioPublication.allowed_mode_groups};
+    enqueueContestRadioPublication("replace",contestRadioPublication);
+  },[contestRadioPublication,contestRadioPreviewPending,contestingTest,contestRadioRetryTick]);
+  useEffect(()=>{
+    const state=contestRadioPublicationRef.current,token=++state.mountToken;state.mounted=true;
+    return()=>{queueMicrotask(()=>{
+      if(state.mountToken===token){state.mounted=false;
+        if(!contestingTest&&state.base)enqueueContestRadioPublication("clear",{...state.base,spots:[]});}
+    });};
+  },[]);
+  const spotSelectionContext = `${operatingContext}/${workspaceGeneration}/${projection?.sessionID ?? "no-session"}`;
+  const spotIDSignature = visibleWorkflowSpots.map(spot=>spot.id).join("\u001f");
+  useEffect(() => {
+    const available = new Set(visibleWorkflowSpots.map(spot => spot.id));
+    const selected = selectedSpotId == null ? null : String(selectedSpotId);
+    const cursor = spotCursorRef.current;
+    if (cursor.context !== spotSelectionContext) {
+      spotCursorRef.current = { context: spotSelectionContext, spotID: selected !== null && available.has(selected) ? selected : null,
+        externalSpotID:selected };
+    } else if (selected !== cursor.externalSpotID) {
+      spotCursorRef.current = { context: spotSelectionContext, spotID:selected !== null&&available.has(selected)?selected:null,externalSpotID:selected };
+    } else if (cursor.spotID !== null && !available.has(cursor.spotID)) {
+      spotCursorRef.current = { ...cursor, spotID: null };
+    }
+  }, [spotSelectionContext, spotIDSignature, selectedSpotId, visibleWorkflowSpots]);
+  useEffect(()=>{if(spotWorkflowScope.sessionID&&!sameSpotWorkflowScope(spotWorkflow,spotWorkflowScope))
+    setSpotWorkflow(restoredSpotWorkflow(spotWorkflowScope));},[spotWorkflowScope,spotWorkflow]);
+  useEffect(()=>{if(sameSpotWorkflowScope(spotWorkflow,spotWorkflowScope)&&effectiveSpotWorkflow!==spotWorkflow)
+    setSpotWorkflow(current=>current===spotWorkflow?effectiveSpotWorkflow:current);},[effectiveSpotWorkflow,spotWorkflow,spotWorkflowScope]);
+  useEffect(()=>{if(effectiveSpotWorkflow.sessionID&&sameSpotWorkflowScope(spotWorkflow,spotWorkflowScope))
+    persistContestSpotWorkflow(localStorage,effectiveSpotWorkflow);},[effectiveSpotWorkflow,spotWorkflow,spotWorkflowScope]);
+  const configuredAutoCQDelay = Number(setup.preferences.autoCQDelay ?? 15);
+  const autoCQDelaySeconds = Number.isFinite(configuredAutoCQDelay) ? Math.min(3600, Math.max(1, configuredAutoCQDelay)) : 15;
+  const phoneSimulationAvailable = Boolean(contestingTest && projection?.pluginID && contestPhoneIntentPlugins.has(projection.pluginID) && projection.mode === "SSB");
+  const phoneProductionAvailable = Boolean(!contestingTest && !projection?.practice && projection?.pluginID && contestPhoneIntentPlugins.has(projection.pluginID) && projection.mode === "SSB");
+  const phoneProductionConfigured = phoneProductionAvailable && Boolean(String(setup.preferences.voiceProfilePath ?? "").trim());
+  const phoneOutputAvailable = phoneSimulationAvailable || phoneProductionConfigured;
+  const phoneCanSend = phoneSimulationArmed && !phoneSimulationPending && !phoneReleaseUncertain;
+  const phoneReleaseBlocking = Boolean(phoneReleaseUncertain || !phoneOutputAvailable && (phoneSimulationArmed || phoneSimulationPending));
+  useEffect(() => {
+    phoneSimulationControllerRef.current?.abort(); phoneSimulationControllerRef.current = null;
+    phoneSimulationRecoveryRef.current = null;
+    const generation = ++phoneReleaseGenerationRef.current;
+    setPhoneSimulationPending(true);
+    void voiceOutput.stop().then(() => {
+      if (phoneReleaseGenerationRef.current !== generation) return;
+      setPhoneReleaseUncertain(""); setPhoneSimulationArmed(false); setPhoneSimulationTrace([]);
+    }).catch(cause => {
+      if (phoneReleaseGenerationRef.current !== generation) return;
+      const message = `Contest phone PTT release remains uncertain: ${errorMessage(cause)}`;
+      setPhoneReleaseUncertain(message); setPhoneSimulationArmed(true); setError(message);
+    }).finally(() => {
+      if (phoneReleaseGenerationRef.current === generation) setPhoneSimulationPending(false);
+    });
+  }, [contestingTest, projection?.sessionID, projection?.pluginID, projection?.mode, voiceOutput]);
+  const rememberSetup = (document: ContestSetupDocument) => {
+    setSetup(document);
+    try { localStorage.setItem(setupDraftKey, JSON.stringify(document)); } catch { /* storage is optional */ }
+  };
+
+  const result = async <T,>(method: string, params: Record<string, unknown> = {}) => unwrap<T>(await request(method, params));
+  const setupViewChanged = useCallback((view: SetupView | null) => {
+    onSetupViewChange?.(view);
+    if (view !== "Choose a Contest") return;
+    const generation = projectionRef.current?.workspaceGeneration ?? workspaceGeneration;
+    // Cold start opens the native-authoritative session first. Load the full
+    // chooser only on demand, without letting a late read cross workspaces.
+    void request("contest_sessions", {}).then(frame => {
+      const list = unwrap<{sessions: Session[]}>(frame);
+      if ((projectionRef.current?.workspaceGeneration ?? workspaceGeneration) === generation) setSessions(list.sessions);
+    }).catch(cause => {
+      if ((projectionRef.current?.workspaceGeneration ?? workspaceGeneration) === generation) setError(errorMessage(cause));
+    });
+  }, [request, onSetupViewChange, workspaceGeneration]);
+  const partialQuery = (fields.callsign ?? "").trim().toUpperCase();
+  useEffect(() => {
+    if (!/^[A-Z0-9/]{3,32}$/.test(partialQuery)) { setLookupPathContext(null); return; }
+    setLookupPathContext(current => current?.callsign === partialQuery ? current : null);
+    let cancelled = false, retryTimer: number | null = null;
+    const call = partialQuery;
+    const lookup = (attempt: number) => {
+      void serviceRequest("lookup_call", { call }).then(response => {
+        const frame = response && typeof response === "object" && !Array.isArray(response) ? response as Data : {};
+        const value = frame.result && typeof frame.result === "object" && !Array.isArray(frame.result) ? frame.result as Data : frame;
+        if (cancelled || String(value.call ?? "").trim().toUpperCase() !== call) return;
+        const metric = (input: unknown, maximum: number) => {
+          if (input === null || input === undefined || input === "") return null;
+          const numeric = typeof input === "number" ? input : Number(input);
+          return Number.isFinite(numeric) && numeric >= 0 && numeric <= maximum ? numeric : null;
+        };
+        const coordinate = (input: unknown, maximum: number) => {
+          if (input === null || input === undefined || input === "") return null;
+          const numeric = typeof input === "number" ? input : Number(input);
+          return Number.isFinite(numeric) && Math.abs(numeric) <= maximum ? numeric : null;
+        };
+        setLookupPathContext({ callsign: call,
+          country: typeof value.country === "string" && value.country.trim() ? value.country.trim() : null,
+          cqZone: metric(value.cqZone, 90), ituZone: metric(value.ituZone, 90),
+          latitude: coordinate(value.latitude, 90), longitude: coordinate(value.longitude, 180),
+          headingDegrees: metric(value.bearing, 360), longPathHeadingDegrees: metric(value.long_path_bearing, 360),
+          distanceKm: metric(value.distance_km, 50_000) });
+        if (attempt < 2 && ["settings_busy","workspace_unavailable"].includes(String(value.lookup_status ?? "")) &&
+            (value.bearing == null || value.long_path_bearing == null || value.distance_km == null))
+          retryTimer = window.setTimeout(() => lookup(attempt + 1), 450 * (attempt + 1));
+      }).catch(() => { if(!cancelled&&attempt<4)retryTimer=window.setTimeout(()=>lookup(attempt+1),250*(attempt+1)); });
+    };
+    const timer = window.setTimeout(() => lookup(0), 250);
+    return () => { cancelled = true; window.clearTimeout(timer); if (retryTimer !== null) window.clearTimeout(retryTimer); };
+  }, [partialQuery, serviceRequest]);
+  const historyCandidate = useMemo(() => not1mmHistoryCandidate(fields.callsign ?? "", projection?.history ?? ""),
+    [fields.callsign, projection?.history]);
+  const loggedCandidates = partialCandidates("log",
+    partial?.sessionID === projection?.sessionID && partial?.revision === projection?.revision && partial?.query === partialQuery
+      ? partial?.rows.map(row => row.Call) ?? [] : [], partialQuery);
+  const clusterCandidates = partialCandidates("cluster", spots.map(spot => spot.callsign), partialQuery);
+  useEffect(() => {
+    let cancelled = false;
+    if (!projection || !/^[A-Z0-9/]{3,32}$/.test(partialQuery)) { setPartial(null); return; }
+    const {sessionID, revision} = projection;
+    void result<Data>("contest_check_partial", {sessionID, expectedRevision:revision, query:partialQuery, limit:500})
+      .then(value => { if (!cancelled) setPartial({sessionID, revision, query:partialQuery, rows:Array.isArray(value.rows)?value.rows:[]}); })
+      .catch(() => { if (!cancelled) setPartial(null); });
+    return () => { cancelled = true; };
+  }, [projection?.sessionID, projection?.revision, partialQuery, request]);
+  const acceptProjection = (next: Projection, inputVersion?: number) => {
+    if(projectionRef.current?.sessionID!==next.sessionID||projectionRef.current.workspaceGeneration!==next.workspaceGeneration){
+      laneBuffersRef.current={};setLaneCapabilities(null);setLaneNative(null);
+    }
+    if(dualContestLanes(next))for(const lane of next.operatingLanes!.lanes)
+      laneBuffersRef.current[lane.laneID]=mergeContestLaneBuffer(laneBuffersRef.current[lane.laneID],next,lane.laneID);
+    if(typedFieldsRef.current.draftID!==next.draftID)typedFieldsRef.current={draftID:next.draftID,fields:new Set()};
+    projectionRef.current = next; focusRef.current = next.focus; setProjection(next);
+    const values = dualContestLanes(next) ? laneBuffersRef.current[next.operatingLanes!.keyboardLaneID]?.fields ?? projectionFields(next)
+      : inputVersion !== undefined && editVersionRef.current !== inputVersion
+      ? {...fieldsRef.current,...Object.fromEntries(next.fields.filter(field=>field.readOnly||field.id===next.allocatedSerialFieldID).map(field=>[field.id,field.value]))}
+      : projectionFields(next);
+    fieldsRef.current = values; setFields(values);
+  };
+  const acceptSessionProjection = (next: Projection) => {
+    if (projectionRef.current?.sessionID !== next.sessionID) {
+      logQueryRef.current="";setLogQuery("");setLogFocus("");
+      setRows([]); setLogOffset(0); setLogTotal(0); setPartial(null); setScore(null); setStatistics(null);
+      setMatrices({}); setRates(null); setEditing(null);
+      setAuxiliaryReads({});
+    }
+    acceptProjection(next);
+  };
+  const admitRates = (next: Data, sessionID: string, revision: number) => {
+    const current = projectionRef.current;
+    if (current?.sessionID !== sessionID || current.revision !== revision ||
+        next.sessionID !== sessionID || next.revision !== revision) return false;
+    setRates(next);
+    return true;
+  };
+  const admitStatistics = (next: Data, sessionID: string, revision: number) => {
+    const current = projectionRef.current;
+    if (current?.sessionID !== sessionID || current.revision !== revision) return false;
+    if (next.sessionID !== sessionID || next.revision !== revision) return false;
+    const raw = next.statistics;
+    if (raw === undefined) { setStatistics(undefined); return true; }
+    const exactStatistics = !!raw && typeof raw === "object" && !Array.isArray(raw) &&
+      Object.keys(raw).length === 2 && "rows" in raw && "total" in raw;
+    const layout = current.pluginID === "cq_ww_ssb" ? "cq_ww" as const : "generic" as const;
+    const sourceRows = Array.isArray(raw?.rows) ? raw.rows as Data[] : [];
+    const cqMultiplier = (row: Data, key: "countries" | "zones") => {
+      const value=Number(row?.[key]);
+      if(Number.isSafeInteger(value)&&value>=0)return value;
+      return sourceRows.length<=1?Number((next.score as Score)?.[key]):Number.NaN;
+    };
+    const dupeCount = (row:Data) => row?.dupes===undefined?{}:{dupes:row.dupes===null?null:Number(row.dupes)};
+    const cqRow = (row: Data) => ({ band:String(row?.band ?? ""), qsos:Number(row?.qsos), points:Number(row?.points), ...dupeCount(row),
+      countries:cqMultiplier(row,"countries"), zones:cqMultiplier(row,"zones") });
+    const genericRow = (row: Data) => ({ band:String(row?.band ?? ""), qsos:Number(row?.qsos), calls:Number(row?.calls), ...dupeCount(row),
+      cw:Number(row?.cw), phone:Number(row?.phone), digital:Number(row?.digital), wpx:Number(row?.wpx), points:Number(row?.points) });
+    const candidate = layout === "cq_ww"
+      ? { schemaVersion:3 as const,status:"ready" as const,layout,score:scoreSummary(next.score as Score,current.pluginID),
+          rows:sourceRows.map(cqRow),total:cqRow(raw?.total as Data),busy:false }
+      : { schemaVersion:3 as const,status:"ready" as const,score:scoreSummary(next.score as Score,current.pluginID),
+          rows:sourceRows.map(genericRow),total:genericRow(raw?.total as Data),busy:false };
+    if (!exactStatistics || !validContestSurfaceProjection("propagation", candidate)) {
+      setStatistics(null); return false;
+    }
+    setStatistics(layout === "cq_ww"
+      ? { sessionID,revision,layout,rows:candidate.rows as ContestCQWWStatisticsRow[],total:candidate.total as ContestCQWWStatisticsRow }
+      : { sessionID,revision,layout,rows:candidate.rows as ContestStatisticsRow[],total:candidate.total as ContestStatisticsRow });
+    return true;
+  };
+  const refresh = async (sessionID: string, next?: Projection, offset = 0,
+      lanes: readonly AuxiliaryLane[] = ["log", "score", "rates"], pageLimit = logPageSize) => {
+    const expected = next ?? projectionRef.current;
+    if (!expected || expected.sessionID !== sessionID) return;
+    const revision = expected.revision;
+    const key = `${sessionID}:${revision}`;
+    const operations = lanes.map(async lane => {
+      const query=logQueryRef.current,order={...logOrderRef.current};
+      const value:Data = await (lane === "log"
+        ? result<Data>("contest_log_page", { sessionID, expectedRevision: revision, offset, limit: pageLimit,query,...order })
+        : lane === "score" ? result<Data>("contest_score", { sessionID, expectedRevision: revision })
+        : result<Data>("contest_rates", { sessionID, expectedRevision: revision }));
+      const current = projectionRef.current;
+      if (current?.sessionID !== sessionID || current.revision !== revision) return false;
+      if (lane === "log") {
+        if(query!==logQueryRef.current||order.sort!==logOrderRef.current.sort||order.direction!==logOrderRef.current.direction)return false;
+        setRows(Array.isArray(value.rows) ? value.rows : []); setLogOffset(Number(value.offset ?? offset)); setLogTotal(Number(value.total ?? 0));
+      } else if (lane === "score") {
+        setScore(value.score as Score); setMatrices({...value.matrices,countryUniverse:value.countryUniverse??[],multiplierViews:value.multiplierViews??[]});
+        admitStatistics(value, sessionID, revision);
+      } else if (!admitRates(value, sessionID, revision)) return false;
+      setAuxiliaryReads(previous => {
+        if (previous[lane] === key) return previous;
+        return { ...previous, [lane]:key };
+      });
+      return true;
+    });
+    const settled = await Promise.allSettled(operations);
+    const current = projectionRef.current;
+    if (current?.sessionID !== sessionID || current.revision !== revision) return;
+    const failure = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+    if (failure) {
+      const message = errorMessage(failure.reason);
+      auxiliaryErrorRef.current = message; setError(message);
+    } else if (auxiliaryErrorRef.current) {
+      const recovered = auxiliaryErrorRef.current; auxiliaryErrorRef.current = "";
+      setError(currentError => currentError === recovered ? "" : currentError);
+    }
+  };
+  useEffect(() => {
+    if (!projection) return;
+    const key = `${projection.sessionID}:${projection.revision}`;
+    const missing = (["log", "score", "rates"] as const).filter(lane => auxiliaryReads[lane] !== key);
+    if (!missing.length) return;
+    const timer = window.setTimeout(() => {
+      void refresh(projection.sessionID, projection, logOffset, missing);
+    }, 1_000);
+    return () => window.clearTimeout(timer);
+  }, [projection?.sessionID, projection?.revision, auxiliaryReads.log, auxiliaryReads.score, auxiliaryReads.rates, logOffset, request]);
+  useEffect(() => {
+    const sessionID = projection?.sessionID;
+    if (!sessionID) return;
+    let cancelled = false;
+    let sequence = 0;
+    const timer = window.setInterval(() => {
+      const requestSequence = ++sequence;
+      void request("contest_rates", { sessionID }).then(value => {
+        const next = unwrap<Data>(value);
+        const current = projectionRef.current;
+        if (cancelled || requestSequence !== sequence || !current) return;
+        admitRates(next, sessionID, current.revision);
+      }).catch(() => { /* Retain the last admitted snapshot until the next refresh. */ });
+    }, 10_000);
+    return () => { cancelled = true; sequence += 1; window.clearInterval(timer); };
+  }, [projection?.sessionID, request]);
+  useEffect(() => {
+    const sessionID = projection?.sessionID, generation = projection?.workspaceGeneration;
+    if (!sessionID || !generation) return;
+    let cancelled = false, inFlight = false;
+    const poll = async () => {
+      if (cancelled || inFlight || busyRef.current) return;
+      const observed = projectionRef.current;
+      if (!observed || observed.sessionID !== sessionID || observed.workspaceGeneration !== generation) return;
+      const inputVersion = editVersionRef.current;
+      const inputsWereBuffered = !sameFields(fieldsRef.current, projectionFields(observed));
+      inFlight = true;
+      try {
+        const read = await result<{ projection: Projection }>("contest_draft_get", {
+          sessionID, workspaceGeneration: generation,
+        });
+        const next = read.projection, current = projectionRef.current;
+        if (cancelled || !current || current.sessionID !== sessionID || current.workspaceGeneration !== generation ||
+            next.sessionID !== sessionID || next.workspaceGeneration !== generation || next.revision <= current.revision) return;
+        // WSJT-X/JTDX and multi-operator peers mutate the authoritative Python
+        // session outside this renderer. Adopt that newer revision so every
+        // detached projection is republished, while retaining any locally
+        // buffered operator input that has not reached the host yet.
+        const preserveInputs = inputsWereBuffered || editVersionRef.current !== inputVersion;
+        acceptProjection(next, preserveInputs ? Number.MIN_SAFE_INTEGER : inputVersion);
+        await refresh(sessionID, next, logOffset);
+      } catch {
+        // A transient read must not disturb the last admitted contest surface.
+      } finally { inFlight = false; }
+    };
+    const timer = window.setInterval(() => { void poll(); }, 1_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [projection?.sessionID, projection?.workspaceGeneration, logOffset, request]);
+  const openSession = async (session: Pick<Session, "sessionID" | "workspaceGeneration">, startup = false) => {
+    if (busyRef.current) return;
+    busyRef.current = true; setBusy(true); setError("");
+    try {
+      flushUnfinishedEditors();
+      if (projectionRef.current?.sessionID !== session.sessionID) await flushDraftRef.current();
+      const opened = await result<{ projection: Projection }>("contest_open", {
+        sessionID: session.sessionID, workspaceGeneration: session.workspaceGeneration,
+      });
+      const setupResult = await result<{ setup: ContestSetupDocument; effectiveMacros?: ContestSetupMacro[] }>("contest_setup_get", { sessionID: session.sessionID });
+      setEffectiveMacros(setupResult.effectiveMacros);
+      setManualFrequencyMHz((opened.projection.frequencyHz / 1_000_000).toFixed(6));
+      const current = projectionRef.current;
+      const admitted = current?.sessionID === opened.projection.sessionID &&
+        current.workspaceGeneration === opened.projection.workspaceGeneration && current.revision > opened.projection.revision
+        ? current : opened.projection;
+      acceptSessionProjection(admitted); practiceTransitionRef.current=false; phoneSimulationRecoveryRef.current = null;
+      // Native contest_open has admitted these exact coordinates. The standalone
+      // owner may have bootstrapped from a newer normal logbook after a restore.
+      onSessionOpened?.({sessionID:admitted.sessionID,workspaceGeneration:admitted.workspaceGeneration});
+      if (startup) setStartupOpenError("");
+      setSessions(existing => existing.some(item => item.sessionID === admitted.sessionID) ? existing : [...existing, {
+        sessionID: admitted.sessionID, workspaceGeneration: admitted.workspaceGeneration,
+        name: admitted.pluginName ?? admitted.pluginID, pluginID: admitted.pluginID,
+        sourceRevision: admitted.sourceRevision, revision: admitted.revision,
+      }]);
+      rememberSetup(setupResult.setup); await refresh(session.sessionID, admitted);
+      localStorage.setItem(activeSessionKey, session.sessionID); if (!setupOnly) setManager(false); setEditing(null);
+      await cw.controller.refresh();
+    } catch (cause) {
+      const message = errorMessage(cause);
+      setError(message);
+      if (startup) setStartupOpenError(message);
+    }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+
+  useEffect(() => {
+    let active = true;
+    setStartupPending(true); setCatalogReady(false); setCatalogLoadError("");
+    void (async () => {
+      try {
+        if (strictHostActive) {
+          const catalog = result<Data>("contest_catalog");
+          await openSession(strictHostActive, true);
+          try {
+            const available = await catalog;
+            if (!active) return;
+            const hostBands = validBandDefinitions(available.bandDefinitions);
+            setCatalog(Array.isArray(available.plugins) ? available.plugins : []);
+            setBandDefinitions(hostBands.length ? hostBands : fallbackBandDefinitions);
+            setCatalogReady(true);
+          } catch (cause) {
+            if (active) setCatalogLoadError(cause instanceof ContestServerError && cause.code === "contest_host_protocol"
+              ? "Contest types could not be loaded. Station services may still be starting." : errorMessage(cause));
+          }
+          return;
+        }
+        const [available, list] = await Promise.all([
+          result<Data>("contest_catalog"), result<{ sessions: Session[]; activeSessionID?: string | null }>("contest_sessions"),
+        ]);
+        if (!active) return;
+        const hostBands = validBandDefinitions(available.bandDefinitions);
+        setCatalog(Array.isArray(available.plugins) ? available.plugins : []);
+        setBandDefinitions(hostBands.length ? hostBands : fallbackBandDefinitions); setSessions(list.sessions);
+        setCatalogReady(true);
+        const stored = localStorage.getItem(activeSessionKey);
+        const hostActive = list.activeSessionID
+          ? list.sessions.find(session => session.sessionID === list.activeSessionID) : undefined;
+        const storedActive = stored ? list.sessions.find(session => session.sessionID === stored) : undefined;
+        const saved = hostActive ?? storedActive ?? (stored && list.sessions.length === 1 ? list.sessions[0] : undefined);
+        if (stored && !storedActive && !hostActive) localStorage.removeItem(activeSessionKey);
+        if (saved) await openSession(saved);
+      } catch (cause) {
+        if (active) setCatalogLoadError(cause instanceof ContestServerError && cause.code === "contest_host_protocol"
+          ? "Contest types could not be loaded. Station services may still be starting." : errorMessage(cause));
+      } finally {
+        if (active) setStartupPending(false);
+      }
+    })();
+    return () => { active = false; };
+  }, [catalogLoadAttempt, strictHostActive?.sessionID, strictHostActive?.workspaceGeneration]);
+
+  useEffect(() => {
+    if (!registerTransition) return;
+    registerTransition({
+      freeze: () => setRetiring(true), resume: () => setRetiring(false),
+      prepare: async () => {
+        if (busyRef.current || editing) throw new Error("Finish the current contest edit before changing operating module.");
+        flushUnfinishedEditors();
+        await flushAllDraftsRef.current();
+        await cw.controller.stop();
+      },
+    });
+    return () => registerTransition(null);
+  }, [registerTransition, editing, cw.controller]);
+
+  useEffect(()=>{
+    if(!setupOnly)return;let active=true,stop:(()=>void)|undefined;
+    void listen<string>("xlog:contesting-quit-blocked",event=>{if(active&&typeof event.payload==="string")setError(event.payload);})
+      .then(dispose=>{if(active)stop=dispose;else dispose();}).catch(()=>{});
+    return()=>{active=false;stop?.();};
+  },[setupOnly]);
+
+  const mutate = async (method: string, base: Projection, extra: Record<string, unknown> = {}, operationID: string = crypto.randomUUID()) => {
+    const laneScope=dualContestLanes(base)&&["contest_draft_apply","contest_digital_select","contest_focus","contest_run_state","contest_esm","contest_function_key","contest_qso_commit","contest_lane_context","contest_lane_select"].includes(method)
+      ?contestLaneParams(captureContestLaneScope(base,base.selectedLaneID??base.operatingLanes!.keyboardLaneID)):{};
+    const payload = { sessionID: base.sessionID, operationID, expectedRevision: base.revision, draftID: base.draftID, ...laneScope, ...extra };
+    try {
+      const changed=await result<MutationResult>(method,payload),next=changed.projection;
+      // These exact consecutive local edits cannot change any candidate's log
+      // score. Unknown/external revisions, contacts and setup always invalidate.
+      if(["contest_draft_apply","contest_focus","contest_run_state"].includes(method)&&
+          next.sessionID===base.sessionID&&next.workspaceGeneration===base.workspaceGeneration&&next.revision===base.revision+1&&
+          next.pluginID===base.pluginID&&next.referenceID===base.referenceID&&canonicalJSON(next.score)===canonicalJSON(base.score))
+        return {...changed,projection:{...next,spotScoreRevision:base.spotScoreRevision??base.revision}};
+      return changed;
+    }
+    catch (cause) {
+      const durableMethods = new Set<ContestMutation["method"]>(["contest_draft_apply", "contest_focus", "contest_qso_commit", "contest_qso_correct", "contest_qso_delete", "contest_recalculate"]);
+      const uncertain = !(cause instanceof ContestServerError) || cause.outcome === "uncertain";
+      if (uncertain && durableMethods.has(method as ContestMutation["method"])) {
+        const operation: ContestMutation = { method: method as ContestMutation["method"], payload,
+          scope: { sessionID: base.sessionID, workspaceGeneration: base.workspaceGeneration, requestID: operationID,
+            expectedRevision: base.revision, draftID: base.draftID, payloadDigest: await payloadDigest(payload),
+            operationTimestamp: new Date().toISOString() } };
+        throw new ContestMutationUncertain(operation, cause);
+      }
+      throw cause;
+    }
+  };
+  const configuredClient=groupNetwork?.authority?.role==="client"||setup.network.multiEnabled===true&&setup.network.multiMaster!==true;
+  const laneBuffer=(scope:CapturedContestLaneScope)=>{
+    const current=projectionRef.current;if(!current)throw Error("Open a contest session.");assertContestLaneScope(current,scope);
+    const buffer=laneBuffersRef.current[scope.laneID];if(!buffer)throw Error("The lane entry is unavailable.");return buffer;
+  };
+  const admitLaneResult=(changed:MutationResult,scope:CapturedContestLaneScope,submitted?:ContestLaneBuffer)=>{
+    const current=projectionRef.current,next=changed.projection;
+    if(!current||current.sessionID!==scope.sessionID||current.workspaceGeneration!==scope.workspaceGeneration||
+      next.sessionID!==scope.sessionID||next.workspaceGeneration!==scope.workspaceGeneration)throw Error("The lane session changed before its reply.");
+    if(submitted){const buffered=laneBuffersRef.current[scope.laneID];
+      if(buffered?.scope.draftID===scope.draftID&&buffered.scope.bindingVersion===scope.bindingVersion)
+        laneBuffersRef.current[scope.laneID]={...buffered,baseline:{...submitted.fields},frequencyHz:Number(submitted.frequencyText),
+          receiveFrequencyHz:submitted.receiveFrequencyText.trim()?Number(submitted.receiveFrequencyText):null};}
+    if(next.revision>=current.revision)acceptProjection(next);
+    return changed;
+  };
+  const flushLane=async(scope:CapturedContestLaneScope)=>{
+    const current=projectionRef.current!;assertContestLaneScope(current,scope);
+    const buffer=structuredClone(laneBuffer(scope)),base=contestLaneProjection(current,scope.laneID);
+    if(buffer.conflicts.length)throw Error(`Lane entry changed outside these buffered edits (${buffer.conflicts.join(", ")}). Review it before continuing.`);
+    const frequencyHz=Number(buffer.frequencyText);
+    if(!Number.isSafeInteger(frequencyHz)||contestFrequency(frequencyHz,base.supportedBands??activeSupportedBands,bandDefinitions)===null)
+      throw Error("Enter a frequency in Hz on an eligible contest band for this lane.");
+    const receiveFrequencyHz=buffer.receiveFrequencyText.trim()?Number(buffer.receiveFrequencyText):null;
+    if(receiveFrequencyHz!==null&&(!Number.isSafeInteger(receiveFrequencyHz)||receiveFrequencyHz<100_000||receiveFrequencyHz>100_000_000_000))
+      throw Error("Receive frequency must be integer Hz, or blank when unknown.");
+    if(!sameFields(buffer.fields,projectionFields(base))||frequencyHz!==base.frequencyHz||receiveFrequencyHz!==(contestLaneSnapshot(current,scope.laneID).receiveFrequencyHz??null)){
+      const changed=await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields,frequencyHz,receiveFrequencyHz});
+      admitLaneResult(changed,scope,buffer);
+    }
+    return contestLaneProjection(projectionRef.current!,scope.laneID);
+  };
+  const enqueueLane=<T,>(scope:CapturedContestLaneScope,operation:(base:Projection)=>Promise<T>,flush=true):Promise<T>=>{
+    const task=laneQueueRef.current.catch(()=>{}).then(async()=>{
+      for(let wait=0;busyRef.current&&wait<100;wait++)await new Promise(resolve=>window.setTimeout(resolve,20));
+      if(busyRef.current||retiring||configuredClient)throw Error("The contest owner is busy or this desk is a replica.");
+      const current=projectionRef.current;if(!current)throw Error("Open a contest session.");assertContestLaneScope(current,scope);
+      busyRef.current=true;
+      try{return await operation(flush?await flushLane(scope):contestLaneProjection(current,scope.laneID));}
+      finally{busyRef.current=false;}
+    });
+    laneQueueRef.current=task;return task;
+  };
+  const nativeLaneContext=(scope:CapturedContestLaneScope):ContestLaneOutputContext=>{
+    const current=projectionRef.current;if(!current)throw Error("Open a contest session.");
+    const lane=assertContestLaneScope(current,scope);
+    return {sessionID:scope.sessionID,workspaceGeneration:scope.workspaceGeneration,laneID:scope.laneID,
+      draftID:scope.draftID,bindingVersion:scope.bindingVersion,binding:lane.binding,operatingContext,
+      ...(laneCapabilities?.nativeContext?.workerGeneration!==undefined?{workerGeneration:laneCapabilities.nativeContext.workerGeneration}:{})} as ContestLaneOutputContext;
+  };
+  const acceptLaneNative=(value:any)=>{const snapshot=value?.snapshot??value?.result??value;setLaneNative(snapshot);return snapshot;};
+  const readLaneCapabilities=async()=>{
+    const base=projectionRef.current;if(!base)throw Error("Open a contest session.");
+    const context:ContestLaneOutputContext=dualContestLanes(base)?nativeLaneContext(captureContestLaneScope(base)):
+      {sessionID:base.sessionID,workspaceGeneration:base.workspaceGeneration,laneID:"laneA",draftID:base.draftID,
+        bindingVersion:base.bindingVersion??0,binding:null,operatingContext} as ContestLaneOutputContext;
+    const read:any=await requestContestLaneOutput(context,"capabilities");
+    if(projectionRef.current?.sessionID!==base.sessionID||projectionRef.current.workspaceGeneration!==base.workspaceGeneration)
+      throw Error("The contest changed before lane capabilities arrived.");
+    const value=read?.result??read;setLaneCapabilities(value);acceptLaneNative(value);
+    setLaneModeChoice(base.operatingLanes?.mode??"SO1V");return value;
+  };
+  const nativeLaneRoutes=():any[]=>{const routes=laneCapabilities?.capabilities?.routes??laneCapabilities?.routes;return Array.isArray(routes)?routes:[];};
+  const configureOperatingLanes=async()=>{
+    if(configuredClient)throw Error("Configure operating lanes at the authoritative local desk.");
+    await laneQueueRef.current.catch(()=>{});
+    const routes=nativeLaneRoutes();
+    const binding=(key:string)=>{const route=routes[Number(key)]?.binding??routes[Number(key)];
+      if(!route)throw Error("Review available native routes before configuring lanes.");
+      return {radioID:route.radioID,receiverID:route.receiverID,vfo:route.vfo,sliceID:route.sliceID??null,generation:route.generation};};
+    const bindings=laneModeChoice==="SO1V"?{laneA:null,laneB:null}:{laneA:binding(laneRouteChoices.laneA),laneB:binding(laneRouteChoices.laneB)};
+    const configured=await runMutation(base=>mutate("contest_lanes_configure",base,{workspaceGeneration:base.workspaceGeneration,
+      mode:laneModeChoice,bindings,keyboardLaneID:"laneA"}),false,true,false,true);
+    if(configured&&dualContestLanes(configured))for(const lane of configured.operatingLanes!.lanes){
+      const scope=captureContestLaneScope(configured,lane.laneID);acceptLaneNative(await requestContestLaneOutput(nativeLaneContext(scope),"bind"));}
+    setNotice("Operating lane configuration saved. Entry focus does not change listening or TX routing.");
+  };
+  const scheduleLaneFlush=(scope:CapturedContestLaneScope)=>{
+    const previous=laneFlushTimersRef.current[scope.laneID];if(previous!==undefined)window.clearTimeout(previous);
+    laneFlushTimersRef.current[scope.laneID]=window.setTimeout(()=>{
+      delete laneFlushTimersRef.current[scope.laneID];void enqueueLane(scope,async()=>{}).catch(cause=>setError(errorMessage(cause)));
+    },250);
+  };
+  useEffect(()=>()=>{for(const timer of Object.values(laneFlushTimersRef.current))window.clearTimeout(timer);},[]);
+  const bindNativeLane=async(context:ContestLaneOutputContext)=>{
+    const existing=laneNative?.lanes?.[context.laneID]?.context;
+    if(!existing||existing.draftID!==context.draftID||existing.bindingVersion!==context.bindingVersion||
+      canonicalJSON(existing.binding)!==canonicalJSON(context.binding))
+      acceptLaneNative(await requestContestLaneOutput(context,"bind"));
+  };
+  const laneMacro=async(scope:CapturedContestLaneScope,base:Projection,key:string,esm=false)=>{
+    if (fldigiReleaseBlocking || fldigiStopRef.current) throw Error("Release fldigi with Stop before sending from another operating lane.");
+    assertNoPendingStack(scope);const origin=nativeLaneContext(scope),tx=laneNative?.txContext;
+    if(!tx||tx.laneID!==scope.laneID||tx.draftID!==scope.draftID||tx.bindingVersion!==scope.bindingVersion||
+      canonicalJSON(tx.binding)!==canonicalJSON(origin.binding)||laneNative?.cw?.armed!==true)
+      throw Error("Explicitly request TX for this exact lane and draft before using ESM or a message key.");
+    const changed=await mutate(esm?"contest_esm":"contest_function_key",base,{...contestLaneParams(scope),
+      fields:{...laneBuffer(scope).fields},frequencyHz:base.frequencyHz,...(esm?{field:key}:{key})});
+    admitLaneResult(changed,scope);
+    if(changed.actions?.length){
+      if(changed.actions.some(action=>action.kind!=="function_key"))throw Error("This lane's message provider is unavailable. No fallback output was sent.");
+      const native:any=await requestContestLaneOutput(origin,"macro",{operationID:changed.operationID,revision:changed.projection.revision});
+      acceptLaneNative(native);if(native?.receipt?.confirmed!==true)throw Error("The original lane message is unconfirmed. Use Stop and review its receipt before another send.");
+    }
+    return changed;
+  };
+  const onOperatingLaneAction=(action:ContestLaneAction):void=>{
+    const current=projectionRef.current;if(!current||!dualContestLanes(current))return;
+    const scope=captureContestLaneScope(current,action.laneID);
+    if(scope.draftID!==action.draftID||scope.bindingVersion!==action.bindingVersion||scope.bindingGeneration!==action.bindingGeneration){setError("The lane action is stale; review its current draft and receiver binding.");return;}
+    if(action.kind==="field-change"||action.kind==="frequency-change"||action.kind==="receive-frequency-change"){
+      const buffer=laneBuffer(scope);buffer.version++;
+      if(action.kind==="field-change"){
+        buffer.fields={...buffer.fields,[action.fieldID]:["callsign","other_1","other_2"].includes(action.fieldID)?action.value.toUpperCase():action.value};
+        if(!buffer.heardFieldIDs.includes(action.fieldID))buffer.heardFieldIDs.push(action.fieldID);
+        buffer.conflicts=buffer.conflicts.filter(key=>key!==action.fieldID);
+      }else if(action.kind==="frequency-change"){buffer.frequencyText=action.value;buffer.conflicts=buffer.conflicts.filter(key=>key!=="frequencyHz");}
+      else {buffer.receiveFrequencyText=action.value;buffer.conflicts=buffer.conflicts.filter(key=>key!=="receiveFrequencyHz");}
+      if(current.operatingLanes!.keyboardLaneID===scope.laneID){fieldsRef.current={...buffer.fields};setFields(fieldsRef.current);editVersionRef.current++;}
+      renderLaneBuffers(value=>value+1);scheduleLaneFlush(scope);return;
+    }
+    if(action.kind==="stop"){
+      if(fldigiReleaseBlocking){void stopAutoCQ().catch(cause=>setError(errorMessage(cause)));return;}
+      void requestContestLaneOutput(nativeLaneContext(scope),"stop").then(acceptLaneNative).catch(cause=>setError(errorMessage(cause)));return;
+    }
+    if(action.kind==="key-binding"){
+      const mapped=action.action==="LOG_NOW"?{kind:"log" as const}:action.action==="CLEAR_INPUTS"?{kind:"clear" as const}:
+        action.action==="RETURN_CQ_FREQUENCY"?{kind:"return-cq" as const}:action.action==="TOGGLE_RUN"?{kind:"run-change" as const,value:!contestLaneProjection(current,scope.laneID).run}:
+        action.action==="SET_RUN"||action.action==="SET_S_AND_P"?{kind:"run-change" as const,value:action.action==="SET_RUN"}:
+        action.action.startsWith("SEND_F")?{kind:"function-key" as const,key:action.action.slice(5)}:null;
+      if(mapped){onOperatingLaneAction({...action,...mapped} as ContestLaneAction);return;}
+    }
+    const critical=["log","clear","function-key","operator-key"].includes(action.kind);
+    if(fldigiReleaseBlocking&&["request-tx","function-key","operator-key"].includes(action.kind)){
+      setError("Release fldigi with Stop before requesting another transmitter.");return;}
+    if(critical)setLaneTransitionBusy(value=>({...value,[scope.laneID]:true}));
+    void enqueueLane(scope,async base=>{
+      if(critical)setLaneTransitionBusy(value=>({...value,[scope.laneID]:true}));
+      try{
+        switch(action.kind){
+          case "focus":{
+            if(projectionRef.current!.operatingLanes!.keyboardLaneID!==scope.laneID){
+              const selected=await mutate("contest_lane_select",base,contestLaneParams(scope));admitLaneResult(selected,scope);
+              base=contestLaneProjection(projectionRef.current!,scope.laneID);}
+            if(base.focus!==action.fieldID)admitLaneResult(await mutate("contest_focus",base,{...contestLaneParams(scope),field:action.fieldID}),scope);
+            break;
+          }
+          case "mode-change":admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),mode:action.value}),scope);break;
+          case "run-change":admitLaneResult(await mutate("contest_run_state",base,{...contestLaneParams(scope),run:action.value}),scope);break;
+          case "remember-cq":admitLaneResult(await mutate("contest_lane_context",base,{...contestLaneParams(scope),
+            cqContext:{...contestLaneSnapshot(base,scope.laneID).cqContext,rememberedCQFrequencyHz:base.frequencyHz}}),scope);break;
+          case "return-cq":case "tune":case "listen":case "request-tx":{
+            const lane=contestLaneSnapshot(base,scope.laneID),target=action.kind==="return-cq"?Number(lane.cqContext?.rememberedCQFrequencyHz):base.frequencyHz;
+            if(action.kind==="return-cq"&&(!Number.isSafeInteger(target)||target<=0))throw Error("No remembered CQ frequency is available in this lane.");
+            const blocked=(action.kind==="return-cq"||action.kind==="tune")&&contestLaneTuningBlockReason(lane,target);
+            if(blocked)throw Error(blocked);
+            const context=nativeLaneContext(scope);await bindNativeLane(context);
+            if(action.kind==="return-cq"){
+              const hz=target;
+              acceptLaneNative(await requestContestLaneOutput(context,"tune",{frequencyHz:hz,mode:base.mode}));
+              const buffer=laneBuffer(scope);buffer.frequencyText=String(hz);
+              admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),frequencyHz:hz}),scope,structuredClone(buffer));
+            }else acceptLaneNative(await requestContestLaneOutput(context,action.kind==="request-tx"?"requestTX":action.kind,
+              action.kind==="tune"?{frequencyHz:base.frequencyHz,mode:base.mode}:{}));
+            break;
+          }
+          case "log":{
+            assertNoPendingStack();const qsoID=crypto.randomUUID();
+            const changed=await mutate("contest_qso_commit",base,{...contestLaneParams(scope),qsoID,fields:{...laneBuffer(scope).fields},frequencyHz:base.frequencyHz});
+            admitLaneResult(changed,scope);void refresh(changed.projection.sessionID,changed.projection);break;
+          }
+          case "clear":{
+            const buffer=laneBuffer(scope);buffer.fields=clearedContestFields(base,base.mode);buffer.heardFieldIDs=[];buffer.conflicts=[];
+            admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields}),scope,structuredClone(buffer));break;
+          }
+          case "function-key":await laneMacro(scope,base,action.key);break;
+          case "operator-key":await laneMacro(scope,base,action.fieldID??base.focus,true);break;
+          case "key-binding":{
+            const mapped=action.action==="LOG_NOW"?{kind:"log" as const}:action.action==="CLEAR_INPUTS"?{kind:"clear" as const}:
+              action.action==="RETURN_CQ_FREQUENCY"?{kind:"return-cq" as const}:action.action==="TOGGLE_RUN"?{kind:"run-change" as const,value:!base.run}:
+              action.action==="SET_RUN"||action.action==="SET_S_AND_P"?{kind:"run-change" as const,value:action.action==="SET_RUN"}:
+              action.action.startsWith("SEND_F")?{kind:"function-key" as const,key:action.action.slice(5)}:null;
+            if(mapped){queueMicrotask(()=>onOperatingLaneAction({...action,...mapped} as ContestLaneAction));break;}
+            if(["FOCUS_CALLSIGN","FOCUS_NEXT","FOCUS_PREVIOUS"].includes(action.action)){
+              const field=action.action==="FOCUS_CALLSIGN"?"callsign":(action.action==="FOCUS_PREVIOUS"?base.tabPrevious:base.tabNext)[action.fieldID??base.focus];
+              document.querySelector<HTMLInputElement>(`[data-lane-id="${scope.laneID}"] [data-contest-lane-field="${CSS.escape(field??"callsign")}"]`)?.focus();break;
+            }
+            const panels:Record<string,ContestSurfacePanelID>={WIN_BAND:"band-maps",WIN_CHECK:"callsign-intelligence",WIN_LOG:"logbook",WIN_RATE:"monitor",WIN_STATS:"propagation",WIN_VFO:"station-control"};
+            if(panels[action.action]&&surfaceContext){await openContestSurfaceWindow(surfaceContext,panels[action.action]);break;}
+            throw Error(`The saved ${action.action} shortcut is retained; this action requires a separately qualified exact lane route.`);
+          }
+        }
+      }finally{if(critical)setLaneTransitionBusy(value=>({...value,[scope.laneID]:false}));}
+    },action.kind!=="focus").catch(cause=>setError(errorMessage(cause))).finally(()=>{if(critical)setLaneTransitionBusy(value=>({...value,[scope.laneID]:false}));});
+  };
+  const authorityClientReady=groupNetwork?.authority?.role==="client"&&["leasing","connected"].includes(groupNetwork.authority.status)&&
+    typeof groupNetwork.authority.sessionID==="string"&&typeof groupNetwork.authority.workspaceGeneration==="string";
+  const readyAuthority=()=>{const authority=groupNetworkRef.current?.authority;
+    if(authority?.role!=="client"||!["leasing","connected"].includes(authority.status)||!uuidPattern.test(String(authority.sessionID))||
+        !uuidPattern.test(String(authority.workspaceGeneration)))throw new Error("The configured contest client is waiting for its master authority.");
+    return {sessionID:authority.sessionID!,workspaceGeneration:authority.workspaceGeneration!};};
+  const pendingMutation=(action:ClientAction,base:Projection,baseRevision:number,create:()=>{qsoID:string;params:Record<string,unknown>})=>{
+    const authority=readyAuthority(),scope=pendingScope(base.sessionID,base.workspaceGeneration,base.draftID,action,baseRevision);
+    const restored=storedPendingClientMutation(scope,authority.sessionID,authority.workspaceGeneration);if(restored)return restored;
+    const created=create(),item:PendingClientMutation={schemaVersion:1,localSessionID:base.sessionID,
+      localWorkspaceGeneration:base.workspaceGeneration,authoritySessionID:authority.sessionID,
+      authorityWorkspaceGeneration:authority.workspaceGeneration,draftID:base.draftID,action,baseRevision,
+      requestID:crypto.randomUUID(),qsoID:created.qsoID,params:created.params,createdAt:Date.now()};
+    if(!validPendingClientMutation(item))throw new Error("The authoritative contest operation is invalid; no network operation was sent.");
+    return persistPendingClientMutation(item);
+  };
+  const pendingForDraft=(action:ClientAction,base:Projection)=>{
+    const authority=readyAuthority(),scope=`${pendingClientPrefix}${base.sessionID}/${base.workspaceGeneration}/${base.draftID}/${action}/`;
+    let matched:PendingClientMutation|null=null;
+    for(let index=0;index<localStorage.length;index+=1){const key=localStorage.key(index);if(!key?.startsWith(scope))continue;
+      const raw=localStorage.getItem(key);let value:unknown;try{value=JSON.parse(raw??"");}catch{return quarantinePendingClientMutation(key,raw,"invalid");}
+      if(!validPendingClientMutation(value)||pendingStorageKey(value)!==key)return quarantinePendingClientMutation(key,raw,"invalid");
+      if(value.authoritySessionID!==authority.sessionID||value.authorityWorkspaceGeneration!==authority.workspaceGeneration)
+        return quarantinePendingClientMutation(key,raw,"stale");
+      if(matched)throw new Error("More than one pending authoritative operation exists for this contest draft.");matched=value;
+    }
+    return matched;
+  };
+  const syncReplica = async (authored?:{qsoID:string;draftID:string},{background=false}:{background?:boolean}={}) => {
+    let active=projectionRef.current;if(!active)throw new Error("Open a contest before synchronising it.");
+    const authority=readyAuthority();
+    if(background&&(busyRef.current||editingRef.current||
+        !sameFields(fieldsRef.current,projectionFields(active))))return active;
+    const context={operatingContext,sessionID:active.sessionID,workspaceGeneration:active.workspaceGeneration};
+    const generation=authorityGenerationRef.current,inputVersion=editVersionRef.current,serialContest=active.reservedSerial!==null&&active.reservedSerial!==undefined;
+    let sameAuthority=active.replicaAuthority===undefined||active.replicaAuthority?.sessionID===authority.sessionID&&
+      active.replicaAuthority?.workspaceGeneration===authority.workspaceGeneration;
+    let needsSerial=serialContest&&(!active.authoritySerialRequestID||!sameAuthority);
+    for(let page=0;page<200;page+=1){
+      const cursor=sameAuthority?(active.replicaCursor??{revision:0,sequence:0}):{revision:0,sequence:0};
+      const reserveThisPage=needsSerial&&!authored;
+      const syncRequest={operationID:crypto.randomUUID(),changesRequestID:crypto.randomUUID(),expectedRevision:active.revision,
+        fromCursor:cursor,limit:25,...(authored?{draftID:authored.draftID,authoredQSOID:authored.qsoID}:{}),
+        ...(reserveThisPage
+          ?{serialReservation:{requestID:crypto.randomUUID(),frequencyHz:active.frequencyHz}}:{})};
+      let synced;try{synced=await syncContestGroupReplicaPage(context,syncRequest);}catch{synced=await syncContestGroupReplicaPage(context,syncRequest);}
+      if(generation!==authorityGenerationRef.current)throw new Error("The group authority changed during synchronisation.");
+      const result=synced.apply.result as Data,next=result.projection as Projection,cursorResult=result.replicaCursor as Data;
+      if(!next||next.sessionID!==active.sessionID||next.workspaceGeneration!==active.workspaceGeneration||
+          !cursorResult||cursorResult.revision!==next.replicaCursor?.revision||cursorResult.sequence!==next.replicaCursor?.sequence)
+        throw new Error("The native replica returned a mismatched local projection.");
+      acceptProjection(next,inputVersion);active=next;
+      sameAuthority=active.replicaAuthority===undefined||active.replicaAuthority?.sessionID===authority.sessionID&&
+        active.replicaAuthority?.workspaceGeneration===authority.workspaceGeneration;
+      if(reserveThisPage){if(!next.authoritySerialRequestID)throw new Error("The local replica did not bind its authoritative serial reservation.");needsSerial=false;}
+      if(synced.authoredApplied){authored=undefined;needsSerial=serialContest;}
+      if(!synced.hasMore&&!needsSerial){await refresh(next.sessionID,next,logOffset);return next;}
+    }
+    throw new Error("The authoritative contest log changed too quickly to finish synchronising.");
+  };
+  const sendPendingMutation=async(item:PendingClientMutation)=>{
+    const active=projectionRef.current,authority=readyAuthority();
+    if(!active||active.sessionID!==item.localSessionID||active.workspaceGeneration!==item.localWorkspaceGeneration||
+        authority.sessionID!==item.authoritySessionID||authority.workspaceGeneration!==item.authorityWorkspaceGeneration)
+      throw new Error("The pending contest operation belongs to a stale local or group authority context.");
+    const context={operatingContext,sessionID:active.sessionID,workspaceGeneration:active.workspaceGeneration};
+    let applied;try{applied=await requestContestGroupAuthority(context,"contactApply",item.params,item.requestID);}
+    catch{applied=await requestContestGroupAuthority(context,"contactApply",item.params,item.requestID);}
+    const next=item.action==="commit"?await syncReplica({qsoID:item.qsoID,draftID:item.draftID}):await syncReplica();
+    if(item.action!=="commit"&&Number(next.replicaCursor?.revision??-1)<Number(applied.changeRevision))
+      throw new Error("The authoritative contact change has not reached the local replica.");
+    localStorage.removeItem(pendingStorageKey(item));return next;
+  };
+  const resumePendingMutations=async()=>{
+    const active=projectionRef.current,authority=readyAuthority();if(!active)return;
+    const pending:PendingClientMutation[]=[];
+    const localScope=`${pendingClientPrefix}${active.sessionID}/${active.workspaceGeneration}/`;
+    for(let index=0;index<localStorage.length;index+=1){const key=localStorage.key(index);if(!key?.startsWith(localScope))continue;
+      let value:unknown;try{value=JSON.parse(localStorage.getItem(key)??"");}catch{continue;}
+      if(validPendingClientMutation(value)&&value.localSessionID===active.sessionID&&value.localWorkspaceGeneration===active.workspaceGeneration&&
+          value.authoritySessionID===authority.sessionID&&value.authorityWorkspaceGeneration===authority.workspaceGeneration)pending.push(value);
+    }
+    pending.sort((left,right)=>left.createdAt-right.createdAt);
+    for(const item of pending)await sendPendingMutation(item);
+  };
+  const queueEarlyCW = (values:Record<string,string>, manualStart=false, finish=false) => {
+    const captured=projectionRef.current,inputVersion=editVersionRef.current;
+    if(!captured||!earlyCWEnabled||dualContestLanes(captured)||captured.practice||configuredClient||!captured.run||captured.mode!=="CW")return earlyCWQueueRef.current;
+    const call=(values.callsign??"").trim().toUpperCase();
+    if(!earlyCWRef.current){
+      if(!manualStart&&call.length<earlyCWThreshold)return earlyCWQueueRef.current;
+      if(!cw.state.armed||!cw.state.capabilities?.streaming)return earlyCWQueueRef.current;
+      earlyCWRef.current={sessionID:captured.sessionID,workspaceGeneration:captured.workspaceGeneration,draftID:captured.draftID,streamID:crypto.randomUUID(),call:"",finished:false};
+    }
+    const stream=earlyCWRef.current;
+    earlyCWQueueRef.current=earlyCWQueueRef.current.then(async()=>{
+      if(earlyCWFaultRef.current)throw Error(earlyCWFaultRef.current);
+      const base=projectionRef.current;
+      if(!base||base.sessionID!==stream.sessionID||base.workspaceGeneration!==stream.workspaceGeneration||base.draftID!==stream.draftID||earlyCWRef.current!==stream)
+        throw Error("Early CW draft changed. Stop and explicitly start again.");
+      if(!/^[A-Z0-9]{1,32}$/.test(call)||!call.startsWith(stream.call))throw Error("Submitted CW cannot be unsent. Stop and use full-call correction.");
+      if(stream.finished)return;
+      const operationID=crypto.randomUUID(),operation=finish?"early_finish":stream.call?"early_append":"early_start";
+      const native=await cw.controller.executeContest({operation,operationID,sessionID:base.sessionID,workspaceGeneration:base.workspaceGeneration,
+        expectedContestRevision:base.revision,draftID:base.draftID,streamID:stream.streamID,earlyStartEnabled:true,
+        inputOrigin:"typing",manualStart,threshold:earlyCWThreshold,fields:values,frequencyHz:operationFrequencyHz??base.frequencyHz});
+      const changed=native?.contestResult as (MutationResult&{operationID?:string})|undefined;
+      if(!changed?.projection||changed.operationID!==operationID)throw Error(native?.error||"Early CW outcome is unknown. Stop before another action.");
+      acceptProjection(changed.projection,inputVersion);
+      if(native?.error)throw Error(native.error);
+      stream.call=call;stream.finished=finish;
+    }).catch(async cause=>{
+      earlyCWFaultRef.current=errorMessage(cause);setError(earlyCWFaultRef.current);setEarlyCWEnabled(false);
+      // Stop always reaches the native owner before any optional UI persistence.
+      await cw.controller.stop();
+    });
+    return earlyCWQueueRef.current;
+  };
+  const flushDraft = async (supplied = projectionRef.current,
+      frequencyHz = operationFrequencyHz): Promise<Projection | null> => {
+    await earlyCWQueueRef.current;
+    if(supplied&&projectionRef.current?.sessionID===supplied.sessionID&&projectionRef.current.draftID===supplied.draftID)supplied=projectionRef.current;
+    if (!supplied) return null;
+    if(dualContestLanes(supplied))return flushLane(captureContestLaneScope(supplied));
+    if (frequencyHz === null) throw new Error("Connect the selected radio or enter a frequency on a band supported by this contest before continuing.");
+    const values = { ...fieldsRef.current }, inputVersion = editVersionRef.current;
+    if (sameFields(values, projectionFields(supplied)) && frequencyHz === supplied.frequencyHz) return supplied;
+    const changed = await mutate("contest_draft_apply", supplied, { fields: values, frequencyHz });
+    acceptProjection(changed.projection, inputVersion);
+    return changed.projection;
+  };
+  flushDraftRef.current = () => flushDraft();
+  flushAllDraftsRef.current = async () => {
+    const current=projectionRef.current;
+    if(current&&dualContestLanes(current)){
+      for(const lane of current.operatingLanes!.lanes)await flushLane(captureContestLaneScope(projectionRef.current!,lane.laneID));
+    }else await flushDraft();
+  };
+  const runMutation = async (operation: (base: Projection) => Promise<MutationResult>, refreshViews = true,
+    flushBuffered = true, preserveConcurrentEdits = false, throwFailures = false,
+    consumeOutput?: (changed: MutationResult, origin: Projection) => Promise<MutationResult>, signal?: AbortSignal,
+    recoverStopped?: (recovery: Promise<boolean>) => void) => {
+    let base = projectionRef.current;
+    if (!base || busyRef.current || retiring) {
+      if (throwFailures) throw new Error(!base ? "Open a contest session before editing it." : "The contest owner is busy.");
+      return null;
+    }
+    const inputVersion = editVersionRef.current;
+    let operationPromise: Promise<MutationResult> | null = null, committed: MutationResult | null = null, changed: MutationResult | null = null;
+    busyRef.current = true; setBusy(true); setError(""); setNotice("");
+    try {
+      if (flushBuffered) base = await flushDraft(base);
+      if (!base) throw new Error("Open a contest session before editing it.");
+      operationPromise = operation(base);
+      changed = await (signal ? abortPhoneWait(operationPromise, signal) : operationPromise);
+      committed = changed;
+      if (changed.actions?.length && consumeOutput)
+        changed = await (signal ? abortPhoneWait(consumeOutput(changed, base), signal) : consumeOutput(changed, base));
+      acceptProjection(changed.projection, preserveConcurrentEdits ? inputVersion : undefined);
+      if (refreshViews) await refresh(changed.projection.sessionID, changed.projection);
+      for (const item of changed.messages ?? []) setNotice(item);
+      if (changed.actions?.length) throw new Error("Contest output requires native operation admission; no renderer output was sent.");
+      if (changed.outputError) setError(changed.outputError);
+      return changed.projection;
+    } catch (cause) {
+      if ((cause instanceof PhoneSimulationStopped || cause instanceof PhoneSimulationClaimUncertain) && base) {
+        const admitCommittedProjection = (settled: MutationResult) => {
+          const current = projectionRef.current, next = settled.projection;
+          const admitted = current?.sessionID === base!.sessionID && current.workspaceGeneration === base!.workspaceGeneration &&
+            current.revision === base!.revision && next?.sessionID === base!.sessionID &&
+            next.workspaceGeneration === base!.workspaceGeneration && settled.revision === next.revision;
+          if (admitted)
+            acceptProjection(next, preserveConcurrentEdits ? inputVersion : undefined);
+          return admitted;
+        };
+        if (cause instanceof PhoneSimulationClaimUncertain && committed) admitCommittedProjection(committed);
+        else if (changed) admitCommittedProjection(changed);
+        else if (cause instanceof PhoneSimulationStopped && operationPromise)
+          recoverStopped?.(operationPromise.then(admitCommittedProjection, () => false));
+        if (cause instanceof PhoneSimulationClaimUncertain)
+          recoverStopped?.(Promise.resolve(false));
+      }
+      if (!(cause instanceof PhoneSimulationStopped)) setError(errorMessage(cause));
+      if (throwFailures && !(cause instanceof PhoneSimulationStopped)) throw cause;
+      return null;
+    }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+  const consumeContestPhoneSimulation = async (changed: MutationResult, origin: PhoneIntentOrigin): Promise<MutationResult> => {
+    const controller = phoneSimulationControllerRef.current;
+    if (!controller || controller.signal.aborted) throw new PhoneSimulationStopped();
+    const operationID = changed.operationID;
+    const actions = changed.actions ?? [];
+    if (!operationID || changed.replayed !== false || changed.revision !== changed.projection.revision || !actions.length || actions.length > 12)
+      throw new Error("The contest phone simulation result could not be verified; no output was replayed.");
+    const traces: PhoneSimulationTrace[] = actions.map((action, index) => {
+      const payload = typeof action.payload === "string" ? action.payload : "";
+      const bytes = new TextEncoder().encode(payload).byteLength;
+      const source = action.sourceMacro;
+      if (action.actionID !== `${operationID}:${index}` || action.sessionID !== origin.sessionID ||
+          action.workspaceGeneration !== origin.workspaceGeneration || action.sourceRevision !== origin.sourceRevision ||
+          action.draftID !== origin.draftID || action.kind !== "voice_keyer" || action.signal !== "phone" ||
+          action.mode !== "SSB" || !/^F(?:[1-9]|1[0-2])$/.test(action.key) || typeof action.label !== "string" ||
+          new TextEncoder().encode(action.label).byteLength > 160 || bytes > 4_096 || action.payloadUTF8Bytes !== bytes ||
+          !/^[0-9a-f]{64}$/.test(action.payloadSHA256) || !/^[0-9a-f]{64}$/.test(action.sourceMacroSHA256) ||
+          !source || typeof source !== "object" || source.key !== action.key || source.label !== action.label ||
+          source.revision !== origin.sourceRevision)
+        throw new Error("The contest phone voice-keyer intent could not be verified; no audio or PTT action was taken.");
+      return { operationID: action.actionID, mode: "SSB", macro: action.label, text: payload, status: "confirmed" };
+    });
+    if (!phoneProductionAvailable || !voiceOutput.ownsNativeClaim) {
+    const claimParams = { sessionID: changed.projection.sessionID, operationID, revision: changed.projection.revision };
+    const firstClaim = result<Data>("contest_output_claim", claimParams);
+    let timer = 0;
+    let claimed: Data | null = null;
+    try {
+      claimed = await Promise.race([firstClaim, new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error("contest_phone_claim_reply_timeout")), phoneClaimReplyTimeoutMs);
+      })]);
+    } catch (cause) {
+      const retryable = cause instanceof Error && cause.message === "contest_phone_claim_reply_timeout" ||
+        cause instanceof ContestServerError && cause.outcome === "uncertain";
+      if (!retryable) throw cause;
+      try { claimed = await result<Data>("contest_output_claim", claimParams); }
+      catch (retryCause) {
+        if (retryCause instanceof ContestServerError && retryCause.outcome === "uncertain")
+          throw new PhoneSimulationClaimUncertain();
+        if (!(retryCause instanceof ContestServerError) || retryCause.code !== "output_consumed" || retryCause.outcome !== "confirmed")
+          throw retryCause;
+      }
+    } finally { if (timer) window.clearTimeout(timer); }
+    if (claimed && (claimed.claimed !== true || claimed.operationID !== operationID || canonicalJSON(claimed.actions) !== canonicalJSON(actions)))
+      throw new Error("The contest phone output claim could not be verified; do not retry the key.");
+    }
+    if (controller.signal.aborted || phoneSimulationControllerRef.current !== controller) throw new PhoneSimulationStopped();
+    if (phoneProductionAvailable) await voiceOutput.play(actions as ContestVoiceAction[], origin,
+      String(setup.preferences.voiceProfilePath ?? ""), String(setup.preferences.soundDevice ?? ""), controller.signal);
+    setPhoneSimulationTrace(items => [...items, ...traces].slice(-24));
+    return { ...changed, actions: [] };
+  };
+  const suppressUnavailablePhoneOutput = async (changed: MutationResult, origin: PhoneIntentOrigin): Promise<MutationResult> => {
+    const operationID = changed.operationID, actions = changed.actions ?? [];
+    if (actions.length > 12 || actions.length > 0 && (!operationID || changed.replayed !== false ||
+        changed.revision !== changed.projection.revision) || actions.some((action, index) => action.actionID !== `${operationID}:${index}` ||
+        action.sessionID !== origin.sessionID || action.workspaceGeneration !== origin.workspaceGeneration ||
+        action.sourceRevision !== origin.sourceRevision || action.draftID !== origin.draftID ||
+        action.kind !== "voice_keyer" || action.signal !== "phone" || action.mode !== "SSB"))
+      throw new Error("The optional phone output intent could not be verified; no audio or PTT action was taken.");
+    // Voice output is optional. Keep the worker-owned ESM transition, but leave
+    // every output intent unclaimed and undispatched when no voice path exists.
+    return { ...changed, actions: [] };
+  };
+  const consumeFldigiOutput = async (changed: MutationResult, origin: PhoneIntentOrigin, expectedGeneration?:string): Promise<MutationResult> => {
+    const operationID = changed.operationID, actions = changed.actions ?? [];
+    if (!operationID || changed.replayed !== false || changed.revision !== changed.projection.revision ||
+        !actions.length || actions.length > 12 || actions.some((action, index) => {
+          const payload = typeof action.payload === "string" ? action.payload : "";
+          return action.actionID !== `${operationID}:${index}` || action.kind !== "fldigi" || action.signal !== "digital" ||
+            action.sessionID !== origin.sessionID || action.workspaceGeneration !== origin.workspaceGeneration ||
+            action.sourceRevision !== origin.sourceRevision || action.draftID !== origin.draftID ||
+            new TextEncoder().encode(payload).byteLength > 4_096 || !/^[0-9a-f]{64}$/.test(action.payloadSHA256);
+        })) throw new Error("The contest fldigi intent could not be verified; no XML-RPC command was sent.");
+    const claimed = await result<Data>("contest_output_claim", {
+      sessionID: changed.projection.sessionID, operationID, revision: changed.projection.revision });
+    if (claimed.claimed !== true || claimed.operationID !== operationID || canonicalJSON(claimed.actions) !== canonicalJSON(actions))
+      throw new Error("The contest fldigi output claim could not be verified; do not retry the key.");
+    await serviceRequest("fldigi_send", { actions,...(expectedGeneration?{expectedGeneration}:{}) });
+    return { ...changed, actions: [] };
+  };
+  const hostAction = async (method: string, extra: Record<string, unknown> = {}, throwFailures = false,
+      contestSurfaceRequestID?: string) => {
+    const invoked=projectionRef.current,invocation=invoked?{sessionID:invoked.sessionID,workspaceGeneration:invoked.workspaceGeneration,draftID:invoked.draftID}:null;
+    await earlyCWQueueRef.current;
+    const invocationCurrent=()=>{const latest=projectionRef.current;return !!invocation&&latest?.sessionID===invocation.sessionID&&
+      latest.workspaceGeneration===invocation.workspaceGeneration&&latest.draftID===invocation.draftID;};
+    if(!invocationCurrent()){const failure=Error("The original contest key action belongs to a retired draft or workspace.");setError(failure.message);if(throwFailures)throw failure;return null;}
+    if(method==="contest_esm"&&earlyCWRef.current&&!earlyCWRef.current.finished){
+      await queueEarlyCW({...fieldsRef.current},true,true);
+    }
+    if(!invocationCurrent()){const failure=Error("The original contest key action changed during early CW completion.");setError(failure.message);if(throwFailures)throw failure;return null;}
+    if(earlyCWFaultRef.current){setError(earlyCWFaultRef.current);if(throwFailures)throw Error(earlyCWFaultRef.current);return null;}
+    if (fldigiReleaseBlocking || fldigiStopRef.current) {
+      const failure = new Error("fldigi receive release is unconfirmed; use Stop to retry before transmitting.");
+      setError(failure.message); if (throwFailures) throw failure; return null;
+    }
+    const laneSource=projectionRef.current;
+    if(laneSource&&dualContestLanes(laneSource)&&["contest_esm","contest_function_key"].includes(method)){
+      const scope=captureContestLaneScope(laneSource,(extra.laneID as ContestLaneID|undefined));
+      try{return await enqueueLane(scope,async base=>{await laneMacro(scope,base,String(extra.key??extra.field??base.focus),method==="contest_esm");return projectionRef.current;});}
+      catch(cause){setError(errorMessage(cause));if(throwFailures)throw cause;return null;}
+    }
+    try{assertNoPendingStack();}catch(cause){setError(errorMessage(cause));if(throwFailures)throw cause;return null;}
+    if(projectionRef.current?.practice||practiceTransitionRef.current){
+      const failure=new Error("Practice has native output disabled. Use Log Now to save without output.");
+      setError(failure.message);if(throwFailures)throw failure;return null;
+    }
+    const source=projectionRef.current,cqObservation=method==="contest_function_key"&&extra.key==="F1"&&source&&observedFrequencyHzRef.current!==null
+      ? {sessionID:source.sessionID,workspaceGeneration:source.workspaceGeneration,frequencyHz:observedFrequencyHzRef.current,mode:source.mode}:null;
+    if (configuredClient && (method === "contest_esm" || method === "contest_function_key")) {
+      const failure=new Error("Client ESM and function keys are disabled until the master can authorize their logging action.");
+      setError(failure.message); if(throwFailures)throw failure; return null;
+    }
+    const phoneAction = Boolean(projectionRef.current?.pluginID && contestPhoneIntentPlugins.has(projectionRef.current.pluginID) && projectionRef.current.mode === "SSB");
+    const fldigiMode = projectionRef.current?.fldigiTransmitAvailable === true;
+    const fldigiAction = Boolean(fldigiMode &&
+      fldigiSnapshot?.configuration.transmit_enabled && projectionRef.current?.mode !== "CW" && projectionRef.current?.mode !== "SSB");
+    if (phoneReleaseBlocking) {
+      const failure = new Error(phoneReleaseUncertain || "Contest phone PTT release is still pending.");
+      setError(failure.message); if (throwFailures) throw failure; return null;
+    }
+    if (fldigiMode && !fldigiAction) {
+      const failure = new Error("Enable fldigi macro transmit in Digital Logging Setup before using RTTY function keys.");
+      setError(failure.message); if (throwFailures) throw failure; return null;
+    }
+    if (phoneAction && phoneReleaseUncertain) {
+      const failure = new Error(phoneReleaseUncertain);
+      setError(failure.message); if (throwFailures) throw failure; return null;
+    }
+    if (phoneAction && (method !== "contest_esm" || phoneOutputAvailable) && (!phoneOutputAvailable || !phoneCanSend)) {
+      const failure = new Error(phoneOutputAvailable
+        ? `Arm the ${phoneSimulationAvailable ? "nontransmitting phone simulation" : "recorded phone output"} before using phone contest messages.`
+        : phoneProductionAvailable ? "Phone contest voice output is unavailable in production until a Voice WAV profile folder is saved; no audio or PTT action was taken."
+          : "Phone contest voice output is unavailable; no audio or PTT action was taken.");
+      setError(failure.message); if (throwFailures) throw failure; return null;
+    }
+    if (phoneAction && phoneSimulationRecoveryRef.current) {
+      const timeout = new Promise<false>(resolve => window.setTimeout(() => resolve(false), phoneClaimReplyTimeoutMs));
+      const recovered = await Promise.race([phoneSimulationRecoveryRef.current, timeout]);
+      if (!recovered) {
+        const failure = new Error("The stopped phone operation is still unresolved. Reopen the contest session to reconcile its revision before sending another key.");
+        setError(failure.message); if (throwFailures) throw failure; return null;
+      }
+      phoneSimulationRecoveryRef.current = null;
+    }
+    const phoneController = phoneAction && phoneOutputAvailable ? new AbortController() : null;
+    if (phoneController) { phoneSimulationControllerRef.current = phoneController; setPhoneSimulationPending(true); }
+    try {
+      const confirmed = await runMutation(async base => {
+    if (operationFrequencyHz === null) throw new Error("Connect the selected radio or enter a frequency on a band supported by this contest before using ESM.");
+    if (base.mode !== "CW")
+      return mutate(method, base, { fields: fieldsRef.current, frequencyHz: operationFrequencyHz, ...extra });
+    const operationID = crypto.randomUUID();
+    const native = await cw.controller.executeContest({ operation: method === "contest_esm" ? "esm" : "function_key",
+      operationID, sessionID: base.sessionID, expectedContestRevision: base.revision, draftID: base.draftID,
+      fields: fieldsRef.current, frequencyHz: operationFrequencyHz, correctionPolicy:cwCorrectionPolicy, ...extra,
+      ...(contestSurfaceRequestID ? { contestSurfaceRequestID } : {}) });
+    const changed = native?.contestResult as (MutationResult & { operationID?: string }) | undefined;
+    if (!changed?.projection || changed.operationID !== operationID) throw new Error(native?.error || "Contest CW operation was not confirmed. Use Stop and reopen the session before deciding what to do next.");
+    return { ...changed, actions: [], outputError: native?.error || undefined };
+      }, !phoneAction, false, false, throwFailures,
+        phoneAction ? phoneOutputAvailable ? consumeContestPhoneSimulation : suppressUnavailablePhoneOutput
+          : fldigiAction ? consumeFldigiOutput : undefined, phoneController?.signal,
+        recovery => { phoneSimulationRecoveryRef.current = recovery; });
+      if (phoneAction && confirmed && !phoneController?.signal.aborted) void refresh(confirmed.sessionID, confirmed).catch(cause => {
+        const current = projectionRef.current;
+        if (current?.sessionID === confirmed.sessionID && current.revision === confirmed.revision) setError(errorMessage(cause));
+      });
+      if(confirmed&&cqObservation&&confirmed.sessionID===cqObservation.sessionID)lastCQFrequencyRef.current=cqObservation;
+      return confirmed;
+    }
+    finally { if (phoneController && phoneSimulationControllerRef.current === phoneController) {
+      phoneSimulationControllerRef.current = null; setPhoneSimulationPending(false);
+    } }
+  };
+  autoCQHostActionRef.current = hostAction;
+
+  const stopPhoneOutput = async () => {
+    phoneSimulationControllerRef.current?.abort(); phoneSimulationControllerRef.current = null;
+    const generation = ++phoneReleaseGenerationRef.current;
+    setPhoneSimulationPending(true);
+    try {
+      await voiceOutput.stop();
+      if (phoneReleaseGenerationRef.current === generation) {
+        setPhoneReleaseUncertain(""); setPhoneSimulationArmed(false);
+      }
+    } catch (cause) {
+      const message = `Contest phone PTT release remains uncertain: ${errorMessage(cause)}`;
+      if (phoneReleaseGenerationRef.current === generation) {
+        setPhoneReleaseUncertain(message); setPhoneSimulationArmed(true); setError(message);
+      }
+      throw cause;
+    } finally {
+      if (phoneReleaseGenerationRef.current === generation) setPhoneSimulationPending(false);
+    }
+  };
+
+  const clearAutoCQ = () => {
+    autoCQActiveRef.current = false;
+    if (autoCQTimerRef.current !== null) window.clearTimeout(autoCQTimerRef.current);
+    autoCQTimerRef.current = null; setAutoCQDeadlineMs(null);
+  };
+  const stopFldigiOutput = (expectedGeneration?:string) => {
+    if (fldigiStopRef.current) return fldigiStopRef.current;
+    ++digitalGenerationRef.current; setFldigiStopPending(true);
+    let observed = false;
+    const pending = (async () => {
+      const fldigi = boundedFldigiSnapshot(await (expectedGeneration?serviceRequest("fldigi_stop",{expectedGeneration}):serviceRequest("fldigi_stop")));
+      if (!fldigi) throw new Error("fldigi Stop confirmation is unavailable; use Stop to retry.");
+      observed = true;
+      setDigitalSnapshot(current => current,fldigi);
+      if (fldigi.configuration_error) throw new Error(fldigi.configuration_error, {cause:"fldigi_configuration"});
+    })().catch(cause => {
+      const previous = fldigiSnapshotRef.current;
+      if (!observed && previous && !expectedGeneration) setDigitalSnapshot(current => current,{...previous,
+        transmit_release_required:true,transmit_release_uncertain:true,status:"fldigi Stop confirmation is unavailable; use Stop to retry."});
+      setError(errorMessage(cause)); throw cause;
+    }).finally(() => { fldigiStopRef.current = null; setFldigiStopPending(false); });
+    fldigiStopRef.current = pending; return pending;
+  };
+  const stopAutoCQ = async (stopOutput = true, stopRotor = false, scopedQTC = false) => {
+    earlyCWRef.current=null;earlyCWFaultRef.current="";setEarlyCWEnabled(false);
+    clearAutoCQ();
+    if (!stopOutput) return;
+    const qtcOwner=qtcOutputOwnerRef.current;qtcOwner?.controller.abort();
+    const fldigi = fldigiSnapshotRef.current;
+    const stopped=await Promise.allSettled([qtcOwner?.mode==="SSB"?stopPhoneOutput():qtcOwner?stopFldigiOutput(scopedQTC?qtcOwner.bridgeGeneration:undefined):fldigiStopRef.current || fldigi?.transmit_release_required || fldigi?.transmit_release_uncertain ||
+      projectionRef.current?.fldigiTransmitAvailable && fldigi?.configuration.transmit_enabled ? stopFldigiOutput() : phoneOutputAvailable?stopPhoneOutput():cw.controller.stop(),
+      ...(!contestingTest&&stopRotor&&rotorStop?[rotorStop()]:[])]);
+    const failures=stopped.flatMap((result,index)=>result.status==="rejected"?
+      [`${index===0?"contest output":"rotor"}: ${errorMessage(result.reason)}`]:[]);
+    if(failures.length){const configurationOnly=stopped.every(result=>result.status==="fulfilled"||result.reason instanceof Error&&result.reason.cause==="fldigi_configuration");
+      const failure=new Error(`${configurationOnly?"Stop settings could not be saved":"Escape stop remains uncertain"} — ${failures.join(" · ")}`);setError(failure.message);throw failure;}
+    if(qtcOwner&&qtcOutputOwnerRef.current===qtcOwner)qtcOutputOwnerRef.current=null;
+  };
+  const scheduleAutoCQ = () => {
+    if (!autoCQActiveRef.current) return;
+    const delayMs = autoCQDelaySeconds * 1000;
+    setAutoCQNowMs(Date.now()); setAutoCQDeadlineMs(Date.now() + delayMs);
+    autoCQTimerRef.current = window.setTimeout(() => { void (async () => {
+      if (!autoCQActiveRef.current) return;
+      try { await autoCQHostActionRef.current("contest_function_key", { key: "F1" }, true); }
+      catch { clearAutoCQ(); return; }
+      if (autoCQActiveRef.current) scheduleAutoCQ();
+    })(); }, delayMs);
+  };
+  const startAutoCQ = async (contestSurfaceRequestID?: string) => {
+    if(dualContestLanes(projectionRef.current))throw Error("Automatic CQ is not enabled for operating lanes. Send an explicit lane message.");
+    const active = projectionRef.current;
+    if (!active) throw new Error("Open a contest before starting Auto CQ.");
+    if (phoneReleaseBlocking) throw new Error(phoneReleaseUncertain || "Contest phone PTT release is still pending.");
+    if (active.mode !== "CW" && !phoneOutputAvailable) throw new Error("Auto CQ requires admitted CW or recorded phone output.");
+    if (phoneOutputAvailable ? !phoneCanSend : !cw.state.armed) throw new Error("Arm the contest output before starting Auto CQ.");
+    if (!active.run) await runMutation(base => mutate("contest_run_state", base, { run: true }), false, true, false, true);
+    clearAutoCQ(); autoCQActiveRef.current = true; scheduleAutoCQ();
+    try { await hostAction("contest_function_key", { key: "F1" }, true, contestSurfaceRequestID); }
+    catch (cause) { clearAutoCQ(); throw cause; }
+  };
+
+  useEffect(() => {
+    if (autoCQDeadlineMs === null) return;
+    const ticker = window.setInterval(() => setAutoCQNowMs(Date.now()), 100);
+    return () => window.clearInterval(ticker);
+  }, [autoCQDeadlineMs]);
+  useEffect(() => () => {
+    autoCQActiveRef.current = false;
+    if (autoCQTimerRef.current !== null) window.clearTimeout(autoCQTimerRef.current);
+    phoneSimulationControllerRef.current?.abort(); ++phoneReleaseGenerationRef.current;
+    void voiceOutput.stop().catch(cause => console.error("Contest phone unmount release remains uncertain", cause));
+  }, [voiceOutput]);
+  useEffect(() => { clearAutoCQ(); }, [projection?.sessionID, projection?.mode, contestingTest, autoCQDelaySeconds]);
+
+  useEffect(() => {
+    if (!projection || editing) return;
+    fieldRefs.current[projection.focus]?.focus();
+  }, [projection?.focus, projection?.draftID, editing]);
+
+  useEffect(()=>{
+    const pending=pendingRadioTuneRef.current;
+    if(pending?.confirmedAt===undefined)return;
+    // A confirmed tune may precede the renderer's next telemetry snapshot.
+    // Only the old source sample gets a short grace period; never fence later
+    // manual tuning indefinitely when the target snapshot was coalesced away.
+    const remaining=2000-(Date.now()-pending.confirmedAt);
+    if(remaining<=0)return;
+    const timer=window.setTimeout(()=>setRadioTuneCompletionTick(value=>value+1),remaining);
+    return()=>window.clearTimeout(timer);
+  },[radioTuneCompletionTick]);
+
+  useEffect(() => {
+    if (!projection) return;
+    const previous = observedFrequencyRef.current;
+    if (observedFrequencyHz === null) {
+      observedFrequencyRef.current = { sessionID: projection.sessionID, frequencyHz: null };
+      return;
+    }
+    if (busyRef.current || retiring) return;
+    const pendingTune = pendingRadioTuneRef.current;
+    let commandedArrival=false;
+    if (pendingTune?.sessionID === projection.sessionID) {
+      if (observedFrequencyHz !== pendingTune.targetHz &&
+          (pendingTune.confirmedAt===undefined||observedFrequencyHz===pendingTune.sourceHz&&Date.now()-pendingTune.confirmedAt<2000)) return;
+      pendingRadioTuneRef.current = null;
+      commandedArrival=observedFrequencyHz===pendingTune.targetHz;
+      // This is the readback of our spot click, not an operator leaving the
+      // newly loaded callsign behind at the previous VFO frequency.
+      if(commandedArrival){
+        observedFrequencyRef.current={sessionID:projection.sessionID,frequencyHz:observedFrequencyHz};
+        tuningAnchorRef.current={identity:`${projection.sessionID}/${projection.draftID}/${fieldsRef.current.callsign??""}/${projection.run}`,frequencyHz:observedFrequencyHz};
+        if(projection.frequencyHz===observedFrequencyHz)return;
+      }
+    }
+    const freshObservedChange = previous.sessionID === projection.sessionID && previous.frequencyHz !== null
+      ? previous.frequencyHz !== observedFrequencyHz : projection.frequencyHz !== observedFrequencyHz;
+    const tuningIdentity=`${projection.sessionID}/${projection.draftID}/${fieldsRef.current.callsign??""}/${projection.run}`;
+    if(tuningAnchorRef.current.identity!==tuningIdentity)tuningAnchorRef.current={identity:tuningIdentity,frequencyHz:projection.frequencyHz};
+    const tolerance=["SSB","USB","LSB"].includes(projection.mode.toUpperCase())?ssbTuningToleranceHz:0;
+    const operatorRetune=!commandedArrival&&previous.sessionID===projection.sessionID&&previous.frequencyHz!==null&&previous.frequencyHz!==observedFrequencyHz&&
+      (!(fieldsRef.current.callsign??"").trim()&&!projection.run||Math.abs(observedFrequencyHz-tuningAnchorRef.current.frequencyHz)>tolerance);
+    if(operatorRetune)tuningAnchorRef.current={identity:tuningIdentity,frequencyHz:observedFrequencyHz};
+    observedFrequencyRef.current = { sessionID: projection.sessionID, frequencyHz: observedFrequencyHz };
+    if (!freshObservedChange && projection.frequencyHz === observedFrequencyHz) return;
+    const syncKey=`${projection.sessionID}:${observedFrequencyHz}`;
+    if(observedFrequencySyncRef.current===syncKey)return;
+    if (operatorRetune && !projection.run && previous.sessionID === projection.sessionID && previous.frequencyHz !== null) {
+      const heardCall = (fieldsRef.current.callsign ?? "").trim().toUpperCase();
+      const manual=manualHeardCallRef.current;
+      if(manual?.sessionID===projection.sessionID&&manual.draftID===projection.draftID&&manual.callsign===heardCall){
+      const existing = allWorkflowSpots.find(spot => spot.callsign.trim().toUpperCase() === heardCall &&
+        Math.round(spot.frequencyKHz * 10) === Math.round(manual.frequencyHz / 100));
+      const heardBase = existing ?? localContestHeardSpot({ callsign:heardCall, frequencyHz:manual.frequencyHz,
+        mode:projection.mode, stationCall:effectiveStationCall, bandDefinitions, callContext:projection.callContext });
+      const heardPath=lookupPathContext?.callsign===heardCall?lookupPathContext:null;
+      const heard=heardBase&&heardPath?{...heardBase,latitude:heardBase.latitude??heardPath.latitude,
+        longitude:heardBase.longitude??heardPath.longitude,country:heardBase.country||heardPath.country||"",
+        cqZone:heardBase.cqZone??heardPath.cqZone,ituZone:heardBase.ituZone??heardPath.ituZone}:heardBase;
+      if (heard) setSpotWorkflow(current => updateContestSpotWorkflow(
+        sameSpotWorkflowScope(current,spotWorkflowScope)?current:effectiveSpotWorkflow,
+        [...allWorkflowSpots.filter(item=>item.id!==heard.id),heard], heard.id, "mark", true));
+      }
+    }
+    const leaveRunOnRetune = projection.entryPolicy?.leaveRunOnRetune === true;
+    const clearOnRetune = (!projection.run || leaveRunOnRetune) && (projection.entryPolicy?.clearOnVFOChange ?? setup.preferences.clearOnVFOChange === true);
+    const tunedSpot = operatorRetune && clearOnRetune
+      ? observedContestSpot(visibleWorkflowSpots, observedFrequencyHz,ssbTuningToleranceHz) : null;
+    const observedFields=operatorRetune&&clearOnRetune?{...fieldsRef.current,callsign:""}:fieldsRef.current;
+    if(operatorRetune&&clearOnRetune){manualHeardCallRef.current=null;fieldsRef.current=observedFields;setFields(observedFields);}
+    observedFrequencySyncRef.current=syncKey;
+    void (async()=>{
+      if(operatorRetune&&projection.run&&leaveRunOnRetune){
+        const switched=await runMutation(base=>mutate("contest_run_state",base,{run:false}),false,true,false,true);
+        if(!switched)return;
+      }
+      const next=await runMutation(base => mutate("contest_draft_apply", base, {
+        fields: observedFields, frequencyHz: observedFrequencyHz,
+        ...(operatorRetune ? { observedVFOChange: true } : {}),
+        ...(tunedSpot ? { observedSpotCallsign:tunedSpot.callsign } : {}),
+      }), false, false, true);
+      if (!next || !tunedSpot) return;
+      const spotID=String(tunedSpot.id);
+      spotCursorRef.current = { ...spotCursorRef.current, context:spotSelectionContext, spotID };
+      onSelectedSpot?.(spotID);
+    })().finally(()=>{if(observedFrequencySyncRef.current===syncKey)observedFrequencySyncRef.current="";});
+  }, [observedFrequencyHz, projection?.sessionID, projection?.frequencyHz, projection?.run, busy, retiring,
+    projection?.mode,projection?.callContext,setup.preferences.clearOnVFOChange,ssbTuningToleranceHz,radioTuneCompletionTick,visibleWorkflowSpots,allWorkflowSpots,lookupPathContext,
+    spotWorkflowScope,effectiveSpotWorkflow,effectiveStationCall,bandDefinitions,spotSelectionContext,onSelectedSpot]);
+
+  const createSession = async (document: ContestSetupDocument) => {
+    const contestCall = String(document.station.Call || effectiveStationCall).trim().toUpperCase();
+    if (!contestCall) throw new Error("Configure the xLog station callsign before creating a contest.");
+    const catalogBands = catalog.find(item => item.id === document.pluginID)?.supportedBands;
+    const supportedBands = Array.isArray(catalogBands) && catalogBands.length ? catalogBands as string[] : bandDefinitions.map(band => band.id);
+    const frequencyHz = contestFrequency(selectedRadioFrequencyHz, supportedBands, bandDefinitions) ??
+      manualFrequency(manualFrequencyMHz, supportedBands, bandDefinitions);
+    if (frequencyHz === null) throw new Error("Connect the selected radio or enter a frequency on a band supported by this contest before creating a contest.");
+    if (busyRef.current) return;
+    busyRef.current = true; setBusy(true); setError("");
+    try {
+      flushUnfinishedEditors();
+      await flushDraft(projectionRef.current, operationFrequencyHz ?? projectionRef.current?.frequencyHz ?? null);
+      if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(workspaceGeneration))
+        throw new Error("The current xLog workspace identity is unavailable. Reopen the workspace before creating a contest.");
+      const sessionID = crypto.randomUUID();
+      const created = await result<MutationResult>("contest_create", { sessionID, workspaceGeneration,
+        operationID: crypto.randomUUID(), expectedRevision: 0,
+        pluginID: document.pluginID, name: document.name.trim() || "CQ WW CW", station: { ...document.station, Call: contestCall },
+        operator: document.operator.trim().toUpperCase() || contestCall, frequencyHz,
+        settings: document.settings });
+      const saved = await mutate("contest_setup_save", created.projection, { setup: document }) as MutationResult & { setup: ContestSetupDocument; effectiveMacros?: ContestSetupMacro[] };
+      setEffectiveMacros(saved.effectiveMacros);
+      acceptSessionProjection(saved.projection); rememberSetup(saved.setup); await refresh(saved.projection.sessionID, saved.projection);
+      const list = await result<{ sessions: Session[] }>("contest_sessions"); setSessions(list.sessions);
+      localStorage.setItem(activeSessionKey, saved.projection.sessionID); if (!setupOnly) setManager(false);
+    } catch (cause) { setError(errorMessage(cause)); throw cause; }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+  const saveSetup = async (document: ContestSetupDocument) => {
+    if (!projectionRef.current) { rememberSetup(document); return; }
+    let savedMacros: ContestSetupMacro[] | undefined;
+    const saved = await runMutation(async base => {
+      const response = await mutate("contest_setup_save", base, { setup: document });
+      savedMacros = response.effectiveMacros;
+      return response;
+    },
+      false, true, false, true);
+    if (saved) { rememberSetup(document); setEffectiveMacros(savedMacros); }
+  };
+  const createPractice=async()=>{
+    flushUnfinishedEditors();
+    const base=projectionRef.current;if(!base||busyRef.current)throw new Error("Open a source contest before creating Practice.");
+    const key=`xlog.contest.practice-create.v1/${base.workspaceGeneration}/${base.sessionID}`;
+    const pending=localStorage.getItem(key),params=pending?JSON.parse(pending):{sessionID:crypto.randomUUID(),workspaceGeneration:base.workspaceGeneration,
+      operationID:crypto.randomUUID(),expectedRevision:0,practiceSourceSessionID:base.sessionID,sourceRevision:base.revision};
+    localStorage.setItem(key,JSON.stringify(params));practiceTransitionRef.current=true;
+    busyRef.current=true;setBusy(true);setError("");
+    try{
+      const created=await result<MutationResult>("contest_create",params);
+      acceptSessionProjection(created.projection);practiceTransitionRef.current=false;localStorage.removeItem(key);
+      setManualFrequencyMHz((created.projection.frequencyHz/1e6).toFixed(6));
+      const saved=await result<{setup:ContestSetupDocument;effectiveMacros?:ContestSetupMacro[]}>("contest_setup_get",{sessionID:created.projection.sessionID});
+      acceptSessionProjection(created.projection);rememberSetup(saved.setup);setEffectiveMacros(saved.effectiveMacros);
+      setManualFrequencyMHz((created.projection.frequencyHz/1e6).toFixed(6));
+      await refresh(created.projection.sessionID,created.projection);setSessions((await result<{sessions:Session[]}>("contest_sessions")).sessions);
+      localStorage.setItem(activeSessionKey,created.projection.sessionID);setProductivityOpen(true);setProductivityTab("Entry & stack");
+    }catch(cause){if(cause instanceof ContestServerError&&cause.outcome!=="uncertain"){localStorage.removeItem(key);practiceTransitionRef.current=false;}
+      setError(errorMessage(cause));throw cause;}finally{busyRef.current=false;setBusy(false);}
+  };
+  useEffect(() => {
+    if ((!setupOnly && !projection) || digitalPlatformLimitation()) return;
+    let active = true;
+    const refreshDigital = () => { if (fldigiStopRef.current) return; const generation = digitalGenerationRef.current;
+      void Promise.allSettled([serviceRequest("wsjtx_snapshot"), serviceRequest("fldigi_snapshot")]).then(([wsjtx, fldigi]) => {
+      if (!active || generation !== digitalGenerationRef.current || fldigiStopRef.current) return;
+      const decoded = wsjtx.status === "fulfilled" ? boundedDigitalSnapshot(wsjtx.value) : undefined;
+      setDigitalSnapshot(current => decoded ?? current,fldigi.status === "fulfilled" ? boundedFldigiSnapshot(fldigi.value) : undefined);
+    }); };
+    refreshDigital(); const timer = window.setInterval(refreshDigital, 5_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [setupOnly, serviceRequest, projection?.sessionID, projection?.revision]);
+  useContestSetupDialogs({ enabled: setupOnly, context: `${operatingContext}/${workspaceGeneration}/${projection?.sessionID ?? "no-session"}`,
+    document: setup, auxiliary: { roverLocation: projection?.roverLocation ?? "", activeSessionID: projection?.sessionID, catalog: setupCatalog,
+      effectiveMacros, diagnostics: {
+      engine: "Not1MM Python", plugin: projection?.pluginID ?? "No open contest",
+      version: projection?.ruleIdentity?.version ?? "26.10.11", source: projection?.sourceRevision ?? "7c8b499225a73f7f8f792246881bd7aefc05452f",
+      reference: projection?.referenceID ?? "No active reference" }, digital: digitalSnapshot }, save: async document => {
+      if (busyRef.current || retiring) throw new Error("Contest Setup is busy. Try again after it finishes.");
+      await saveSetup(document);
+    }, saveRover: async location => { await hostAction("contest_rover_location", { location }, true); },
+    readDigital: () => digitalSnapshotRef.current,
+    saveDigital: async ({ configuration, fldigi_configuration, action }: ContestDigitalSave) => {
+      if (busyRef.current || retiring) throw new Error("Contest Setup is busy. Try again after it finishes.");
+      if (action === "stop") {
+        const stopped = await Promise.allSettled([serviceRequest("wsjtx_stop"), stopFldigiOutput()]);
+        const reads = await Promise.allSettled([serviceRequest("wsjtx_snapshot"),serviceRequest("fldigi_snapshot")]);
+        const wsjtx = reads[0].status === "fulfilled" ? boundedDigitalSnapshot(reads[0].value) : undefined;
+        const fldigi = reads[1].status === "fulfilled" ? boundedFldigiSnapshot(reads[1].value) : undefined;
+        setDigitalSnapshot(current => wsjtx ?? current,fldigi);
+        const failed = [...stopped,...reads].find(result => result.status === "rejected");
+        if (failed?.status === "rejected") throw failed.reason;
+        if (fldigi?.transmit_release_required || fldigi?.transmit_release_uncertain)
+          throw new Error(fldigi.status);
+      }
+      else {
+        ++digitalGenerationRef.current;
+        const fldigi = boundedFldigiSnapshot(await serviceRequest("fldigi_configure", {
+          configuration: fldigi_configuration ?? { receive_enabled: false, transmit_enabled: false } }));
+        const configured = boundedDigitalSnapshot(await serviceRequest("wsjtx_configure", { configuration: { ...configuration, enabled: action === "start" ? true : configuration.enabled } }));
+        const wsjtx = action === "start" ? boundedDigitalSnapshot(await serviceRequest("wsjtx_start")) : configured;
+        const startedFldigi = action === "start" && fldigi?.configuration.receive_enabled
+          ? boundedFldigiSnapshot(await serviceRequest("fldigi_start")) : fldigi;
+        if (wsjtx) wsjtx.fldigi = startedFldigi;
+        setDigitalSnapshot(wsjtx);
+      }
+    }, report: setError });
+
+  const keyDown = (event: KeyboardEvent<HTMLFormElement>) => {
+    if (event.key === "Escape") { event.preventDefault(); void stopAutoCQ(true).catch(cause=>setError(errorMessage(cause))); return; }
+    if(event.target instanceof Element&&event.target.closest('[aria-label="WAE QTC desk"]'))return;
+    if (!projection || busy || retiring) return;
+    const target = event.target as HTMLInputElement;
+    if (!event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === " " &&
+        target.dataset.contestField === "callsign" && (fieldsRef.current.callsign ?? "").trim().toUpperCase() === "OPON") {
+      event.preventDefault(); changeField("callsign", "");
+      void openContestSetupDialog("operator").catch(cause => setError(errorMessage(cause))); return;
+    }
+    if (!event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === " " &&
+        target.dataset.contestField === "callsign" && (fieldsRef.current.callsign ?? "").trim().toUpperCase() === "ROVE") {
+      event.preventDefault(); changeField("callsign", "");
+      void openContestSetupDialog("rover").catch(cause => setError(errorMessage(cause))); return;
+    }
+    if (!event.altKey && !event.ctrlKey && !event.metaKey && /^F(?:[1-9]|1[0-2])$/.test(event.key)) {
+      if (event.shiftKey && event.key !== "F1") return;
+      event.preventDefault(); if (event.shiftKey) void startAutoCQ().catch(cause => setError(errorMessage(cause)));
+      else void hostAction("contest_function_key", { key: event.key }); return;
+    }
+    if (event.key === "Enter") { event.preventDefault();
+      if (setup.preferences.useESM) void hostAction("contest_esm", { field: focusRef.current }); else void commitEntry();
+      return; }
+    if (event.key === "Tab") {
+      const target = event.target as HTMLInputElement, current = target.dataset.contestField;
+      const next = current && (event.shiftKey ? projection.tabPrevious[current] : projection.tabNext[current]);
+      if (next && fieldRefs.current[next]) { event.preventDefault(); fieldRefs.current[next]?.focus(); }
+    }
+  };
+  const chooseSpot = async (spot: BandMapSpot, throwFailures = false) => {
+    const frequencyHz = Math.round(Number(spot.frequencyKHz) * 1000);
+    if (contestFrequency(frequencyHz, activeSupportedBands, bandDefinitions) === null) {
+      if (throwFailures) throw new Error("That spot is outside the active contest's supported bands.");
+      return;
+    }
+    const laneSource=projectionRef.current;
+    if(laneSource&&dualContestLanes(laneSource)){
+      const scope=captureContestLaneScope(laneSource);
+      try{await enqueueLane(scope,async base=>{
+        const mode=base.supportedModes?.find(value=>canonicalContestSurfaceMode(value)===canonicalContestSurfaceMode(spot.mode))??base.mode;
+        const buffer=laneBuffer(scope);buffer.fields={...buffer.fields,callsign:String(spot.callsign??"").toUpperCase()};buffer.frequencyText=String(frequencyHz);
+        const changed=await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields,frequencyHz,mode});
+        admitLaneResult(changed,scope,structuredClone(buffer));
+        const context=nativeLaneContext(scope);await bindNativeLane(context);acceptLaneNative(await requestContestLaneOutput(context,"tune",{frequencyHz,mode}));
+        onSelectedSpot?.(String(spot.id));setNotice(`Loaded ${spot.callsign} and tuned ${scope.laneID} through its exact route.`);
+      });}catch(cause){setError(errorMessage(cause));if(throwFailures)throw cause;}return;
+    }
+    const sourceHz=observedFrequencyHzRef.current,sessionID=projectionRef.current?.sessionID;
+    const tuneIntent:PendingRadioTune|null=sourceHz!==null&&sessionID?{sessionID,sourceHz,targetHz:frequencyHz}:null;
+    // Register before changing the entry: old telemetry must not pull the new
+    // callsign back to the old frequency while the tune command is in flight.
+    if(tuneIntent)pendingRadioTuneRef.current=tuneIntent;
+    let admittedSpotMode: string | null = null;
+    try {
+    const next = await runMutation(async base => {
+      const supportedModes=contestSpotSurfaceModes(base.pluginID,base.supportedModes??[],base.spotModeCategory??"MIXED"),spotMode=canonicalContestSurfaceMode(spot.mode);
+      const admittedMode=supportedModes.length===1?base.mode:
+        base.supportedModes?.find(mode=>canonicalContestSurfaceMode(mode)===spotMode)??
+        (spotMode&&supportedModes.includes(spotMode)?spotMode:null);
+      if(!admittedMode)throw new Error("That spot's mode is not supported by the active contest.");
+      admittedSpotMode = admittedMode;
+      return mutate("contest_draft_apply", base, {
+        fields: { ...fieldsRef.current, callsign: String(spot.callsign ?? "").toUpperCase() }, frequencyHz, mode:admittedMode,
+      });
+    }, false, false, false, throwFailures);
+    if (!next || !admittedSpotMode) {cancelRadioTune(tuneIntent);return;}
+    manualHeardCallRef.current=null;
+    spotCursorRef.current = { ...spotCursorRef.current, context: spotSelectionContext, spotID: String(spot.id) };
+    setManualFrequencyMHz((frequencyHz / 1_000_000).toFixed(6));
+    onSelectedSpot?.(String(spot.id));
+    setNotice(`Loaded ${spot.callsign}.`);
+    try {
+      await stationTune(frequencyHz, admittedSpotMode);
+      if(tuneIntent)finishRadioTune(tuneIntent);
+      setNotice(`Loaded ${spot.callsign} and confirmed the selected radio tune.`);
+    } catch (cause) {
+      cancelRadioTune(tuneIntent);
+      setError(errorMessage(cause));
+      if (throwFailures) throw cause;
+    }
+    } catch(cause){cancelRadioTune(tuneIntent);throw cause;}
+  };
+
+  const exportLog = async (format: PythonContestExportFormat, throwFailures = false, completion?: {
+      operatingContext:string;sessionID:string;workspaceGeneration:string;requestID:string;projectionRevision:number },expectedRevision?:number,expectedSHA256?:string,siteID?:string) => {
+    const active = projectionRef.current;
+    if (!active || busyRef.current) return;
+    const exportFormats=active.exportFormats??["cabrillo","adif"];
+    const formatLabel = format === "cabrillo" ? "Cabrillo" : format.toUpperCase();
+    if(!exportFormats.includes(format)){const failure=new Error(`${formatLabel} export is not supported by this contest.`);
+      setError(failure.message);if(throwFailures)throw failure;return;}
+    let nativeOwnsCompletion = false;
+    busyRef.current = true; setBusy(true); setError("");
+    try {
+      const prepared = await result<ContestExportSavePrepared & { filename?: string }>("contest_export_prepare", { sessionID: active.sessionID, format,
+        ...(expectedRevision===undefined?{}:{expectedRevision}),...(siteID?{siteID}:{}) });
+      if(expectedSHA256&&prepared.sha256!==expectedSHA256){await result("contest_export_release",{sessionID:active.sessionID,workspaceGeneration:active.workspaceGeneration,exportID:prepared.artifactID});
+        throw new Error("Export bytes changed after review. Run submission preflight again before saving.");}
+      nativeOwnsCompletion = completion !== undefined;
+      const saved = await nativeContestExportSave(prepared, completion);
+      if (saved.status === "saved") setNotice(`Saved ${saved.filename}.`);
+      else if (saved.status === "cancelled") setNotice(`${formatLabel} save cancelled.`);
+      else setError(saved.message);
+      return completion ? "native-completed" as const : undefined;
+    } catch (cause) { setError(errorMessage(cause)); if (nativeOwnsCompletion) return "native-completed" as const; if (throwFailures) throw cause; }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+
+  const beginEdit = async (qsoID: string, throwFailures = false, suppliedRow?: Data) => {
+    const active = projectionRef.current;
+    const partialRows = partial?.sessionID===active?.sessionID && partial?.revision===active?.revision && partial?.query===(fieldsRef.current.callsign??"").trim().toUpperCase()?partial?.rows:[];
+    const row = suppliedRow ?? [...rows,...(partialRows??[])].find(item => String(item.ID) === qsoID);
+    if (!row) { if (throwFailures) throw new Error("The selected contact is no longer in this log or its partial matches."); return; }
+    if (busyRef.current || retiring) { if (throwFailures) throw new Error("The contest owner is busy."); return; }
+    busyRef.current = true; setBusy(true); setError("");
+    try {
+      await flushDraftRef.current();
+      const raw = row.raw_fields && typeof row.raw_fields === "object" && !Array.isArray(row.raw_fields) ? row.raw_fields as Record<string, unknown> : {};
+      setEditing({ ...row, raw_fields: raw }); setEditCall(String(raw.callsign ?? row.Call ?? ""));
+      setEditZone(correctionFieldValue(row, raw, "other_2", active?.pluginID));
+      setEditTimestamp(String(row.TS ?? "")); setEditFrequencyMHz((Number(row.Freq ?? 0) / 1000).toFixed(6));
+      const receiveKHz = Number(row.QSXFreq ?? 0);
+      setEditReceiveFrequencyHz(Number.isFinite(receiveKHz) && receiveKHz >= 0 ? String(Math.round(receiveKHz * 1000)) : "0");
+      setEditPower(String(row.Power ?? "0"));
+      setEditOperator(String(row.Operator ?? "")); setEditSent(String(raw.sent ?? row.SNT ?? "")); setEditReceived(String(raw.receive ?? row.RCV ?? ""));
+      setEditName(String(raw.Name ?? row.Name ?? "")); setEditQTH(String(raw.QTH ?? row.QTH ?? "")); setEditComment(String(raw.Comment ?? row.Comment ?? ""));
+      setEditSentExchange(correctionFieldValue(row, raw, "other_1", active?.pluginID)); setCorrectionReason("Operator correction");
+      setDeletionReason("Operator deletion"); setConfirmDelete(false);
+    } catch (cause) { setError(errorMessage(cause)); if (throwFailures) throw cause; }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+  const saveCorrection = async (reason: string, throwFailures = false) => { if (!editing) return null;
+    const frequencyHz = manualFrequency(editFrequencyMHz, activeSupportedBands, bandDefinitions);
+    if (frequencyHz === null) throw new Error("Enter a frequency on a band supported by this contest before saving the correction.");
+    const receiveFrequencyHz = correctedReceiveFrequency(editReceiveFrequencyHz);
+    if (receiveFrequencyHz === null) throw new Error("Enter the RX frequency in Hz using digits only.");
+    const power = correctedPower(editPower);
+    if (power === null) throw new Error("Enter transmit power as up to 8 digits, or leave it blank.");
+    const originalFields = editing.raw_fields && typeof editing.raw_fields === "object" && !Array.isArray(editing.raw_fields)
+      ? editing.raw_fields as Record<string, unknown> : {};
+    const active = projectionRef.current;
+    const pluginMetadata = pluginContactMetadataColumns(active?.fields ?? []);
+    const correctionFields: Record<string, unknown> = { ...originalFields, callsign: editCall.toUpperCase(), sent: editSent,
+      receive: editReceived, other_1: editSentExchange, other_2: editZone };
+    for (const [column, value] of [["Name", editName], ["QTH", editQTH], ["Comment", editComment]] as const) {
+      delete correctionFields[column];
+      const original = String(originalFields[column] ?? editing[column] ?? "");
+      if (!pluginMetadata.has(column) && value !== original) correctionFields[column] = value;
+    }
+    if(configuredClient){
+      if(authorityBusyRef.current)throw new Error("The authoritative contest log is synchronising; try again.");
+      authorityBusyRef.current=true;
+      try{
+      const baseRevision=authoritativeChangeRevision(editing);
+      if(!active)throw new Error("The active contest authority context is unavailable.");
+      const pending=pendingMutation("correct",active,baseRevision,()=>{const qsoID=String(editing.ID);return{qsoID,params:{action:"correct",qsoID,baseRevision,
+        timestamp: editTimestamp, frequencyHz, receiveFrequencyHz, power, operator: editOperator,
+        fields:correctionFields,reason}}});
+      const next=await sendPendingMutation(pending);setEditing(null);setConfirmDelete(false);return next;
+      }finally{authorityBusyRef.current=false;}
+    }
+    const next = await runMutation(base => mutate("contest_qso_correct", base, { qsoID: editing.ID,
+      timestamp: editTimestamp, frequencyHz, receiveFrequencyHz, power, operator: editOperator,
+      fields: correctionFields, reason }), true, true, false, throwFailures);
+    if (next) { setEditing(null); setConfirmDelete(false); }
+    return next;
+  };
+  const correct = (event: FormEvent) => { event.preventDefault();
+    void saveCorrection(correctionReason).catch(cause => setError(errorMessage(cause))); };
+  const deleteQSO = async (reason: string, throwFailures = false) => { if (!editing) return null;
+    if(configuredClient){
+      if(authorityBusyRef.current)throw new Error("The authoritative contest log is synchronising; try again.");
+      authorityBusyRef.current=true;
+      try{
+      const active=projectionRef.current,baseRevision=authoritativeChangeRevision(editing);
+      if(!active)throw new Error("The active contest authority context is unavailable.");
+      const pending=pendingMutation("delete",active,baseRevision,()=>{const qsoID=String(editing.ID);return{qsoID,
+        params:{action:"delete",qsoID,baseRevision,reason}}});
+      const next=await sendPendingMutation(pending);setEditing(null);setConfirmDelete(false);return next;
+      }finally{authorityBusyRef.current=false;}
+    }
+    const next = await runMutation(base => mutate("contest_qso_delete", base, { qsoID: editing.ID, reason }),
+      true, true, false, throwFailures);
+    if (next) { setEditing(null); setConfirmDelete(false); }
+    return next;
+  };
+  const remove = () => { if (!editing || !confirm(`Delete ${editing.Call} from this contest?`)) return;
+    void deleteQSO(deletionReason).catch(cause => setError(errorMessage(cause))); };
+  const commitEntry=async()=>{
+    const laneSource=projectionRef.current;
+    if(laneSource&&dualContestLanes(laneSource)){
+      const scope=captureContestLaneScope(laneSource);await enqueueLane(scope,async base=>{
+        assertNoPendingStack();const changed=await mutate("contest_qso_commit",base,{...contestLaneParams(scope),qsoID:crypto.randomUUID(),fields:laneBuffer(scope).fields,frequencyHz:base.frequencyHz});
+        admitLaneResult(changed,scope);void refresh(changed.projection.sessionID,changed.projection);
+      });return;
+    }
+    assertNoPendingStack();
+    if((fieldsRef.current.callsign??"").includes("?"))throw new Error("Complete the partial callsign before logging; queued partials are assistance only.");
+    const committedCall=(fieldsRef.current.callsign??"").trim().toUpperCase(),committedFrequency=operationFrequencyHz;
+    const retainedBase=committedFrequency===null?null:localContestHeardSpot({callsign:committedCall,frequencyHz:committedFrequency,
+      mode:projectionRef.current?.mode??"",stationCall:effectiveStationCall,bandDefinitions,callContext:projectionRef.current?.callContext});
+    const retainedPath=lookupPathContext?.callsign===committedCall?lookupPathContext:null;
+    const retainedSpot=retainedBase?{...retainedBase,latitude:retainedPath?.latitude??null,longitude:retainedPath?.longitude??null,
+      country:retainedPath?.country??retainedBase.country,cqZone:retainedPath?.cqZone??retainedBase.cqZone,
+      ituZone:retainedPath?.ituZone??retainedBase.ituZone,comment:"Worked in this contest",source:"Contest log",marked:true,
+      contestPoints:0,contestDupe:true,contestMultiplierCount:0,contestCountryMultiplier:false,contestZoneMultiplier:false}:null;
+    const retainCommittedSpot=()=>{if(!retainedSpot)return;
+      setSpotPointPreview(previous=>({...previous,rows:new Map([...previous.rows].map(([id,row])=>{
+        const spot=previewCandidatesRef.current.find(item=>item.spotID===id);
+        return spot&&spot.callsign.trim().toUpperCase()===committedCall&&
+          allWorkflowSpots.find(item=>item.id===id)?.band===retainedSpot.band
+          ?[id,{...row,points:0,dupe:true,multiplierCount:0,countryMultiplier:false,zoneMultiplier:false}]:[id,row];
+      }))}));
+      setSpotWorkflow(current=>updateContestSpotWorkflow(
+      sameSpotWorkflowScope(current,spotWorkflowScope)?current:effectiveSpotWorkflow,
+      [...allWorkflowSpots.filter(item=>item.id!==retainedSpot.id),retainedSpot],retainedSpot.id,"mark",true));};
+    if(configuredClient){
+      if(authorityBusyRef.current)throw new Error("The authoritative contest log is synchronising; try again.");
+      authorityBusyRef.current=true;
+      try{
+        const current=projectionRef.current;if(!current)throw new Error("The active contest authority context is unavailable.");
+        const restored=pendingForDraft("commit",current),base=restored?current:await syncReplica(),
+          pending=restored??pendingMutation("commit",base,base.revision,()=>{const qsoID=crypto.randomUUID();return{qsoID,
+            params:{action:"commit",qsoID,timestamp:new Date().toISOString().slice(0,19).replace("T"," "),
+              frequencyHz:base.frequencyHz,mode:base.mode,operator:base.operator??setup.operator,fields:{...fieldsRef.current},
+              ...(base.authoritySerialRequestID?{serialRequestID:base.authoritySerialRequestID}:{})}}});
+        const next=await sendPendingMutation(pending);retainCommittedSpot();return next;
+      }finally{authorityBusyRef.current=false;}
+    }
+    const next=await runMutation(base=>mutate("contest_qso_commit",base,{fields:fieldsRef.current,frequencyHz:base.frequencyHz}),
+      false,true,false,true);
+    if(next){
+      retainCommittedSpot();
+      // The durable commit is complete. Auxiliary views have their own revision
+      // fences and retries; they must not hold the saved receipt or entry busy.
+      void refresh(next.sessionID,next);
+      await new Promise<void>(resolve=>window.setTimeout(resolve,0));
+      // A failed view publication cannot undo or reject a persisted contact.
+      await waitForSurfacePublication().catch(cause=>setError(errorMessage(cause)));
+    }
+    return next;
+  };
+
+  const scoreView = scoreSummary(score, projection?.pluginID);
+  const visibleFields = projection?.fields.filter(field => field.visible) ?? [];
+  const changeField = (field: string, value: string, typed=false) => {
+    const active=projectionRef.current;if(active&&dualContestLanes(active)){
+      onOperatingLaneAction({...captureContestLaneScope(active),kind:"field-change",fieldID:field,value});return;
+    }
+    const draft=projectionRef.current;if(draft){if(typedFieldsRef.current.draftID!==draft.draftID)typedFieldsRef.current={draftID:draft.draftID,fields:new Set()};typedFieldsRef.current.fields.add(field);}
+    if(field==="callsign")recordManualHeardCall(value);
+    if (field === "callsign" && autoCQActiveRef.current) void stopAutoCQ();
+    editVersionRef.current += 1;
+    const next = { ...fieldsRef.current, [field]: value };
+    fieldsRef.current = next; setFields(next);
+    if(field==="callsign"&&earlyCWEnabled){
+      if(typed)void queueEarlyCW(next);
+      else if(earlyCWRef.current){earlyCWFaultRef.current="Early CW interrupted by a pasted or selected callsign. Stop and explicitly start again.";setEarlyCWEnabled(false);void cw.controller.stop();setError(earlyCWFaultRef.current);}
+    }
+  };
+  const stackDraft=(base=projectionRef.current,values?:Record<string,string>,laneID?:ContestLaneID):ParkedCallStackDraft=>{
+    if(!base)throw new Error("Open a contest before using Call Stack.");
+    const laneScope=dualContestLanes(base)?captureContestLaneScope(base,laneID):null;
+    if(laneScope){base=contestLaneProjection(base,laneScope.laneID);
+      const buffer=laneBuffersRef.current[laneScope.laneID];values=values??(buffer?.scope.draftID===base.draftID?buffer.fields:projectionFields(base));
+    }else values=values??fieldsRef.current;
+    return {sessionID:base.sessionID,workspaceGeneration:base.workspaceGeneration,draftID:base.draftID,revision:base.revision,
+      captureParkedSnapshot:true as const,reservedSerial:base.reservedSerial??null,allocatedSerialFieldID:base.allocatedSerialFieldID??null,
+      ...(laneScope?{laneID:laneScope.laneID,bindingVersion:laneScope.bindingVersion,bindingGeneration:laneScope.bindingGeneration}:{}),
+      fields:{...values},defaults:clearedContestFields(base,base.mode),receivedFieldIDs:base.fields.filter(field=>field.id!=="callsign"&&field.id!=="sent"&&
+        field.id!==base.allocatedSerialFieldID&&!field.readOnly&&field.visible&&field.enabled).map(field=>field.id),heardFieldIDs:base.fields.filter(field=>field.id!=="callsign"&&field.id!=="sent"&&
+        field.id!==base.allocatedSerialFieldID&&!field.readOnly&&(laneScope?laneBuffersRef.current[laneScope.laneID]?.heardFieldIDs.includes(field.id):
+          typedFieldsRef.current.draftID===base.draftID&&typedFieldsRef.current.fields.has(field.id))).map(field=>field.id)};
+  };
+  const stackResult=async(operation:CallStackOperation,changed:MutationResult&{operationID?:string},preserveBuffered=false):Promise<CallStackResult>=>{
+    if(changed.operationID!==operation.operationID||changed.projection.sessionID!==operation.draft.sessionID||
+      changed.projection.workspaceGeneration!==operation.draft.workspaceGeneration)throw new Error("The stack receipt belongs to a different operation.");
+    const current=projectionRef.current;
+    if(current?.sessionID!==operation.draft.sessionID||current.workspaceGeneration!==operation.draft.workspaceGeneration)throw new Error("The Call Stack session changed; reopen its source to recover.");
+    const next=changed.projection;
+    if(operation.draft.laneID&&dualContestLanes(next)){
+      const view=contestLaneProjection(next,operation.draft.laneID);
+      if(!preserveBuffered&&operation.kind==="load"){
+        const buffer=laneBuffersRef.current[operation.draft.laneID];if(buffer?.scope.draftID===operation.draft.draftID)
+          laneBuffersRef.current[operation.draft.laneID]={...buffer,fields:projectionFields(view),baseline:projectionFields(view),heardFieldIDs:operation.loadedHeardFieldIDs??operation.draft.heardFieldIDs};}
+      if(current.revision<=next.revision){acceptProjection(next);void refresh(next.sessionID,next);}
+      return {operationID:operation.operationID,draft:stackDraft(next,projectionFields(view),operation.draft.laneID),...(operation.kind==="commit"?{qsoID:operation.operationID}:{})};
+    }
+    if(operation.kind==="load"&&!preserveBuffered&&(current.revision<=next.revision||
+      current.draftID===next.draftID&&sameFields(fieldsRef.current,projectionFields(next))))
+      typedFieldsRef.current={draftID:next.draftID,fields:new Set(operation.loadedHeardFieldIDs??(operation.draft.receivedFieldIDs??[]).filter(id=>operation.fields[id]!==operation.draft.defaults[id]))};
+    if(current.revision<=next.revision){acceptProjection(next,preserveBuffered?Number.MIN_SAFE_INTEGER:undefined);void refresh(next.sessionID,next);}
+    return {operationID:operation.operationID,draft:stackDraft(next,projectionFields(next)),...(operation.kind==="commit"?{qsoID:operation.operationID}:{})};
+  };
+  const mutateStack=async(operation:CallStackOperation)=>{
+    if(operation.stackTransition&&draftOutputBlockedRef.current)
+      throw new Error("Disarm contest output and finish its pending operation before parking or resuming Entry.");
+    if(operation.draft.laneID){
+      const current=projectionRef.current;if(!current)throw Error("The Call Stack session changed.");
+      const scope={sessionID:operation.draft.sessionID,workspaceGeneration:operation.draft.workspaceGeneration,laneID:operation.draft.laneID,
+        draftID:operation.draft.draftID,bindingVersion:operation.draft.bindingVersion??-1,bindingGeneration:operation.draft.bindingGeneration??null};
+      return enqueueLane(scope,async base=>{
+        const version=laneBuffer(scope).version;
+        const changed=await mutate(operation.kind==="commit"?"contest_qso_commit":"contest_draft_apply",base,{
+          ...contestLaneParams(scope),operationID:operation.operationID,expectedRevision:operation.draft.revision,fields:operation.fields,
+          ...(operation.kind==="commit"?{qsoID:operation.operationID}:{manualStackLoad:true,
+            ...(operation.stackTransition?{stackTransition:operation.stackTransition,stackCurrentFields:operation.draft.fields}:{})})});
+        return stackResult(operation,changed,laneBuffersRef.current[scope.laneID]?.version!==version);
+      },false);
+    }
+    if(configuredClient){
+      const pass=passStackAdmissionRef.current;
+      if(operation.kind!=="load"||!authorityClientReady||!pass||pass.sessionID!==operation.draft.sessionID||
+          pass.workspaceGeneration!==operation.draft.workspaceGeneration||pass.draftID!==operation.draft.draftID)
+        throw new Error("Call Stack logging requires the local authoritative desk; only an admitted directed pass may load a client draft.");
+    }
+    if(busyRef.current||retiring)throw new Error("The contest owner is busy.");
+    const current=projectionRef.current;
+    if(!current||current.sessionID!==operation.draft.sessionID||current.workspaceGeneration!==operation.draft.workspaceGeneration)throw new Error("The Call Stack session changed.");
+    const version=editVersionRef.current;
+    busyRef.current=true;setBusy(true);setError("");
+    try{
+      const changed=await mutate(operation.kind==="commit"?"contest_qso_commit":"contest_draft_apply",current,{
+        operationID:operation.operationID,expectedRevision:operation.draft.revision,draftID:operation.draft.draftID,fields:operation.fields,
+        workspaceGeneration:operation.draft.workspaceGeneration,
+        ...(operation.kind==="commit"?{qsoID:operation.operationID}:{manualStackLoad:true,
+          ...(operation.stackTransition?{stackTransition:operation.stackTransition,stackCurrentFields:operation.draft.fields}:{})})});
+      if(operation.kind==="load")typedFieldsRef.current={draftID:changed.projection.draftID,fields:new Set(operation.loadedHeardFieldIDs??(operation.draft.receivedFieldIDs??[])
+        .filter(id=>operation.fields[id]!==operation.draft.defaults[id]))};
+      return await stackResult(operation,changed,editVersionRef.current!==version);
+    }finally{busyRef.current=false;setBusy(false);}
+  };
+  const recoverStack=async(operation:CallStackOperation)=>{
+    if(operation.draft.laneID){
+      const before=projectionRef.current,buffer=laneBuffersRef.current[operation.draft.laneID],version=buffer?.version;
+      const keep=Boolean(buffer&&Object.keys(buffer.fields).some(id=>buffer.fields[id]!==operation.fields[id]));
+      const receipt=await result<{found:boolean;result:(MutationResult&{operationID:string})|null}>("contest_operation_receipt",{sessionID:operation.draft.sessionID,operationID:operation.operationID});
+      if(!receipt.found||!receipt.result)return null;
+      const opened=await result<{projection:Projection}>("contest_draft_get",{sessionID:operation.draft.sessionID,workspaceGeneration:operation.draft.workspaceGeneration});
+      if(before?.sessionID===projectionRef.current?.sessionID&&projectionRef.current?.sessionID===operation.draft.sessionID)acceptProjection(opened.projection);
+      return stackResult(operation,receipt.result,keep||laneBuffersRef.current[operation.draft.laneID]?.version!==version);
+    }
+    const before=projectionRef.current,buffered={...fieldsRef.current},version=editVersionRef.current;
+    const preserve=before?.draftID===operation.draft.draftID?before.fields.some(field=>!field.readOnly&&field.id!==before.allocatedSerialFieldID&&
+      buffered[field.id]!==operation.fields[field.id]):
+      Boolean(before&&!sameFields(buffered,projectionFields(before)));
+    const receipt=await result<{found:boolean;result:(MutationResult&{operationID:string})|null}>("contest_operation_receipt",{
+      sessionID:operation.draft.sessionID,operationID:operation.operationID});
+    if(!receipt.found||!receipt.result)return null;
+    // Reconcile live projection before considering an old receipt's draft safe to load.
+    const opened=await result<{projection:Projection}>("contest_draft_get",{sessionID:operation.draft.sessionID});
+    const keep=preserve||version!==editVersionRef.current;
+    if(projectionRef.current?.sessionID===operation.draft.sessionID)acceptProjection(opened.projection,keep?Number.MIN_SAFE_INTEGER:undefined);
+    return stackResult(operation,receipt.result,keep);
+  };
+  const saveNote=async(target:NoteTarget,text:string,noteID:string)=>{
+    const base=projectionRef.current;if(!base||busyRef.current||retiring)throw new Error("The contest owner is busy.");
+    const key=`xlog.contest.note-pending.v1/${base.workspaceGeneration}/${base.sessionID}/${noteID}`;
+    const saved=localStorage.getItem(key);
+    const noteScope=()=>{
+      if(!dualContestLanes(base))return {};
+      const laneID=target.laneID??("draftID" in target?base.operatingLanes!.lanes.find(lane=>lane.draftID===target.draftID)?.laneID:undefined);
+      if(!laneID)throw new ContestServerError("unknown_note_lane","The original note lane is unavailable. Keep this text and review its original draft or contact.","confirmed");
+      const scope=captureContestLaneScope(base,laneID);
+      if(target.bindingVersion!==undefined&&(target.bindingVersion!==scope.bindingVersion||target.bindingGeneration!==scope.bindingGeneration))
+        throw new ContestServerError("stale_binding","The original note receiver binding changed. Keep this text and reopen its target deliberately.","confirmed");
+      return contestLaneParams(scope);
+    };
+    const identity="draftID" in target?{draftID:target.draftID}:{qsoID:target.qsoID};
+    const params=saved?JSON.parse(saved):{sessionID:base.sessionID,workspaceGeneration:base.workspaceGeneration,
+      operationID:noteID,expectedRevision:base.revision,noteID,target:identity,text,...noteScope()};
+    localStorage.setItem(key,JSON.stringify(params));busyRef.current=true;setBusy(true);
+    try{
+      const receipt=await result<{found:boolean;result:MutationResult|null}>("contest_operation_receipt",{sessionID:base.sessionID,operationID:noteID});
+      const changed=receipt.found&&receipt.result?receipt.result:await result<MutationResult>("contest_note_save",params);
+      localStorage.removeItem(key);
+      const latest=await result<{projection:Projection}>("contest_draft_get",{sessionID:base.sessionID});
+      if(projectionRef.current?.sessionID===base.sessionID)acceptProjection(latest.projection);
+      setNotice("Note saved to its original contact identity.");
+      return changed;
+    }catch(cause){if(cause instanceof ContestServerError&&cause.outcome!=="uncertain")localStorage.removeItem(key);throw cause;}
+    finally{busyRef.current=false;setBusy(false);}
+  };
+  const planningRequest=useCallback(async(method:string,params:Record<string,unknown>)=>{
+    const base=projectionRef.current;if(!base)throw Error("Open a contest session.");
+    let laneParams:Record<string,unknown>={};
+    if(method==="contest_message_preview"&&dualContestLanes(base)){
+      const id=(params.draft as {id?:string}|undefined)?.id,lane=base.operatingLanes!.lanes.find(value=>value.draftID===id);
+      if(!lane)throw Error("The message preview's original lane draft changed. Review its current draft before previewing again.");
+      laneParams=contestLaneParams(captureContestLaneScope(base,lane.laneID));
+    }
+    return result<any>(method,{sessionID:base.sessionID,workspaceGeneration:base.workspaceGeneration,expectedRevision:base.revision,...laneParams,...params});
+  },[request]);
+  const sendQTC=async(intent:{batchID:string;index:number;fields:string})=>{
+    const base=projectionRef.current;
+    if(!base||configuredClient||base.practice||dualContestLanes(base))throw Error("QTC output requires the authoritative single-lane desk. Exact multi-lane QTC output is unavailable; use explicit manual operation.");
+    if(base.mode==="CW"){
+      if(!cw.state.armed)throw Error("Arm the captured CW output before sending a QTC.");
+      let outputError="";
+      const applied=await runMutation(async current=>{
+        const operationID=crypto.randomUUID();
+        const native=await cw.controller.executeContest({operation:"qtc",operationID,sessionID:current.sessionID,
+          workspaceGeneration:current.workspaceGeneration,expectedContestRevision:current.revision,draftID:current.draftID,
+          batchID:intent.batchID,index:intent.index,qtcField:intent.fields});
+        const changed=native?.contestResult as (MutationResult&{operationID?:string})|undefined;
+        if(!changed?.projection||changed.operationID!==operationID)throw Error(native?.error||"QTC native receipt unavailable. Inspect the original attempt; do not retry it.");
+        outputError=String(native?.error??changed.outputError??"");
+        return {...changed,actions:[],outputError:outputError||undefined};
+      },false,false,true,true);
+      if(outputError)throw Error(outputError);
+      if(!applied)throw Error("QTC output returned without an applied native receipt. Inspect its original attempt.");
+      return applied;
+    }
+    if(base.mode==="SSB"&&(!phoneProductionConfigured||!phoneCanSend))throw Error("Arm recorded phone output with a saved WAV profile, or speak the QTC manually. Missing letter/digit/fragments never become generated speech.");
+    if(base.mode!=="SSB"&&!fldigiSnapshot?.configuration.transmit_enabled)throw Error("Enable the admitted fldigi transmit route or operate the QTC manually.");
+    const controller=new AbortController();
+    if(qtcOutputOwnerRef.current)throw Error("Stop and reconcile the original QTC output owner before starting another action.");
+    const owner:{controller:AbortController;mode:string;bridgeGeneration?:string}={controller,mode:base.mode};qtcOutputOwnerRef.current=owner;
+    if(base.mode==="SSB")phoneSimulationControllerRef.current=controller;
+    let completed=false;
+    try{
+      const voiceTarget=base.mode==="SSB"?await captureContestVoiceTarget(base):undefined;
+      const bridge=base.mode!=="SSB"?await serviceRequest("fldigi_snapshot"):null;
+      const bridgeGeneration=bridge?(bridge as Data).transmit_generation:undefined;
+      if(base.mode!=="SSB"&&(typeof bridgeGeneration!=="string"||!/^[0-9a-f-]{36}$/.test(bridgeGeneration)))throw Error("The fldigi transmit generation could not be captured before QTC preparation.");
+      if(bridgeGeneration)owner.bridgeGeneration=bridgeGeneration;
+      const scopeCurrent=()=>{const latest=projectionRef.current;return latest?.sessionID===base.sessionID&&latest.workspaceGeneration===base.workspaceGeneration&&latest.draftID===base.draftID;};
+      if(controller.signal.aborted||!scopeCurrent())throw Error("QTC output was stopped or its source context changed before preparation.");
+      const applied=await runMutation(current=>{
+        if(controller.signal.aborted||!scopeCurrent())throw Error("QTC output was stopped before host admission.");
+        return mutate("contest_strategy_apply",current,{workspaceGeneration:current.workspaceGeneration,
+        action:"qtc_output",batchID:intent.batchID,index:intent.index,qtcField:intent.fields,
+        ...(voiceTarget?{voiceTarget}:{bridgeGeneration})});},false,false,true,true,
+        async(changed,origin)=>{
+          const operationID=changed.operationID,actions=changed.actions??[];
+          if(!operationID||changed.replayed!==false||actions.length!==1||actions[0].qtc?.batchID!==intent.batchID||actions[0].qtc?.field!==intent.fields)
+            throw Error("The captured QTC output could not be verified; no output was replayed.");
+          if(controller.signal.aborted||!scopeCurrent())throw Error("QTC output was stopped or its captured context changed before dispatch.");
+          if(base.mode!=="SSB"){
+            if(actions[0].qtc.bridgeGeneration!==bridgeGeneration)throw Error("The QTC fldigi generation changed in its host receipt.");
+            await consumeFldigiOutput(changed,origin,bridgeGeneration);
+            const outcome=await mutate("contest_strategy_apply",changed.projection,{workspaceGeneration:origin.workspaceGeneration,
+              action:"qtc_output_result",outputOperationID:operationID,outcome:"owner_returned"});
+            return {...outcome,actions:[]};
+          }
+          if(canonicalJSON(actions[0].qtc.voiceTarget)!==canonicalJSON(voiceTarget))throw Error("The QTC voice target changed in its host receipt.");
+          if(!voiceOutput.ownsNativeClaim){const claimed=await result<Data>("contest_output_claim",{sessionID:origin.sessionID,operationID,revision:changed.revision});
+          if(claimed.claimed!==true||canonicalJSON(claimed.actions)!==canonicalJSON(actions))throw Error("QTC output claim is unconfirmed. Inspect its original attempt.");
+          }
+          if(controller.signal.aborted||!scopeCurrent())throw Error("QTC output was stopped before native voice preparation.");
+          await voiceOutput.play(actions as ContestVoiceAction[],origin,String(setup.preferences.voiceProfilePath??""),String(setup.preferences.soundDevice??""),controller.signal,voiceTarget);
+          const outcome=await mutate("contest_strategy_apply",changed.projection,{workspaceGeneration:origin.workspaceGeneration,
+            action:"qtc_output_result",outputOperationID:operationID,outcome:"owner_returned"});
+          return {...outcome,actions:[]};
+        },controller.signal);
+      if(!applied)throw Error("QTC output stopped or returned without a final owner receipt. Its original attempt remains available for review.");
+      completed=true;
+      return applied;
+    }finally{if(phoneSimulationControllerRef.current===controller)phoneSimulationControllerRef.current=null;
+      if(completed&&qtcOutputOwnerRef.current===owner)qtcOutputOwnerRef.current=null;}
+  };
+  const savePlanning=async(method:string|null,extra:Record<string,unknown>={})=>{
+    let base=projectionRef.current;if(!base||busyRef.current||retiring)throw Error("The contest owner is busy.");
+    if(configuredClient)throw Error("Planning changes require the local authoritative desk.");
+    assertNoPendingStack();const inputVersion=editVersionRef.current;
+    const passiveClaim=method==="contest_strategy_apply"&&extra.action==="claim_due";
+    // Serialise the receipt without disabling the focused entry for a notification.
+    busyRef.current=true;if(!passiveClaim)setBusy(true);
+    try{
+      if(extra.action==="site_activate"||extra.action==="adif_import"){
+        if(dualContestLanes(base)){for(const lane of base.operatingLanes!.lanes)await flushLane(captureContestLaneScope(projectionRef.current!,lane.laneID));base=projectionRef.current!;}
+        else base=(await flushDraft(base))!;
+      }
+      const changed=await planningMutation(base,method,{sessionID:base.sessionID,workspaceGeneration:base.workspaceGeneration,
+        expectedRevision:base.revision,draftID:base.draftID,operationID:crypto.randomUUID(),...extra},result);
+      if(!changed)return null;
+      const latest=await result<{projection:Projection}>("contest_draft_get",{sessionID:base.sessionID});
+      if(projectionRef.current?.sessionID===base.sessionID&&projectionRef.current.workspaceGeneration===base.workspaceGeneration){
+        const loading=method==="contest_strategy_apply"&&["sked_load","site_activate"].includes(String(extra.action));
+        acceptProjection(latest.projection,loading?inputVersion:Number.MIN_SAFE_INTEGER);
+        if(changed.effectiveMacros){setEffectiveMacros(changed.effectiveMacros);rememberSetup(changed.setup);}
+      }
+      return changed.waveResult;
+    }finally{busyRef.current=false;if(!passiveClaim)setBusy(false);refreshPlanningRecovery(value=>value+1);}
+  };
+  const loadReminder=async(item:Sked)=>{
+    const current=projectionRef.current;
+    if(current&&dualContestLanes(current)){
+      const scope=captureContestLaneScope(current);
+      if(occupiedStackDraft(stackDraft(current,undefined,scope.laneID)))throw Error("Entry is occupied. Park or finish this lane before loading a reminder.");
+      return enqueueLane(scope,async base=>{
+        const changed=await planningMutation(base,"contest_strategy_apply",{sessionID:scope.sessionID,...contestLaneParams(scope),expectedRevision:base.revision,
+          operationID:crypto.randomUUID(),action:"sked_load",itemID:item.id},result);
+        if(!changed)return null;
+        const view=contestLaneProjection(changed.projection,scope.laneID),buffer=laneBuffer(scope);buffer.fields=projectionFields(view);buffer.frequencyText=String(view.frequencyHz);
+        admitLaneResult(changed,scope,structuredClone(buffer));return changed.waveResult;
+      });
+    }
+    if(occupiedStackDraft(stackDraft()))throw Error("Entry is occupied. Park or finish it before loading this reminder.");
+    return savePlanning("contest_strategy_apply",{action:"sked_load",itemID:item.id});
+  };
+  const loadOpportunity=async(item:{callsign:string;frequencyHz:number;mode:string})=>{
+    const current=projectionRef.current;
+    if(current&&dualContestLanes(current)){
+      const scope=captureContestLaneScope(current);if(occupiedStackDraft(stackDraft(current,undefined,scope.laneID)))throw Error("Entry is occupied. Park or finish this lane before loading an opportunity.");
+      await enqueueLane(scope,async base=>{const buffer=laneBuffer(scope);buffer.fields={...clearedContestFields(base,base.mode),callsign:item.callsign};buffer.frequencyText=String(item.frequencyHz);
+        admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields,frequencyHz:item.frequencyHz,mode:item.mode,manualStackLoad:true}),scope,structuredClone(buffer));});return;
+    }
+    if(occupiedStackDraft(stackDraft()))throw Error("Entry is occupied. Park or finish it before loading an opportunity.");
+    await runMutation(base=>mutate("contest_draft_apply",base,{fields:{...clearedContestFields(base,base.mode),callsign:item.callsign},
+      frequencyHz:item.frequencyHz,mode:item.mode,manualStackLoad:true}),false,false,true,true);
+  };
+  const prepareSked=(item:Partial<Sked|PlannedMove>)=>{setReminderPrefill({callsign:item.callsign,text:item.text,
+    frequencyHz:item.frequencyHz,mode:item.mode,radioID:item.radioID,note:item.note,source:item.source});setProductivityTab("Skeds");};
+  const focusField = (field: string) => {
+    focusRef.current = field;
+    if (projectionRef.current?.focus === field || busyRef.current || retiring) return;
+    void runMutation(base => mutate("contest_focus", base, { field }), false, true, true);
+  };
+  const syncManualFrequency = () => {
+    if (observedFrequencyHz !== null || fallbackFrequencyHz === null || busyRef.current || retiring) return;
+    void runMutation(base => mutate("contest_draft_apply", base, {
+      fields: fieldsRef.current, frequencyHz: fallbackFrequencyHz,
+    }), false, false, true);
+  };
+  const loadLogPage = async (offset: number, throwFailures = false, limit = logPageSize) => {
+    const active = projectionRef.current;
+    if (!active || busyRef.current || offset < 0) {
+      if (throwFailures) throw new Error(!active ? "Open a contest session before paging its log." : "The contest owner is busy.");
+      return;
+    }
+    busyRef.current = true; setBusy(true); setError("");
+    try { await refresh(active.sessionID, active, offset, ["log"], limit); }
+    catch (cause) { setError(errorMessage(cause)); if (throwFailures) throw cause; }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+
+  const detachedAvailable = !!projection && projection.workspaceGeneration === workspaceGeneration;
+  const activeSessionName = sessions.find(session => session.sessionID === projection?.sessionID)?.name || create.name.trim() || "CQ WW CW";
+  const unavailableProjection = { schemaVersion: 1, status: "unavailable" } as const;
+  const surfaceDraftRevisionRef=useRef<ContestDraftRevision|null>(null);
+  if(projection)surfaceDraftRevisionRef.current=advanceContestDraftRevision(surfaceDraftRevisionRef.current,{
+    sessionID:projection.sessionID,workspaceGeneration:projection.workspaceGeneration,draftID:projection.draftID,
+    fields,frequencyHz:operationFrequencyHz,mode:projection.mode,operator:projection.operator??setup.operator,
+    run:projection.run,reservedSerial:projection.reservedSerial??null,pluginID:projection.pluginID,
+    sourceRevision:projection.sourceRevision,referenceID:projection.referenceID,scoringContext:projection.ruleIdentity??null,
+  },projection.revision);
+  else surfaceDraftRevisionRef.current=null;
+  const surfaceDraftRevision=surfaceDraftRevisionRef.current?.revision??0;
+  const surfaceProjections = useMemo(() => {
+    const unavailable = Object.fromEntries(contestSurfacePanelIDs.map(panelID => [panelID, unavailableProjection])) as
+      Record<ContestSurfacePanelID, ContestSurfaceProjection>;
+    if (!projection || !detachedAvailable) return unavailable;
+    // Draft edits advance the authoritative revision on every admitted field
+    // change, but they do not invalidate the last session-owned log, score,
+    // matrix, statistics, or rates snapshot. Keep those committed values on
+    // screen while their revision refresh runs in the background so detached
+    // windows update in place instead of flashing through `unavailable` after
+    // every callsign character. `acceptSessionProjection` clears every lane
+    // when the session changes, so this can never carry data across contests.
+    const auxiliarySessionPrefix = `${projection.sessionID}:`;
+    const logRead = auxiliaryReads.log?.startsWith(auxiliarySessionPrefix) === true;
+    const scoreRead = auxiliaryReads.score?.startsWith(auxiliarySessionPrefix) === true;
+    const ratesRead = auxiliaryReads.rates?.startsWith(auxiliarySessionPrefix) === true;
+    const currentFields = fields;
+    const frequencyHz = operationFrequencyHz;
+    const scoredFields = projectionFields(projection);
+    const entryMultiplierCurrent = !configuredClient && frequencyHz === projection.frequencyHz &&
+      ["callsign", "other_2"].every(id => (currentFields[id] ?? "").trim().toUpperCase() === (scoredFields[id] ?? "").trim().toUpperCase());
+    const reservedSerial = projection.reservedSerial ?? null;
+    const visibleHostFields = projection.fields.filter(field => field.visible || reservedSerial !== null &&
+      field.id === projection.allocatedSerialFieldID).map(field => ({ ...field,
+      label: field.label.trim() || (field.id === "callsign" ? "Callsign" : field.id === "sent" ? "Sent report"
+        : field.id === "receive" ? "Received report" : field.id === projection.allocatedSerialFieldID ? "Sent serial" : "Exchange"),
+    }));
+    const reportFields = visibleHostFields.filter(field => field.id === "sent" || field.id === "receive");
+    const exchangeFields = visibleHostFields.filter(field => field.id !== "callsign" && field.id !== "sent" && field.id !== "receive");
+    const receivedExchangeFields = exchangeFields.filter(field => !field.readOnly);
+    const sentExchangeFields = exchangeFields.filter(field => field.readOnly);
+    const receivedZone = projection.fields.find(field => field.id === "other_2");
+    const sentZone = projection.fields.find(field => field.id === "other_1");
+    const reportsVisible = reportFields.length > 0;
+    const allocatedSerialField = reservedSerial === null ? null : projection.allocatedSerialFieldID ?? null;
+    const editedFrequencyHz = editing ? manualFrequency(editFrequencyMHz, activeSupportedBands, bandDefinitions) : null;
+    const editedReceiveFrequencyHz = editing ? correctedReceiveFrequency(editReceiveFrequencyHz) : null;
+    const editedPower = editing ? correctedPower(editPower) : null;
+    const correctedBand = editedFrequencyHz === null ? null :
+      bandDefinitions.find(definition => editedFrequencyHz >= definition.lowHz && editedFrequencyHz < definition.highHz)?.id ?? null;
+    const callContext = projection.callContext?.callsign === partialQuery ? projection.callContext : undefined;
+    const pathContext = lookupPathContext?.callsign === partialQuery ? lookupPathContext : undefined;
+    const fldigiOperatorAvailable = !fldigiReleaseBlocking && projection.fldigiTransmitAvailable === true &&
+      fldigiSnapshot?.configuration.transmit_enabled === true;
+    const digitalOperatorMode = rttyContestModeAliases.has(projection.mode);
+    const dualLanes=dualContestLanes(projection),selectedLane=dualLanes?contestLaneSnapshot(projection):null;
+    const selectedTX=Boolean(selectedLane&&laneNative?.txContext?.laneID===selectedLane.laneID&&laneNative.txContext.draftID===selectedLane.draftID&&
+      laneNative.txContext.bindingVersion===selectedLane.bindingVersion&&canonicalJSON(laneNative.txContext.binding)===canonicalJSON(selectedLane.binding));
+    const laneArmed=selectedTX&&laneNative?.cw?.armed===true;
+    const operatorOutputAvailable = !fldigiReleaseBlocking && (dualLanes?laneCapabilities?.capabilities?.supported===true&&projection.mode==="CW":projection.mode === "CW" || phoneOutputAvailable || fldigiOperatorAvailable);
+    const operatorOutputUnavailableReason = operatorOutputAvailable ? null : dualLanes?"Review exact native lane routes in Productivity desk. Physical two-lane output is not qualified; SO1V controls remain separate.":projection.mode === "SSB"
+      ? "Recorded phone output is unavailable until a Voice WAV profile folder is saved in Contest Setup."
+      : digitalOperatorMode
+        ? "fldigi macro output is unavailable. Enable fldigi macro transmit in Digital Logging Setup."
+        : "Contest function-key output is unavailable for this mode.";
+    unavailable["active-qso"] = {
+      schemaVersion: 2, status: "ready",
+      manual: {operator:projection.operator ?? "", cwSpeedWpm:dualLanes?null:projection.cwSpeedWpm ?? null,
+        cwSpeedStepWpm:Number.isInteger(setup.preferences.cwSpeedStep) && Number(setup.preferences.cwSpeedStep) >= 1 && Number(setup.preferences.cwSpeedStep) <= 10 ? Number(setup.preferences.cwSpeedStep) : 1,
+        country:pathContext?.country ?? callContext?.country ?? null, cqZone:pathContext?.cqZone ?? callContext?.cqZone ?? null,
+        ituZone:pathContext?.ituZone ?? callContext?.ituZone ?? null,
+        headingDegrees:entryPathMetrics?.headingDegrees ?? pathContext?.headingDegrees ?? callContext?.headingDegrees ?? null,
+        longPathHeadingDegrees:entryPathMetrics?.longPathHeadingDegrees ?? pathContext?.longPathHeadingDegrees ?? callContext?.longPathHeadingDegrees ?? null,
+        distanceKm:entryPathMetrics?.distanceKm ?? pathContext?.distanceKm ?? callContext?.distanceKm ?? null, qsos:projection.score.qsos,
+        multipliers:projection.score.multipliers ?? projection.score.countries + projection.score.zones, total:projection.score.total,
+        ...(projection.score.scoringComplete === false ? {scoringComplete:false} : {})},
+      session: { name: activeSessionName, ruleName: projection.pluginName ?? projection.pluginID, mode: projection.mode,
+        ...(selectedLane?{laneContext:{mode:projection.operatingLanes!.mode as "SO2V"|"SO2R",laneID:selectedLane.laneID,
+          bindingVersion:selectedLane.bindingVersion,binding:selectedLane.binding}}:{}) },
+      draft: {
+        draftID: projection.draftID, revision: surfaceDraftRevision, callsign: currentFields.callsign ?? "",
+        sentReport: currentFields.sent ?? "", receivedReport: currentFields.receive ?? "",
+        receivedFields: receivedExchangeFields.map(field => ({ id: field.id, label: field.label,
+          value: currentFields[field.id] ?? "", required: true, maximumUTF8Bytes: field.id === "other_1" ? 32 : 128,
+          enabled: field.enabled, readOnly: field.readOnly })),
+        frequencyHz, frequencyText: frequencyHz === null ? "" : String(frequencyHz),
+        frequencyError: frequencyHz === null ? "Enter a frequency on a band supported by this contest." : "",
+        band: bandLabels[String(projection.band)] ?? String(projection.band), mode: projection.mode,
+        dupe: configuredClient ? authorityClientReady&&authorityDupe?.key===`${projection.draftID}|${(currentFields.callsign??"").trim().toUpperCase()}|${frequencyHz}|${projection.mode}`
+          ? {state:authorityDupe.isDupe?"duplicate":"clear" as const,reason:authorityDupe.isDupe?"Worked in the authoritative group log.":"Clear in the authoritative group log."}
+          : {state:"unchecked" as const,reason:"Awaiting the authoritative group duplicate check."}
+          : { state: projection.duplicateChecking === false ? "unchecked" : projection.dupe ? "duplicate" : "clear", reason: projection.duplicateChecking === false
+          ? "Duplicate checking disabled." : projection.dupe ? projection.dupeExplanation ?? "Worked in this contest." : "Clear for this contest." },
+        validation: { errors: [], warnings: [...(projection.score.scoringLimitations ?? []),
+          ...(!(currentFields.callsign ?? "").trim() || projection.countryResolved
+          ? [] : ["Country is unresolved; scoring credit may be zero."])] },
+        reservedSerial,exchangeWarnings:projection.exchangeWarnings??[],
+        ...(entryMultiplierCurrent && projection.entryMultiplierStatus ? {multiplierStatus:projection.entryMultiplierStatus} : {}),
+      },
+      descriptor: {
+        enterPolicy: projection.entryPolicy?.enter ?? (setup.preferences.useESM ? "esm" : "manual"),
+        bands: configuredBands, modes: contestSurfaceModes(projection.supportedModes ?? [], projection.mode), reportsVisible,
+        reportFields: reportFields.map(field => ({ id: field.id, label: field.label, value: currentFields[field.id] ?? "",
+          required: true, maximumUTF8Bytes: 160, enabled: field.enabled, readOnly: field.readOnly })),
+        allowDuplicateCommit: projection.allowDuplicateCommit ?? false, automaticSerial: reservedSerial !== null,
+        advanceOnSpace: (projection.advanceOnSpace ?? ["callsign"]).filter(contestInputFieldID),
+        spaceNext: contestTabMap(projection.spaceNext ?? (contestInputFieldID(projection.nextField) ? {callsign:projection.nextField} : {})),
+        keyBindings: activeContestKeyBindings(setup.preferences.keyBindings),
+        sentFields: sentExchangeFields.map(field => ({ id: field.id, label: field.label,
+          value: currentFields[field.id] ?? "", required: true, maximumUTF8Bytes: 32,
+          enabled: field.enabled, readOnly: field.readOnly })),
+        serial: reservedSerial === null ? { requirement: "none", allocatedFieldID: null, reservedSerial: null }
+          : { requirement: "requiredForCommit", allocatedFieldID: allocatedSerialField, reservedSerial },
+      },
+      operator: {
+        output: dualLanes||phoneSimulationAvailable || cw.state.canonical?.provider === "test-simulation" ? "test-simulation" : "xlog-native",
+        outputAvailable: operatorOutputAvailable,
+        outputUnavailableReason: operatorOutputUnavailableReason,
+        ...(fldigiSnapshot ? {fldigi:{transmit_release_required:fldigiSnapshot.transmit_release_required === true,
+          transmit_release_uncertain:fldigiSnapshot.transmit_release_uncertain === true,
+          configuration_error:fldigiSnapshot.configuration_error?.slice(0,2048) ?? null,status:fldigiSnapshot.status.slice(0,512)}} : {}),
+        armed: fldigiReleaseBlocking || (dualLanes?laneArmed:Boolean(phoneReleaseUncertain) || phoneSimulationArmed || fldigiOperatorAvailable || projection.mode === "CW" && cw.state.armed),
+        style: projection.run ? "run" : "search-and-pounce",
+        status: fldigiSnapshot?.transmit_release_uncertain ? "uncertain" : fldigiReleaseBlocking ? "waiting" : dualLanes?laneNative?.releaseRequired?"uncertain":selectedTX&&laneNative?.cw?.pending?"waiting":laneArmed?"armed":"disarmed":phoneReleaseUncertain ? "uncertain" : phoneSimulationPending ? "waiting" : phoneOutputAvailable ? phoneSimulationArmed ? "armed" : "disarmed"
+          : fldigiOperatorAvailable ? "armed" : projection.mode === "CW" && cw.state.pending ? "waiting"
+            : projection.mode === "CW" && cw.state.error ? "uncertain" : projection.mode === "CW" && cw.state.armed ? "armed" : "disarmed",
+        pending: fldigiStopPending ? "send" : dualLanes?selectedTX&&laneNative?.cw?.pending?"send":null:phoneSimulationPending || projection.mode === "CW" && cw.state.pending ? "send" : null,
+        focusedField: contestInputFieldID(projection.focus) ? projection.focus : null,
+        tabNext: contestTabMap(projection.tabNext), tabPrevious: contestTabMap(projection.tabPrevious),
+        functionKeys: projection.functionKeys.map(item => ({ key: item.id as ContestFunctionKey,
+          macro: item.label ?? item.id, highlighted: item.highlighted })),
+        autoCQ: { active: !dualLanes&&autoCQDeadlineMs !== null, delaySeconds: autoCQDelaySeconds,
+          remainingMs: autoCQDeadlineMs === null ? null : Math.max(0, autoCQDeadlineMs - autoCQNowMs) },
+        readiness: { canSendCQ: !fldigiReleaseBlocking && (dualLanes?laneArmed:!phoneReleaseBlocking && (fldigiOperatorAvailable || (phoneOutputAvailable ? phoneCanSend : projection.mode === "CW" && cw.state.armed))),
+          canSendCall: !fldigiReleaseBlocking && (dualLanes?laneArmed:!phoneReleaseBlocking && (fldigiOperatorAvailable || (phoneOutputAvailable ? phoneCanSend : projection.mode === "CW" && cw.state.armed))),
+          canSendDuplicate: !fldigiReleaseBlocking && (dualLanes?laneArmed:!phoneReleaseBlocking && (fldigiOperatorAvailable || (phoneOutputAvailable ? phoneCanSend : projection.mode === "CW" && cw.state.armed))),
+          canReserveCall: false, canReserveCommit: false, canCommit: true },
+        trace: !dualLanes&&phoneOutputAvailable ? phoneSimulationTrace : [],
+      },
+      busy: busy || retiring || Boolean(selectedLane&&laneTransitionBusy[selectedLane.laneID]),
+      dirty: !sameFields(currentFields, projectionFields(projection)) || frequencyHz !== projection.frequencyHz,
+      uncertain: false,
+    };
+    unavailable["qrz-details"] = unavailable["active-qso"];
+    const partialRows = partial?.sessionID===projection.sessionID && partial.revision===projection.revision && partial.query===partialQuery
+      ? partial.rows : [];
+    const configuredPluginColumns = not1mmLogColumns(projection.columns);
+    const sourcePluginColumns = configuredPluginColumns.length ? configuredPluginColumns
+      : projection.pluginID === "cq_ww_ssb" ? cqWwSsbLogColumns : [];
+    const pluginColumns = contestLogColumnLabels(sourcePluginColumns, projection.pluginID);
+    unavailable.logbook = {
+      schemaVersion: 1, status: "ready", sessionRevision: projection.revision,
+      canExportCabrillo: projection.exportFormats?.includes("cabrillo")??true,
+      canExportAdif: projection.exportFormats?.includes("adif")??true,
+      canExportEdi: projection.exportFormats?.includes("edi")??false,
+      page: { offset: logOffset, limit: logPageSize, total: logTotal, rows: logRows(rows, projection.pluginID, bandLabels) },
+      searchQuery:logQuery,focusedQsoID:logFocus,
+      ...(sourcePluginColumns.length ? { exchangeLayout: "plugin" as const, pluginColumns,
+        pluginRows:not1mmLogRows(rows,sourcePluginColumns,projection.fields,projection.pluginID),
+        pluginPartialRows:not1mmLogRows(partialRows,sourcePluginColumns,projection.fields,projection.pluginID) }
+        : { manualRows:manualRows(rows), partialRows:manualRows(partialRows) }),
+      editing: editing ? {
+        ...(projection.pluginID === "cq_ww_ssb" ? { editorProfile: "cq_ww_ssb" as const } : {}),
+        qsoID: String(editing.ID ?? ""), workedAt: editTimestamp, operator: editOperator, callsign: editCall,
+        name: editName, qth: editQTH, comment: editComment, reportsVisible,
+        details: { ...logEditDetails(editing), ...(projection.pluginID === "cq_ww_ssb" ?
+          { receivedNumber: editZone, zone: editZone, power: editPower } : {}) },
+        band: correctedBand ?? bandLabels[String(editing.Band)] ?? String(editing.Band ?? ""), mode: String(editing.Mode ?? "CW"),
+        sentReport: editSent, receivedReport: editReceived,
+        entryFields: visibleHostFields.filter(field => field.id !== "callsign").map(field => ({ id:field.id,label:field.label,
+          value:field.id==="sent"?editSent:field.id==="receive"?editReceived:field.id==="other_1"?editSentExchange:editZone,
+          required:true,maximumUTF8Bytes:field.id==="other_1"?32:field.id==="other_2"?128:160,
+          enabled:field.enabled,readOnly:field.readOnly })),
+        receivedFields: [
+          { id: "other_1", label: sentZone?.label || "Sent exchange", value: editSentExchange, required: true, maximumUTF8Bytes: 32 },
+          { id: "other_2", label: receivedZone?.label || "Received exchange", value: editZone, required: true, maximumUTF8Bytes: 128 },
+        ],
+        frequencyHz: editedFrequencyHz, editFrequencyText: editedFrequencyHz === null ? "" : String(editedFrequencyHz),
+        frequencyError: editedFrequencyHz === null ? "Enter a frequency on a band supported by this contest." : "",
+        receiveFrequencyHz: editedReceiveFrequencyHz, editReceiveFrequencyText: editReceiveFrequencyHz,
+        receiveFrequencyError: editedReceiveFrequencyHz === null ? "Enter the RX frequency in Hz using digits only." : "",
+        editPower, powerError: editedPower === null ? "Enter transmit power as up to 8 digits, or leave it blank." : "",
+        correctionReason, confirmDelete, deletionReason,
+      } : null,
+      busy: busy || retiring || !logRead,
+    };
+    unavailable["callsign-intelligence"] = {
+      schemaVersion: 1, status: "ready", draftID: projection.draftID, draftRevision: surfaceDraftRevision,
+      inputCallsign: currentFields.callsign ?? "",
+      loggedCalls:loggedCandidates.map(candidate => candidate.callsign),
+      clusterCalls:clusterCandidates.map(candidate => candidate.callsign),
+      loggedCandidates, clusterCandidates,
+      scp: { source: scpSurface?.source ?? null,
+        candidates: scpSurface?.query===(currentFields.callsign??"").trim().toUpperCase()?scpSurface.candidates:[],
+        availability: scpSurface?.availability ?? "not_imported", notice: scpSurface?.notice ?? null, error: scpSurface?.error ?? null },
+      history: { source: historyCandidate ? "Imported Call History" : null,
+        rows: historyCandidate ? [historyCandidate] : [] },
+      busy: !!scpSurface?.busy,
+    };
+    const clusterSnapshot=cluster?.snapshot as Data|undefined;
+    const connectedClusters=Number.isSafeInteger(clusterSnapshot?.connectedClusters)&&Number(clusterSnapshot?.connectedClusters)>=0
+      ? Number(clusterSnapshot?.connectedClusters):0;
+    const loadedSpots=Number.isSafeInteger(clusterSnapshot?.loadedSpots)&&Number(clusterSnapshot?.loadedSpots)>=0
+      ? Number(clusterSnapshot?.loadedSpots):sharedSpots.length;
+    const configuredClusters=(Array.isArray(cluster?.configuration?.servers)?cluster.configuration.servers:[]).flatMap((server:Data)=>
+      typeof server.id==="string"&&server.id.trim()&&new TextEncoder().encode(server.id).length<=128&&typeof server.name==="string"&&server.name.trim()&&new TextEncoder().encode(server.name).length<=160&&typeof server.enabled==="boolean"
+        ? [{serverID:server.id,serverName:server.name,enabled:server.enabled}]:[]).slice(0,32);
+    const connections=(Array.isArray(clusterSnapshot?.connections)?clusterSnapshot.connections:[]).flatMap((connection:Data)=>
+      typeof connection.serverID==="string"&&connection.serverID.trim()&&new TextEncoder().encode(connection.serverID).length<=128&&
+      typeof connection.serverName==="string"&&connection.serverName.trim()&&new TextEncoder().encode(connection.serverName).length<=160&&
+      typeof connection.phase==="string"&&connection.phase.trim()&&new TextEncoder().encode(connection.phase).length<=32&&
+      (connection.error==null||typeof connection.error==="string"&&new TextEncoder().encode(connection.error).length<=512)
+        ? [{serverID:connection.serverID,serverName:connection.serverName,phase:connection.phase,error:connection.error??null}]:[]).slice(0,32);
+    const selectedCandidate=spotCursorRef.current.context===spotSelectionContext?spotCursorRef.current.spotID:
+      selectedSpotId==null?null:String(selectedSpotId);
+    const selectedSpotID=selectedCandidate!==null&&visibleWorkflowSpots.some(spot=>spot.id===selectedCandidate)?selectedCandidate:null;
+    const classifiedSurfaceSpot=(spot:ContestSurfaceSpot)=>{const candidate=contestSpotPreviewCandidate(spot),
+      cached=spotPointPreview.identity===spotPointIdentity?spotPointPreview.rows.get(spot.id):undefined,
+      preview=candidate&&cached?.inputSignature===candidate.inputSignature?cached:undefined;return{...spot,
+      mode:canonicalContestSurfaceMode(spot.mode)??spot.mode,contestPoints:preview?.points??spot.contestPoints??null,
+      contestDupe:preview?.dupe??spot.contestDupe??null,contestMultiplierCount:preview?.multiplierCount??spot.contestMultiplierCount??null,
+      contestCountryMultiplier:preview?.countryMultiplier??spot.contestCountryMultiplier??null,
+      contestZoneMultiplier:preview?.zoneMultiplier??spot.contestZoneMultiplier??null};};
+    const surfaceSpots=visibleWorkflowSpots.map(classifiedSurfaceSpot);
+    for(const panelID of ["band-maps","world-map","dx-cluster"] as const){
+      const entrySpot=panelID==="world-map"?currentEntryMapSpot:null,
+        filteredSpots=panelID!=="dx-cluster"&&!(panelID==="band-maps"&&qtcOpportunities)&&!effectiveSpotWorkflow.showWorked
+          ?surfaceSpots.filter(spot=>spot.contestDupe!==true):surfaceSpots,
+        panelSpots=entrySpot&&!filteredSpots.some(spot=>spot.id===entrySpot.id)?[...filteredSpots,classifiedSurfaceSpot(entrySpot)]:filteredSpots;
+      unavailable[panelID]={schemaVersion:2,status:"ready",draftID:projection.draftID,draftRevision:surfaceDraftRevision,
+        radioFrequencyHz:observedFrequencyHz??radioFrequencyHz??null,connectedClusters,loadedSpots,
+        selectedSpotID:entrySpot?.id??(panelID==="world-map"&&/^[A-Z0-9/]{3,32}$/.test(partialQuery)?null:selectedSpotID),configuredClusters,connections,
+        contestSessionID:projection.sessionID,supportedBands:configuredBands,allowedModeGroups,
+        bandSegments:encodeContestBandPlan(contestBandPlan),markedOnly:effectiveSpotWorkflow.markedOnly,
+        showWorked:effectiveSpotWorkflow.showWorked,
+        ...(qtcOpportunities?{qtcOpportunities}:{}),
+        spots:panelSpots,busy:busy||retiring};
+    }
+    unavailable["station-control"] = { schemaVersion: 1, status: "ready",
+      radioFrequencyHz: selectedRadioFrequencyHz, contestFrequencyHz: frequencyHz,
+      band: bandLabels[String(projection.band)] ?? String(projection.band), mode: projection.mode, busy: busy || retiring };
+    if (statistics?.sessionID === projection.sessionID) {
+      unavailable.propagation = { schemaVersion: 3, status: "ready", ...(statistics.layout==="cq_ww"?{layout:"cq_ww" as const}:{}),
+        score: scoreView, rows: statistics.rows, total: statistics.total, busy: busy || retiring } as ContestSurfaceProjection;
+    }
+    else if (statistics === undefined) unavailable.propagation = {
+      schemaVersion: 1, status: "ready", score: scoreView, busy: busy || retiring,
+    };
+    if (ratesRead && rates) unavailable.monitor = { schemaVersion: 1, status: "ready",
+      lastHourQsoPerHour: rates.lastHourQsoPerHour ?? null, last10QsoPerHour: rates.last10QsoPerHour ?? null,
+      last100QsoPerHour: rates.last100QsoPerHour ?? null, sinceHourUTC: Number(rates.sinceHourUTC),
+      sinceHourQso: Number(rates.sinceHourQso), runQso: Number(rates.runQso),
+      searchAndPounceQso: Number(rates.searchAndPounceQso), hourRunQso: Number(rates.hourRunQso),
+      hourSearchAndPounceQso: Number(rates.hourSearchAndPounceQso),
+      hourly:(rates.hourly??[]).map((item:Data)=>({hourUTC:new Date(item.hourUTC).toISOString(),qsos:item.qsos})),
+      lastQsoAt:rates.lastQsoAt?new Date(rates.lastQsoAt).toISOString():null,
+      ...contestSchedule(setup.pluginID,setup.settings,rates.lastQsoAt), busy: busy || retiring };
+    const rtcService=setup.preferences.rtcURL==="https://contestonlinescore.com/post/"?"contestonlinescore":"hamscore";
+    const rtcOutcome=rtcStatus?.last_outcome??"Score reporting is disabled.";
+    const reportState=rtcReportState(rtcStatus);
+    unavailable["score-reporting"] = { schemaVersion: 1, status: "ready", score: scoreView,
+      intervalMinutes: rtcStatus?.interval_minutes??Math.max(1,Math.min(60,Number(setup.preferences.rtcIntervalMinutes)||2)),
+      reportingEnabled: rtcStatus?.enabled===true, availability: contestingTest||score?.scoringComplete===false?"unavailable":"available",
+      reason: score?.scoringComplete===false?"Score reporting is unavailable while this score is partial.":"HTTPS RTC posting is separate from local score display and N1MM UDP score packets.", service:rtcService,
+      username:String(setup.preferences.rtcUsername??""),credentialSaved:rtcCredentialSaved,reportState,lastOutcome:rtcOutcome,
+      nextAttempt:rtcStatus?.next_attempt??null,
+      services: [
+        { id: "hamscore", name: "Real Time Contest Server", url: "https://hamscore.com/postxml/", transportSecurity: "https" },
+        { id: "contestonlinescore", name: "Contest Online ScoreBoard", url: "https://contestonlinescore.com/post/", transportSecurity: "https" },
+        { id: "contest-run", name: "Live Contest Score", url: "http://contest.run", transportSecurity: "legacy-http" },
+      ], busy: busy || retiring };
+    unavailable.messages = { schemaVersion: 1, status: "ready", messages: [
+      ...(error ? [{ kind:"error" as const, text:error }] : []),
+      ...(catalogLoadError ? [{ kind:"error" as const, text:catalogLoadError }] : []),
+      ...(notice ? [{ kind:"notice" as const, text:notice }] : []),
+      ...(operationFrequencyHz === null ? [{ kind:"error" as const, text:"Enter a frequency on a band supported by this contest." }] : []),
+      ...(projection.dupe ? [{ kind:"notice" as const, text:projection.dupeExplanation ?? "Duplicate: worked on this band." }] : []),
+      ...((currentFields.callsign ?? "").trim() && !projection.countryResolved
+        ? [{ kind:"notice" as const, text:"Country is unresolved; scoring credit may be zero." }] : []),
+      ...(scpSurface?.error ? [{ kind:"error" as const, text:scpSurface.error }] : []),
+      ...(scpSurface?.notice ? [{ kind:"notice" as const, text:scpSurface.notice }] : []),
+      ...connections.filter(connection => connection.error).map(connection => ({kind:"error" as const,
+        text:`${connection.serverName}: ${connection.error}`})),
+    ], busy:busy || retiring };
+    for(const [panel,dimension] of [["awards","countries"],["chaser-dx","zones"]] as const){
+      const applicable=projection.multiplierViewStatus?.[dimension]!=="not-applicable";
+      unavailable[panel]={schemaVersion:1,status:"unavailable",reason:applicable
+        ?`The ${dimension} matrix is not yet implemented for this contest. See Statistics for plugin totals.`
+        :`This contest does not use ${dimension} as multipliers. See Multipliers for its scoring dimensions.`};
+    }
+    const familyViews=Array.isArray(matrices.multiplierViews)?matrices.multiplierViews as Data[]:[];
+    if(scoreRead&&familyViews.length&&(!projection.matrixTrackers?.includes("countries")||projection.pluginID==="cq_ww_rtty")){
+      const supported=familyViews.every(view=>view.status==="supported"),scopes=[...new Set(familyViews.flatMap(view=>view.rows.map((row:Data)=>String(row.scope))))] as string[];
+      if(supported&&scopes.length<=32&&scopes.every(validLegacyMultiplierScope)){
+        const rows=new Map<string,Record<string,number>>();
+        for(const view of familyViews)for(const row of view.rows){const label=`${view.label}: ${row.value}`,counts=rows.get(label)??Object.fromEntries(scopes.map(scope=>[scope,0]));
+          counts[row.scope]=Number(row.qsos);rows.set(label,counts);}
+        if(!scopes.length)scopes.push("Contest");
+        unavailable.awards={schemaVersion:1,status:"ready",title:"Worked multipliers · plugin scope",bands:scopes,
+          rows:[...rows].map(([label,counts])=>({label,counts,total:Object.values(counts).filter(count=>count>0).length})),
+          total:familyViews.reduce((sum,view)=>sum+Number(view.total),0),busy:busy||retiring};
+      }else unavailable.awards={schemaVersion:1,status:"unavailable",reason:"Worked multiplier identities do not reconcile with the plugin total, or their full scoring scopes exceed the supported view bounds. Statistics retains the authoritative total."};
+    }
+    // An empty worker matrix is a valid tracker with no worked multipliers yet.
+    // Missing matrices remain unavailable for plugins that do not expose them.
+    if (scoreRead && projection.pluginID!=="cq_ww_rtty" && projection.matrixTrackers?.includes("countries") && Array.isArray(matrices.countries)) {
+      unavailable.awards = multiplierMatrix("DXCC", "dxcc", matrices.countries, busy || retiring,
+        { dxcc: callContext?.country ?? null, cqZone: callContext?.cqZone ?? null, ituZone: callContext?.ituZone ?? null }, null,
+        configuredBands, bandLabels[String(projection.band)] ?? String(projection.band ?? ""),
+        {universe:matrices.countryUniverse??[],spots:surfaceSpots,draftID:projection.draftID,draftRevision:surfaceDraftRevision});
+    }
+    if (scoreRead && projection.matrixTrackers?.includes("zones") && Array.isArray(matrices.zones)) {
+      const zoneLabel = receivedZone?.label.toUpperCase() ?? "";
+      const zoneSystem = zoneLabel.includes("ITU") || zoneLabel.includes("IARU") ? "itu" as const : "cq" as const;
+      const receivedZoneText=String(receivedZone?currentFields[receivedZone.id]??receivedZone.value??"":"").trim(),
+        parsedReceivedZone=/^\d+$/.test(receivedZoneText)?Number(receivedZoneText):null,
+        effectiveReceivedZone=parsedReceivedZone!==null&&parsedReceivedZone>=1&&parsedReceivedZone<=(zoneSystem==="cq"?40:90)
+          ?parsedReceivedZone:null;
+      unavailable["chaser-dx"] = multiplierMatrix(zoneSystem === "itu" ? "ITU Zones" : "CQ Zones", "zone", matrices.zones, busy || retiring,
+        { dxcc: callContext?.country ?? null,
+          cqZone:zoneSystem==="cq"?effectiveReceivedZone??callContext?.cqZone??null:callContext?.cqZone??null,
+          ituZone:zoneSystem==="itu"?effectiveReceivedZone??callContext?.ituZone??null:callContext?.ituZone??null }, zoneSystem,
+        configuredBands, bandLabels[String(projection.band)] ?? String(projection.band ?? ""),
+        {universe:matrices.countryUniverse??[],spots:surfaceSpots,draftID:projection.draftID,draftRevision:surfaceDraftRevision});
+    }
+    return unavailable;
+  }, [projection, detachedAvailable, activeSessionName, fields, operationFrequencyHz, rows, logOffset, logTotal, logQuery, logFocus, logPageSize, editing,
+    editCall, editTimestamp, editFrequencyMHz, editReceiveFrequencyHz, editPower, editOperator, editSent, editReceived, editSentExchange, editZone, editName, editQTH, editComment,
+    correctionReason, confirmDelete, deletionReason,
+    busy, retiring, scpSurface, cw.state.armed, cw.state.pending, cw.state.error, phoneSimulationAvailable, phoneOutputAvailable, phoneSimulationArmed,
+    phoneSimulationPending, phoneReleaseUncertain, phoneSimulationTrace, rates, matrices, statistics, partial, partialQuery, historyCandidate, spots, cluster, configuredBands,
+    bandDefinitions, bandLabels, digitalSnapshot,fldigiSnapshot,fldigiStopPending,fldigiReleaseBlocking,rtcStatus,rtcCredentialSaved,lookupPathContext,
+    setup.settings.SentExchange, setup.settings.StartDate, setup.settings.EndDate, setup.pluginID, setup.preferences.keyBindings, autoCQDeadlineMs, autoCQNowMs, autoCQDelaySeconds, selectedRadioFrequencyHz,observedFrequencyHz,
+    sharedSpots,visibleWorkflowSpots,qtcOpportunities,currentEntryMapSpot,entryPathMetrics,effectiveSpotWorkflow.markedOnly,effectiveSpotWorkflow.showWorked,
+    spotPointPreview,spotPointIdentity,selectedSpotId,configuredClient,authorityClientReady,authorityDupe,
+    auxiliaryReads.log,auxiliaryReads.score,auxiliaryReads.rates,error,catalogLoadError,notice,surfaceDraftRevision,laneCapabilities,laneNative,laneTransitionBusy]);
+
+  const surfaceContext = detachedAvailable && projection ? {
+    operatingContext, sessionID: projection.sessionID, workspaceGeneration: projection.workspaceGeneration,
+  } : null;
+  useEffect(()=>{
+    if(!authorityClientReady||!surfaceContext||!projection){setAuthorityDupe(null);return;}
+    const call=(fields.callsign??"").trim().toUpperCase(),frequencyHz=operationFrequencyHz;
+    if(!/^[A-Z0-9/]{3,32}$/.test(call)||frequencyHz===null){setAuthorityDupe(null);return;}
+    const key=`${projection.draftID}|${call}|${frequencyHz}|${projection.mode}`,requestID=crypto.randomUUID();let cancelled=false;
+    const params={call,frequencyHz,mode:projection.mode,timestamp:new Date().toISOString().slice(0,19).replace("T"," ")};
+    void requestContestGroupAuthority(surfaceContext,"dupeInquiry",params,requestID).then(value=>{
+      if(!cancelled&&projectionRef.current?.draftID===projection.draftID)setAuthorityDupe({key,isDupe:value.isDupe===true});
+    }).catch(()=>{if(!cancelled)setAuthorityDupe(null);});
+    return()=>{cancelled=true;};
+  },[authorityClientReady,surfaceContext?.operatingContext,surfaceContext?.sessionID,surfaceContext?.workspaceGeneration,
+    projection?.draftID,projection?.mode,fields.callsign,operationFrequencyHz]);
+  const draftOutputBlockedRef=useRef(false);
+  passStationStateRef.current={retiring,configuredClient,authorityClientReady};
+  draftOutputBlockedRef.current=Boolean(autoCQActiveRef.current || cw.state.armed || cw.state.pending || cw.state.error || phoneReleaseBlocking || phoneSimulationArmed || phoneSimulationPending);
+  const handleSurfaceAction = async (action: ContestSurfaceActionEnvelope) => {
+    const active = projectionRef.current;
+    if (!active || !detachedAvailable || action.sessionID !== active.sessionID ||
+        action.workspaceGeneration !== active.workspaceGeneration || action.operatingContext !== operatingContext)
+      throw new Error("This detached panel no longer belongs to the active contest session.");
+    if (action.action === "entry_operator_key" && action.params.key === "Escape") {
+      if(fldigiReleaseBlocking){await stopAutoCQ(true);return;}
+      if(dualContestLanes(active)){acceptLaneNative(await requestContestLaneOutput(nativeLaneContext(captureContestLaneScope(active)),"stop"));return;}
+      await stopAutoCQ(true); return;
+    }
+    if(fldigiReleaseBlocking&&["entry_operator_arm","entry_send_cw_text","entry_auto_cq"].includes(action.action))
+      throw Error("Release fldigi with Stop before requesting another transmitter.");
+    if((active.practice||practiceTransitionRef.current)&&["entry_operator_arm","entry_auto_cq","entry_send_cw_text","entry_set_cw_speed","entry_rotor_turn","entry_rotor_stop"].includes(action.action))
+      throw new Error("Practice sessions have native output and station actions disabled.");
+    if (busyRef.current || retiring) throw new Error("The contest owner is busy.");
+    if (action.action.startsWith("entry_") || action.action.startsWith("assistance_") || action.action.startsWith("spot_")) {
+      const rebasablePresentationAction = ["entry_set_text","entry_set_exchange","entry_set_frequency_text","entry_set_band","entry_set_mode",
+        "assistance_query","assistance_download","assistance_refresh","spot_set_marked_only","spot_set_show_worked"].includes(action.action);
+      if (!("draftID" in action.params) || action.params.draftID !== active.draftID ||
+          !rebasablePresentationAction && action.params.expectedDraftRevision !== surfaceDraftRevisionRef.current?.revision)
+        throw new Error("The contest entry changed before this action reached the owner.");
+    }
+    const persistFields = async (fieldID: string, value: string) => {
+      if(dualContestLanes(active)){
+        const scope=captureContestLaneScope(active);onOperatingLaneAction({...scope,kind:"field-change",fieldID,value});
+        await enqueueLane(scope,async()=>{});return;
+      }
+      typedFieldsRef.current.fields.add(fieldID);
+      if (fieldID === "callsign" && autoCQActiveRef.current) await stopAutoCQ();
+      if(fieldID==="callsign")recordManualHeardCall(value);
+      const next = { ...fieldsRef.current, [fieldID]: value };
+      fieldsRef.current = next; setFields(next); editVersionRef.current += 1;
+      await runMutation(base => mutate("contest_draft_apply", base, { fields: next,
+        frequencyHz: operationFrequencyHz ?? base.frequencyHz }), false, false, false, true);
+    };
+    const requireEditing = (qsoID: string) => {
+      if (!editing || String(editing.ID ?? "") !== qsoID) throw new Error("Open this contact in the shared log editor first.");
+    };
+    const currentSpot=()=>{
+      const query=(fieldsRef.current.callsign??"").trim().toUpperCase();
+      const selected=spotCursorRef.current.context===spotSelectionContext?spotCursorRef.current.spotID:
+        selectedSpotId==null?null:String(selectedSpotId);
+      const selectedSpot=selected===null?null:visibleWorkflowSpots.find(spot=>spot.id===selected)??null;
+      if(selectedSpot)return selectedSpot;
+      if(!query)return null;
+      const exact=visibleWorkflowSpots.filter(spot=>spot.callsign===query);
+      if(exact.length)return exact.length===1?exact[0]:null;
+      const partial=visibleWorkflowSpots.filter(spot=>spot.callsign.includes(query));
+      return partial.length===1?partial[0]:null;
+    };
+    const workflowBase=(current:SpotWorkflow)=>sameSpotWorkflowScope(current,spotWorkflowScope)?current:effectiveSpotWorkflow;
+    switch (action.action) {
+      case "spot_select": {
+        const spot=visibleWorkflowSpots.find(candidate=>candidate.id===action.params.spotID);
+        if(!spot)throw new Error("That shared spot is no longer available.");
+        await chooseSpot(spot, true); return;
+      }
+      case "spot_qtc_review": {
+        const spot=visibleWorkflowSpots.find(candidate=>candidate.id===action.params.spotID);
+        if(!spot)throw Error("That shared QTC counterpart report is no longer available.");
+        openQTCOpportunity(spot);return;
+      }
+      case "spot_confirm":
+      case "spot_delete":
+      case "spot_set_marked": {
+        const spot=allWorkflowSpots.find(candidate=>candidate.id===action.params.spotID);
+        if(!spot)throw new Error("That shared spot is no longer available.");
+        setSpotWorkflow(current=>updateContestSpotWorkflow(workflowBase(current),allWorkflowSpots,spot.id,
+          action.action==="spot_confirm"?"confirm":action.action==="spot_delete"?"delete":"mark",
+          action.action==="spot_set_marked"?action.params.marked:false));
+        if(action.action==="spot_delete"&&spotCursorRef.current.spotID===spot.id)
+          spotCursorRef.current={...spotCursorRef.current,context:spotSelectionContext,spotID:null};
+        return;
+      }
+      case "spot_set_marked_only":
+        setSpotWorkflow(current=>({...workflowBase(current),markedOnly:action.params.markedOnly}));return;
+      case "spot_set_show_worked":
+        setSpotWorkflow(current=>({...workflowBase(current),showWorked:action.params.showWorked}));return;
+      case "entry_set_text": {
+        const fieldID = { callsign: "callsign", sentReport: "sent", receivedReport: "receive" }[action.params.field];
+        await persistFields(fieldID, action.params.field === "callsign" ? action.params.value.toUpperCase() : action.params.value); return;
+      }
+      case "entry_group_pass": {
+        const context={operatingContext,sessionID:active.sessionID,workspaceGeneration:active.workspaceGeneration};
+        const params=action.params,inputVersion=editVersionRef.current;
+        const scope=dualContestLanes(active)?captureContestLaneScope(active,params.targetLaneID):null;
+        const binding=scope?contestLaneSnapshot(active,scope.laneID).binding:null;
+        if(scope ? active.operatingLanes!.keyboardLaneID!==scope.laneID||params.bindingVersion!==scope.bindingVersion||
+            params.connectionGeneration!==scope.bindingGeneration||params.draftID!==scope.draftID :
+            params.targetLaneID!=="laneA"||params.bindingVersion!==null||params.connectionGeneration!==null)
+          throw Error("The directed pass addressed lane or receiver binding changed; review it again.");
+        const laneVersion=scope?laneBuffer(scope).version:null;
+        const current=()=>{
+          const latest=projectionRef.current;
+          if(!latest||latest.sessionID!==active.sessionID||latest.workspaceGeneration!==active.workspaceGeneration||passStationStateRef.current.retiring||
+             passStationStateRef.current.configuredClient&&!passStationStateRef.current.authorityClientReady||
+             latest.draftID!==params.draftID||surfaceDraftRevisionRef.current?.revision!==params.expectedDraftRevision||
+             editVersionRef.current!==inputVersion)return false;
+          if(scope){try{assertContestLaneScope(latest,scope);}catch{return false;}
+            if(latest.operatingLanes?.keyboardLaneID!==scope.laneID||laneBuffer(scope).version!==laneVersion)return false;}
+          return true;
+        };
+        if(!current())throw Error("Contest Entry changed before the pass could be reviewed.");
+        let singleTune:CapturedContestTune|null=null;
+        if(params.operation==="tune"&&!scope){
+          assertStationAction();if(contestingTest)throw Error("Directed pass tuning is disabled in Contesting Test.");
+          if(!captureStationTune)throw Error("An exact observed radio binding is unavailable for this directed pass; refresh the station owner.");
+          singleTune=await captureStationTune();
+          if(!current())throw Error("The directed pass draft changed during original radio capture.");
+        }
+        const proposal=await readDirectedPass(context,params.messageID,params.messageVersion);
+        if(proposal.laneID!==params.targetLaneID||!current())throw Error("The addressed pass lane or draft changed during authority readback.");
+        const frequencyHz=contestFrequency(proposal.frequencyHz,active.supportedBands??activeSupportedBands,bandDefinitions);
+        const admittedMode=(active.supportedModes??[active.mode]).find(mode=>canonicalContestSurfaceMode(mode)===canonicalContestSurfaceMode(proposal.mode));
+        if(frequencyHz===null||!admittedMode)throw Error("The pass frequency or mode is unavailable in this contest.");
+        if(params.operation!=="tune"&&draftOutputBlockedRef.current)throw Error("Disarm contest output and finish its pending operation before loading a directed pass.");
+        const captured={operatingContext,sessionID:active.sessionID,workspaceGeneration:active.workspaceGeneration,
+          draftID:params.draftID,draftRevision:params.expectedDraftRevision,laneID:params.targetLaneID,
+          bindingVersion:params.bindingVersion,connectionGeneration:params.connectionGeneration,binding,stationBinding:singleTune?.binding??null,
+          messageID:proposal.id,messageVersion:proposal.version,reviewedUTC:params.reviewedUTC,operation:params.operation};
+        const loadFromStack=async(park:boolean)=>{
+          if(!current())throw Error("The original pass draft changed before loading.");
+          assertNoPendingStack(scope??undefined);
+          const key=callStackStorageKey(stackDraft());
+          let controller=stackControllerRef.current;
+          if(!controller||callStackStorageKey(controller.snapshot())!==key){
+            flushUnfinishedEditors();setManager(false);setProductivityOpen(true);setProductivityTab("Entry & stack");
+            controller=await new Promise<ContestCallStack>((resolve,reject)=>{
+              const waiter={key,resolve,reject,timer:0};
+              waiter.timer=window.setTimeout(()=>{stackControllerWaitersRef.current.delete(waiter);reject(new Error("Call Stack did not become available; Entry and the pass were retained."));},5000);
+              stackControllerWaitersRef.current.add(waiter);
+            });
+          }
+          if(!current()||busyRef.current||draftOutputBlockedRef.current)throw Error("The original directed pass context changed while opening Call Stack.");
+          const itemID=controller.add(proposal.call);
+          passStackAdmissionRef.current={sessionID:active.sessionID,workspaceGeneration:active.workspaceGeneration,draftID:params.draftID};
+          try{await controller.load(itemID,park?"park":undefined);}
+          finally{passStackAdmissionRef.current=null;}
+        };
+        await executeDirectedPass(proposal,action.requestID,params.operation,captured,{
+          context,isCurrent:current,occupied:()=>occupiedStackDraft(stackDraft()),
+          load:()=>loadFromStack(false),parkAndLoad:()=>loadFromStack(true),
+          tune:async()=>{
+            assertStationAction();assertNoPendingStack(scope??undefined);
+            if(contestingTest)throw Error("Directed pass tuning is disabled in Contesting Test.");
+            if(scope){await enqueueLane(scope,async base=>{
+              if(!current())throw Error("The directed pass lane changed before native tune admission.");
+              const blocked=contestLaneTuningBlockReason(contestLaneSnapshot(base,scope.laneID),frequencyHz);if(blocked)throw Error(blocked);
+              const target=nativeLaneContext(scope);await bindNativeLane(target);
+              if(!current())throw Error("The directed pass lane changed before the tune request.");
+              acceptLaneNative(await requestContestLaneOutput(target,"tune",{frequencyHz,mode:admittedMode}));
+            },false);}
+            else{
+              if(busyRef.current||!current())throw Error("The directed pass station context changed before tuning.");
+              if(!singleTune)throw Error("The original directed pass radio binding is unavailable.");
+              await singleTune.tune(frequencyHz,admittedMode);
+            }
+          },
+        });
+        setNotice(params.operation==="tune"?"Directed pass tune accepted by the station owner; review observed frequency separately.":
+          params.operation==="park"?"Original entry parked and directed pass loaded. Tune remains a separate action.":"Directed pass loaded. Tune remains a separate action.");
+        return;
+      }
+      case "entry_set_exchange":
+        if (!active.fields.some(field => field.id === action.params.fieldID && field.visible && field.enabled && !field.readOnly))
+          throw new Error("This contest entry field is not editable here.");
+        await persistFields(action.params.fieldID, action.params.value.toUpperCase()); return;
+      case "entry_set_frequency_text": {
+        const frequencyHz = /^\d+$/.test(action.params.value) ? contestFrequency(Number(action.params.value), activeSupportedBands, bandDefinitions) : null;
+        if (frequencyHz === null) throw new Error("Enter a frequency in Hz on a band supported by this contest.");
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);await enqueueLane(scope,async base=>{
+            const buffer=laneBuffer(scope);buffer.frequencyText=String(frequencyHz);
+            if(action.params.callsignCommand){buffer.fields=clearedContestFields(base,base.mode);buffer.heardFieldIDs=[];}
+            admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields,frequencyHz}),scope,structuredClone(buffer));
+            if(action.params.callsignCommand){const context=nativeLaneContext(scope);await bindNativeLane(context);acceptLaneNative(await requestContestLaneOutput(context,"tune",{frequencyHz,mode:base.mode}));}
+          });return;
+        }
+        if (observedFrequencyHz !== null && !action.params.callsignCommand)
+          throw new Error("Frequency follows the selected xLog radio and cannot be edited here.");
+        const nextFields = action.params.callsignCommand ? clearedContestFields(active, active.mode) : fieldsRef.current;
+        const next = await runMutation(async base => {
+          if (observedFrequencyHz !== null) {
+            const intent:PendingRadioTune={sessionID:base.sessionID,sourceHz:observedFrequencyHz,targetHz:frequencyHz};
+            pendingRadioTuneRef.current=intent;
+            try{await stationTune(frequencyHz,base.mode);finishRadioTune(intent);}
+            catch(cause){cancelRadioTune(intent);throw cause;}
+          }
+          return mutate("contest_draft_apply", base, { fields: nextFields, frequencyHz });
+        }, false, false, false, true);
+        if (next) setManualFrequencyMHz((frequencyHz / 1_000_000).toFixed(6));
+        return;
+      }
+      case "entry_set_band":
+        if (action.params.value !== (bandLabels[String(active.band)] ?? String(active.band)))
+          throw new Error("Band follows the admitted contest frequency.");
+        return;
+      case "entry_set_mode":
+        { const requestedMode = action.params.value, callsignCommand = action.params.callsignCommand === true;
+        const nextMode = callsignCommand
+          ? active.supportedModes?.find(mode => canonicalContestSurfaceMode(mode) === canonicalContestSurfaceMode(requestedMode))
+          : active.supportedModes?.find(mode => mode === requestedMode);
+        if (!nextMode) throw new Error("This contest does not support that operating mode.");
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);await enqueueLane(scope,async base=>{
+            const buffer=laneBuffer(scope);if(callsignCommand){buffer.fields=clearedContestFields(base,nextMode);buffer.heardFieldIDs=[];}
+            admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields,mode:nextMode}),scope,structuredClone(buffer));
+          });return;
+        }
+        if (nextMode !== active.mode || callsignCommand) {
+          const frequencyHz = operationFrequencyHz ?? active.frequencyHz;
+          const previousDefault = active.mode === "SSB" ? "59" : "599";
+          const modeFields = callsignCommand ? clearedContestFields(active, nextMode) :
+            Object.fromEntries(Object.entries(fieldsRef.current).filter(([fieldID, value]) =>
+              !((fieldID === "sent" || fieldID === "receive") && value === previousDefault)));
+          await runMutation(async base => {
+            if (callsignCommand && observedFrequencyHz !== null) await stationTune(frequencyHz, requestedMode);
+            return mutate("contest_draft_apply", base, { fields: modeFields, frequencyHz, mode: nextMode });
+          }, false, false, false, true);
+        }
+        return; }
+      case "entry_reserve_serial": throw new Error("Serial numbers are allocated automatically by the contest host.");
+      case "entry_clear": {
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);await enqueueLane(scope,async base=>{
+            const buffer=laneBuffer(scope);buffer.fields=clearedContestFields(base,base.mode);buffer.heardFieldIDs=[];buffer.conflicts=[];
+            admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),fields:buffer.fields}),scope,structuredClone(buffer));});return;
+        }
+        const cleared = clearedContestFields(active, active.mode);
+        fieldsRef.current = cleared; setFields(cleared); editVersionRef.current += 1;
+        await runMutation(base => mutate("contest_draft_apply", base, { fields: cleared,
+          frequencyHz: operationFrequencyHz ?? base.frequencyHz }), false, false, true, true);
+        return;
+      }
+      case "entry_spot": {
+        const callsign=(fieldsRef.current.callsign??"").trim().toUpperCase(),frequencyHz=operationFrequencyHz;
+        if(!callsign)throw new Error("Enter a callsign before spotting it.");
+        if(frequencyHz===null)throw new Error("A valid contest frequency is required before spotting a callsign.");
+        const frequencyKHz=(frequencyHz/1000).toFixed(3).replace(/\.0+$/,"").replace(/(\.\d*?)0+$/,"$1");
+        await contestSpot(callsign, frequencyHz);
+        setNotice(`Spotted ${callsign} on ${frequencyKHz} kHz through the existing xLog cluster connection.`);return;
+      }
+      case "entry_mark_spot": {
+        const callsign=(fieldsRef.current.callsign??"").trim().toUpperCase();
+        if(!callsign)throw new Error("Enter the exact callsign to mark or unmark.");
+        const admittedFrequencyHz=contestFrequency(selectedRadioFrequencyHz,activeSupportedBands,bandDefinitions);
+        if(admittedFrequencyHz===null)throw new Error("A current observed xLog radio frequency on a band supported by this contest is required to mark a callsign.");
+        const frequencyKHz=admittedFrequencyHz/1_000,receivedAt=Date.now()/1_000-978_307_200;
+        const existing=allWorkflowSpots.find(spot=>spot.callsign===callsign&&Math.round(spot.frequencyKHz*1_000)===selectedRadioFrequencyHz);
+        const spot:ContestSurfaceSpot=existing??{id:`contest-mark:${selectedRadioFrequencyHz}:${callsign}`,receivedAt,clusterName:"Contest",
+          spotter:effectiveStationCall,spotterContinent:null,frequencyKHz,frequencyText:frequencyKHz.toFixed(3),callsign,comment:"Marked from Main Logging",
+          band:bandLabels[String(active.band)]??String(active.band),mode:active.mode,country:"",adif:null,continent:"",cqZone:null,ituZone:null,
+          callStatus:"",dxccStatus:"",workedBefore:null,specialTags:[],score:0,contestPoints:null,contestDupe:null,contestMultiplierCount:null,
+          contestCountryMultiplier:null,contestZoneMultiplier:null,
+          scoreReasons:[],aggregateCount:1,
+          aggregateSpotters:effectiveStationCall?[effectiveStationCall]:[],source:"Contest mark",statusHex:"",bandHex:"",modeHex:"",marked:false};
+        setSpotWorkflow(current=>updateContestSpotWorkflow(workflowBase(current),[...allWorkflowSpots.filter(item=>item.id!==spot.id),spot],
+          spot.id,"mark",!spot.marked,receivedAt));return;
+      }
+      case "entry_tune_spot": {
+        const spot=currentSpot();if(!spot)throw new Error("No selected or matching shared spot is available to tune.");
+        await chooseSpot(spot,true);return;
+      }
+      case "entry_step_spot": {
+        const band=bandLabels[String(active.band)]??String(active.band),
+          candidates=visibleWorkflowSpots.filter(spot=>{const cached=spotPointPreview.rows.get(spot.id),candidate=contestSpotPreviewCandidate(spot);
+            return spot.band===band&&(!action.params.multiplierOnly||spotPointPreview.identity===spotPointIdentity&&spotPointPreview.revision===spotScoreRevision&&
+              cached?.inputSignature===candidate?.inputSignature&&cached?.dupe===false&&(cached?.multiplierCount??0)>0);})
+            .sort((a,b)=>a.frequencyKHz-b.frequencyKHz||a.callsign.localeCompare(b.callsign));
+        if (!candidates.length) throw new Error(action.params.multiplierOnly?"No needed multiplier spots on this band.":"No shared contest spots on this band.");
+        const cursor = spotCursorRef.current.context === spotSelectionContext ? spotCursorRef.current.spotID : null;
+        const pending=pendingRadioTuneRef.current,
+          awaitingTuneSample=pending?.sessionID===active.sessionID&&observedFrequencyHz===pending.sourceHz&&
+            (pending.confirmedAt===undefined||Date.now()-pending.confirmedAt<2000),
+          frequency=(awaitingTuneSample?pending.targetHz:observedFrequencyHz??active.frequencyHz)/1000,
+          tolerance=["SSB","USB","LSB"].includes(active.mode.toUpperCase())?ssbTuningToleranceHz:0,
+          current = cursor == null ? -1 : candidates.findIndex(spot => spot.id === cursor&&Math.abs(spot.frequencyKHz-frequency)*1000<=tolerance);
+        const next=action.params.direction==="next"
+          ?current>=0?candidates[(current+1)%candidates.length]:candidates.find(spot=>spot.frequencyKHz>frequency)??candidates[0]
+          :current>=0?candidates[(current+candidates.length-1)%candidates.length]:[...candidates].reverse().find(spot=>spot.frequencyKHz<frequency)??candidates.at(-1)!;
+        await chooseSpot(next, true); return;
+      }
+      case "entry_step_vfo":
+        if(contestingTest)throw new Error("VFO stepping is disabled in Contesting Test.");
+        if(!stationStep)throw new Error("The selected xLog radio cannot step the VFO.");
+        await stationStep(action.params.direction);
+        setNotice(`VFO ${action.params.direction === "up" ? "increased" : "decreased"} after authoritative radio readback.`);return;
+      case "entry_return_cq_frequency": {
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);await enqueueLane(scope,async base=>{
+            const hz=Number(contestLaneSnapshot(base,scope.laneID).cqContext?.rememberedCQFrequencyHz);if(!Number.isSafeInteger(hz)||hz<=0)throw Error("No remembered CQ frequency is available in this lane.");
+            const blocked=contestLaneTuningBlockReason(contestLaneSnapshot(base,scope.laneID),hz);if(blocked)throw Error(blocked);
+            const context=nativeLaneContext(scope);await bindNativeLane(context);acceptLaneNative(await requestContestLaneOutput(context,"tune",{frequencyHz:hz,mode:base.mode}));
+            const buffer=laneBuffer(scope);buffer.frequencyText=String(hz);admitLaneResult(await mutate("contest_draft_apply",base,{...contestLaneParams(scope),frequencyHz:hz}),scope,structuredClone(buffer));});return;
+        }
+        if(contestingTest)throw new Error("Return to CQ frequency is disabled in Contesting Test.");
+        const target=lastCQFrequencyRef.current,currentFrequency=observedFrequencyHzRef.current;
+        if(!target||target.sessionID!==active.sessionID||target.workspaceGeneration!==active.workspaceGeneration)
+          throw new Error("No confirmed CQ frequency is available for this contest session.");
+        if(currentFrequency===null)throw new Error("Refresh a current observed xLog radio frequency before returning to the CQ frequency.");
+        if(currentFrequency!==target.frequencyHz){
+          const intent:PendingRadioTune={sessionID:active.sessionID,sourceHz:currentFrequency,targetHz:target.frequencyHz};
+          pendingRadioTuneRef.current=intent;
+          try{await stationTune(target.frequencyHz,target.mode);finishRadioTune(intent);}
+          catch(cause){cancelRadioTune(intent);throw cause;}
+        }
+        setNotice(`Returned to the last confirmed CQ frequency ${(target.frequencyHz/1_000_000).toFixed(6)} MHz.`);return;
+      }
+      case "entry_commit":
+        await commitEntry();return;
+      case "entry_edit_last": {
+        const page = await result<Data>("contest_log_page", { sessionID: active.sessionID,
+          expectedRevision: active.revision, offset: 0, limit: 1 });
+        const latest = Array.isArray(page.rows) ? page.rows[0] : null;
+        if (!latest) throw new Error("Log a contact before opening the last QSO for editing.");
+        await beginEdit(String(latest.ID ?? ""), true, latest); return;
+      }
+      case "entry_operator_arm":
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);
+          if(!action.params.armed){acceptLaneNative(await requestContestLaneOutput(nativeLaneContext(scope),"stop"));return;}
+          await enqueueLane(scope,async()=>{const context=nativeLaneContext(scope);await bindNativeLane(context);
+            acceptLaneNative(await requestContestLaneOutput(context,"requestTX"));});return;
+        }
+        if (!action.params.armed) clearAutoCQ();
+        if (phoneReleaseBlocking) {
+          if (action.params.armed) throw new Error(phoneReleaseUncertain || "Contest phone PTT release is still pending.");
+          await stopPhoneOutput(); return;
+        }
+        if (phoneSimulationAvailable || phoneProductionAvailable) {
+          if (action.params.armed && phoneProductionAvailable && !String(setup.preferences.voiceProfilePath ?? "").trim())
+            throw new Error("Choose a voice WAV profile folder in Contest Sound settings before arming phone output.");
+          if (action.params.armed && phoneReleaseUncertain)
+            throw new Error(phoneReleaseUncertain);
+          if (!action.params.armed) await stopPhoneOutput(); else setPhoneSimulationArmed(true);
+          return;
+        }
+        if (active.mode !== "CW") throw new Error("This contest does not support admitted output.");
+        if (action.params.armed) await cw.controller.arm(action.requestID); else await cw.controller.stop();
+        return;
+      case "entry_operator_style":
+        await runMutation(base => mutate("contest_run_state", base, { run: action.params.value === "run" }), false,
+          true, false, true);
+        return;
+      case "entry_set_cw_speed": {
+        if(dualContestLanes(active))throw Error("CW speed control for an exact two-lane provider is unavailable. The SO1V radio owner was not used.");
+        if (active.mode !== "CW") throw new Error("This contest does not support CW output.");
+        await setContestCWSpeed(action.params.value);
+        const document = { ...setup, preferences: { ...setup.preferences, cwSpeed: action.params.value } };
+        const saved = await mutate("contest_setup_save", active, { setup: document }) as MutationResult & { setup: ContestSetupDocument };
+        acceptProjection(saved.projection); setSetup(saved.setup); return;
+      }
+      case "entry_send_cw_text": {
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);await enqueueLane(scope,async()=>{
+            const sent:any=await requestContestLaneOutput(nativeLaneContext(scope),"send",{text:action.params.value,operationID:crypto.randomUUID()});
+            acceptLaneNative(sent);if(sent?.receipt?.confirmed!==true)throw Error("The lane text is unconfirmed; use Stop before considering a retry.");});return;
+        }
+        if (configuredClient) throw new Error("Client CW input is disabled until the master can authorize its output.");
+        if (active.mode !== "CW") throw new Error("Free-form CW input is available only in CW mode.");
+        if (operationFrequencyHz === null) throw new Error("Connect the selected radio or enter a supported contest frequency before sending CW.");
+        const operationID=crypto.randomUUID();
+        const native=await cw.controller.executeContest({operation:"text",operationID,sessionID:active.sessionID,
+          expectedContestRevision:active.revision,draftID:active.draftID,fields:fieldsRef.current,
+          frequencyHz:operationFrequencyHz,text:action.params.value,contestSurfaceRequestID:action.requestID});
+        if(native?.contestResult?.accepted!==true||native.contestResult.operationID!==operationID)
+          throw new Error(native?.error||"Contest CW text was not confirmed. Use Stop before deciding whether to retry.");
+        return;
+      }
+      case "entry_focus":
+        if(dualContestLanes(active)){
+          const scope=captureContestLaneScope(active);await enqueueLane(scope,async base=>{
+            admitLaneResult(await mutate("contest_focus",base,{...contestLaneParams(scope),field:action.params.fieldID}),scope);},false);return;
+        }
+        if (!active.fields.some(field => field.id === action.params.fieldID && field.visible && field.enabled))
+          throw new Error("This contest field is not available for focus.");
+        await runMutation(base => mutate("contest_focus", base, { field: action.params.fieldID }), false,
+          true, true, true);
+        return;
+      case "entry_operator_key":
+        if (action.params.key === "Enter") {
+          if ((active.entryPolicy?.enter ?? (setup.preferences.useESM ? "esm" : "manual")) === "esm") await hostAction("contest_esm", { field: action.params.focusedField ?? active.focus }, true, action.requestID);
+          else await commitEntry();
+          return;
+        }
+        if (action.params.shifted) { if(dualContestLanes(active))throw Error("Alternating or automatic CQ is not enabled for operating lanes. Use an explicit lane message.");await startAutoCQ(action.requestID); return; }
+        await hostAction("contest_function_key", { key: action.params.key }, true, action.requestID); return;
+      case "assistance_query": await persistFields("callsign", action.params.inputCallsign.toUpperCase()); return;
+      case "assistance_download":
+        if (!scpSurface) throw new Error("Super Check Partial is unavailable.");
+        await scpSurface.downloadLatest(); return;
+      case "assistance_refresh":
+        if (!scpSurface) throw new Error("Super Check Partial is unavailable.");
+        await scpSurface.refresh(); return;
+      case "assistance_select":
+        if (action.params.kind === "log" || action.params.kind === "cluster") {
+          const candidates = action.params.kind === "log" ? loggedCandidates : clusterCandidates;
+          const candidate = candidates.find(item => item.candidateID === action.params.candidateID);
+          if (!candidate) throw new Error("The callsign candidate is no longer available.");
+          await persistFields("callsign", candidate.callsign);
+        }
+        else if (action.params.kind === "scp" && scpSurface) await scpSurface.selectCandidate(action.params.candidateID);
+        else if (action.params.kind === "history" && historyCandidate?.candidateID === action.params.candidateID)
+          await persistFields("callsign", historyCandidate.callsign);
+        else throw new Error("The callsign candidate set is unavailable.");
+        return;
+      case "score_configure": {
+        if (action.params.enabled && projection?.score.scoringComplete === false) throw new Error("This score is partial; score reporting is unavailable.");
+        const urls={hamscore:"https://hamscore.com/postxml/",contestonlinescore:"https://contestonlinescore.com/post/"} as const;
+        if(action.params.enabled&&(!action.params.username.trim()||(!action.params.password&& !rtcCredentialSaved)))
+          throw new Error("Save the scoreboard username and password before enabling reports.");
+        if(action.params.password) {
+          await request("secret_save",{account:"rtc-score-password",value:action.params.password});
+          setRTCCredentialSaved(true);
+        }
+        const preferences={...setup.preferences,rtcEnabled:action.params.enabled,rtcURL:urls[action.params.service],
+          rtcUsername:action.params.username.trim(),rtcIntervalMinutes:action.params.intervalMinutes} as
+          typeof setup.preferences&{rtcPassword?:unknown};
+        delete preferences.rtcPassword;
+        const document={...setup,preferences};
+        const saved=await mutate("contest_setup_save",active,{setup:document}) as MutationResult&{setup:ContestSetupDocument};
+        acceptProjection(saved.projection);setSetup(saved.setup);
+        rtcConfigurationRef.current="";
+        const status=await request("contest_rtc_configure",{sessionID:action.sessionID,workspaceGeneration:action.workspaceGeneration,
+          service:action.params.service,url:urls[action.params.service],username:action.params.username.trim(),
+          intervalMinutes:action.params.intervalMinutes,enabled:action.params.enabled});
+        setRTCStatus(status as RTCStatus);return;
+      }
+      case "score_send_now": {
+        if (projection?.score.scoringComplete === false) throw new Error("This score is partial; score reporting is unavailable.");
+        const status=await request("contest_rtc_send_now");setRTCStatus(status as RTCStatus);return;
+      }
+      case "log_import_adif": {
+        if(active.pluginID!=="cq_ww_ssb"||active.mode!=="SSB")throw new Error("ADIF import is currently available only for CQ WW SSB sessions.");
+        const existing=new Set<string>();
+        for(let offset=0;;offset+=100){
+          const page=await result<Data>("contest_log_page",{sessionID:active.sessionID,expectedRevision:active.revision,offset,limit:100});
+          const pageRows=Array.isArray(page.rows)?page.rows:[];
+          for(const row of pageRows)if(typeof row.ID==="string")existing.add(row.ID);
+          if(offset+pageRows.length>=Number(page.total??0)||pageRows.length===0)break;
+        }
+        const records=action.params.records.filter(record=>!existing.has(record.qsoID));
+        if(records.length===0)return;
+        for(const record of records){
+          if(record.mode!=="SSB"||contestFrequency(record.frequencyHz,activeSupportedBands,bandDefinitions)===null)
+            throw new Error(`${record.fields.callsign} is outside this CQ WW SSB session's configured bands.`);
+          if(!/^\d{1,2}$/.test(record.fields.other_2)||Number(record.fields.other_2)<1||Number(record.fields.other_2)>40)
+            throw new Error(`${record.fields.callsign} has an invalid CQ zone.`);
+        }
+        await runMutation(async base=>{
+          const originalFields=projectionFields(base),originalFrequency=base.frequencyHz;
+          let latest:MutationResult={projection:base};
+          try{
+            for(const record of records)latest=await mutate("contest_qso_commit",latest.projection,{qsoID:record.qsoID,
+              timestamp:record.timestamp,frequencyHz:record.frequencyHz,fields:record.fields});
+            return await mutate("contest_draft_apply",latest.projection,{fields:originalFields,frequencyHz:originalFrequency});
+          }catch(cause){
+            if(latest.projection.revision!==base.revision){
+              try{const restored=await mutate("contest_draft_apply",latest.projection,{fields:originalFields,frequencyHz:originalFrequency});
+                acceptProjection(restored.projection);await refresh(restored.projection.sessionID,restored.projection);}
+              catch{/* Preserve the original import failure; the normal refresh path will reconcile the draft. */}
+            }
+            throw cause;
+          }
+        },true,true,false,true);
+        return;
+      }
+      case "log_export_cabrillo": return exportLog("cabrillo", true, { operatingContext:action.operatingContext, sessionID:action.sessionID,
+        workspaceGeneration:action.workspaceGeneration, requestID:action.requestID, projectionRevision:action.projectionRevision });
+      case "log_export_adif": return exportLog("adif", true, { operatingContext:action.operatingContext, sessionID:action.sessionID,
+        workspaceGeneration:action.workspaceGeneration, requestID:action.requestID, projectionRevision:action.projectionRevision });
+      case "log_export_edi": return exportLog("edi", true, { operatingContext:action.operatingContext, sessionID:action.sessionID,
+        workspaceGeneration:action.workspaceGeneration, requestID:action.requestID, projectionRevision:action.projectionRevision });
+      case "log_recalculate":
+        if (action.params.expectedSessionRevision !== active.revision) throw new Error("The contest log changed before recalculation started.");
+        if (await runMutation(base => mutate("contest_recalculate", base), true, true, false, true))
+          setNotice("Score and multipliers recalculated from the complete contest log.");
+        return;
+      case "log_search":
+      case "log_focus": {
+        if(editing)throw new Error("Save or cancel the open contact editor before searching.");
+        const query=(action.action==="log_search"?action.params.query:action.params.callsign).trim().toUpperCase();
+        const selected=await selectContestLog((offset,limit)=>result<any>("contest_log_page",{
+          sessionID:active.sessionID,expectedRevision:active.revision,offset,limit}),active.revision,query,0,logPageSize,
+          action.action==="log_focus"?action.params.qsoID:undefined);
+        if(projectionRef.current?.sessionID!==active.sessionID||projectionRef.current?.revision!==active.revision)
+          throw new Error("The contest changed. Search again.");
+        logQueryRef.current=query;setLogQuery(query);setLogFocus(action.action==="log_focus"?action.params.qsoID:"");
+        setRows(selected.rows);setLogOffset(selected.offset);setLogTotal(selected.total);return;
+      }
+      case "log_correct_call": {
+        if(editing)throw new Error("Save or cancel the open contact editor before applying a review correction.");
+        if(!sameFields(fieldsRef.current,projectionFields(active)))throw new Error("Finish the pending live entry before applying a review correction.");
+        if(configuredClient)throw new Error("Use Edit Contact for a correction on a shared contest client.");
+        const {qsoID,expectedSessionRevision,expectedCall,callsign}=action.params;
+        if(active.revision!==expectedSessionRevision)throw new Error("The contest changed. Run review again before applying this correction.");
+        if(!validReviewCall(callsign)||callsign===expectedCall)throw new Error("Choose a different complete callsign.");
+        const selected=await selectContestLog((offset,limit)=>result<any>("contest_log_page",{
+          sessionID:active.sessionID,expectedRevision:active.revision,offset,limit}),active.revision,expectedCall,0,1,qsoID);
+        if(selected.target?.Call!==expectedCall)throw new Error("This contact changed. Run review again.");
+        await runMutation(base=>{
+          if(base.revision!==expectedSessionRevision)throw new Error("The contest changed. Run review again.");
+          return mutate("contest_qso_correct",base,{qsoID,fields:{callsign},reason:`Log Review callsign correction: ${expectedCall} → ${callsign}`});
+        },true,false,true,true);
+        return;
+      }
+      case "log_page":
+        setLogPageSize(action.params.limit);
+        await loadLogPage(action.params.offset, true, action.params.limit);
+        return;
+      case "log_edit_begin": await beginEdit(action.params.qsoID, true); return;
+      case "log_edit_begin_delete": await beginEdit(action.params.qsoID, true); setConfirmDelete(true); return;
+      case "log_edit_cancel": requireEditing(action.params.qsoID); setEditing(null); setConfirmDelete(false); return;
+      case "log_edit_set_text":
+        requireEditing(action.params.qsoID);
+        if (action.params.field === "callsign") setEditCall(action.params.value.toUpperCase());
+        else if (action.params.field === "sentReport") setEditSent(action.params.value);
+        else if (action.params.field === "receivedReport") setEditReceived(action.params.value);
+        else if (action.params.field === "timestamp") setEditTimestamp(action.params.value);
+        else if (action.params.field === "operator") setEditOperator(action.params.value.toUpperCase());
+        else if (action.params.field === "name") setEditName(action.params.value);
+        else if (action.params.field === "qth") setEditQTH(action.params.value);
+        else if (action.params.field === "comment") setEditComment(action.params.value);
+        else if (action.params.field === "receiveFrequency") setEditReceiveFrequencyHz(action.params.value);
+        else if (action.params.field === "power") setEditPower(action.params.value);
+        else if (action.params.field === "correctionReason") setCorrectionReason(action.params.value);
+        else setDeletionReason(action.params.value);
+        return;
+      case "log_edit_set_exchange":
+        requireEditing(action.params.qsoID);
+        if (action.params.fieldID === "other_1") setEditSentExchange(action.params.value);
+        else if (action.params.fieldID === "other_2") setEditZone(action.params.value);
+        else throw new Error("This contest log field is not editable here.");
+        return;
+      case "log_edit_set_frequency_text": {
+        requireEditing(action.params.qsoID);
+        const frequencyHz = /^\d+$/.test(action.params.value) ? contestFrequency(Number(action.params.value), activeSupportedBands, bandDefinitions) : null;
+        if (frequencyHz === null) throw new Error("Enter a frequency in Hz on a band supported by this contest.");
+        setEditFrequencyMHz((frequencyHz / 1_000_000).toFixed(6)); return;
+      }
+      case "log_edit_set_band":
+        requireEditing(action.params.qsoID);
+        if (action.params.value !== (bandLabels[String(editing?.Band)] ?? String(editing?.Band ?? "")))
+          throw new Error("Band follows the corrected contact frequency.");
+        return;
+      case "log_edit_confirm_delete": requireEditing(action.params.qsoID); setConfirmDelete(action.params.confirmed); return;
+      case "log_edit_save":
+        requireEditing(action.params.qsoID);
+        if (action.params.expectedSessionRevision !== active.revision) throw new Error("The contest log changed before this correction was saved.");
+        if (!correctionReason.trim()) throw new Error("Enter a correction reason.");
+        await saveCorrection(correctionReason.trim(), true); return;
+      case "log_edit_delete":
+        requireEditing(action.params.qsoID);
+        if (action.params.expectedSessionRevision !== active.revision) throw new Error("The contest log changed before this deletion was saved.");
+        if (!confirmDelete) throw new Error("Confirm deletion before removing this contact.");
+        if (!deletionReason.trim()) throw new Error("Enter a deletion reason.");
+        await deleteQSO(deletionReason.trim(), true); return;
+    }
+  };
+  const reportSurfaceError = useCallback((message: string) => setError(message), []);
+  const waitForSurfacePublication = useContestSurfaceOwner({ context: surfaceContext, projections: surfaceProjections,
+    handle: handleSurfaceAction, report: reportSurfaceError });
+  useEffect(() => {
+    if (!setupOnly || !surfaceContext) return;
+    void configureContestGroupChat(surfaceContext, {
+      enabled: setup.network.multiEnabled === true,
+      multicastGroup: String(setup.network.multicastGroup ?? "239.1.1.1"),
+      multicastPort: Number(setup.network.multicastPort ?? 2239),
+      interface: String(setup.network.interface ?? "0.0.0.0"),
+      operator: setup.operator.trim().toUpperCase(),
+      stationName: String(setup.network.stationName ?? "").trim(),
+      multiMaster: setup.network.multiMaster === true,
+      contestIdentity: groupContestIdentity(setup),
+    }).then(snapshot=>{groupNetworkRef.current=snapshot;setGroupNetwork(snapshot);}).catch(cause => setError(errorMessage(cause)));
+  }, [setupOnly, surfaceContext?.operatingContext, surfaceContext?.sessionID, surfaceContext?.workspaceGeneration,
+    setup.network.multiEnabled, setup.network.multicastGroup, setup.network.multicastPort, setup.network.interface,
+    setup.network.stationName, setup.network.multiMaster, setup.operator, setup.pluginID, setup.settings.StartDate, setup.station.Call]);
+
+  useEffect(() => {
+    if (!setupOnly || !surfaceContext || setup.network.multiEnabled !== true) return;
+    let stopped = false, running = false;
+    const reconcile = async () => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        await configureContestGroupChat(surfaceContext, {
+          enabled: true,
+          multicastGroup: String(setup.network.multicastGroup ?? "239.1.1.1"),
+          multicastPort: Number(setup.network.multicastPort ?? 2239),
+          interface: String(setup.network.interface ?? "0.0.0.0"),
+          operator: setup.operator.trim().toUpperCase(),
+          stationName: String(setup.network.stationName ?? "").trim(),
+          multiMaster: setup.network.multiMaster === true,
+          contestIdentity: groupContestIdentity(setup),
+        });
+        const snapshot=await readContestGroupNetwork(surfaceContext);
+        const previous=groupNetworkRef.current?.authority;
+        if(previous && (previous.role!==snapshot.authority.role||previous.status!==snapshot.authority.status||
+            previous.sessionID!==snapshot.authority.sessionID||previous.workspaceGeneration!==snapshot.authority.workspaceGeneration))
+          authorityGenerationRef.current+=1;
+        groupNetworkRef.current=snapshot;setGroupNetwork(snapshot);
+        if(snapshot.authority.role==="client"&&["leasing","connected"].includes(snapshot.authority.status)&&snapshot.authority.sessionID&&
+            snapshot.authority.workspaceGeneration&&!authorityBusyRef.current&&!busyRef.current&&!editingRef.current&&
+            projectionRef.current&&sameFields(fieldsRef.current,projectionFields(projectionRef.current))){
+          authorityBusyRef.current=true;try{await resumePendingMutations();await syncReplica(undefined,{background:true});}catch{/* retry quietly */}
+          finally{authorityBusyRef.current=false;}
+        }
+        // Pinned Renfield responds even when its SQLite write fails. Drain these
+        // transport observations, but never use them to retire the Dirty ledger.
+        await takeContestGroupUnverifiedAcknowledgements(surfaceContext);
+        const current = projectionRef.current;
+        if (!current || current.sessionID !== surfaceContext.sessionID || current.workspaceGeneration !== surfaceContext.workspaceGeneration) return;
+        const pending = unwrap<{ sessionID:string; workspaceGeneration:string; contacts:Record<string,unknown>[] }>(
+          await request("contest_network_pending", { sessionID: current.sessionID,
+            workspaceGeneration: current.workspaceGeneration, limit: 100 }));
+        if (pending.sessionID !== current.sessionID || pending.workspaceGeneration !== current.workspaceGeneration || !Array.isArray(pending.contacts))
+          throw new Error("The contest contact publication queue is stale or malformed.");
+        if(snapshot.authority.role==="master"||snapshot.authority.status==="connected"){
+          await requestContestGroupAuthority(surfaceContext,"coordination",{action:"presence",presence:{
+            ...groupPresenceRef.current,sequence:++groupPresenceRef.current.sequence,operator:setup.operator,
+            role:snapshot.authority.role,band:bandDefinitions.find(band=>current.frequencyHz>=band.lowHz&&current.frequencyHz<band.highHz)?.id??"",
+            mode:current.mode,laneID:current.selectedLaneID??"laneA",cursor:current.replicaCursor?.revision??current.revision,
+            queue:pending.contacts.length,context:`${current.pluginID}/${current.referenceID}`}});
+        }
+        for (const contact of pending.contacts) {
+          if (stopped) return;
+          await publishContestGroupContact(surfaceContext, contact);
+        }
+      } catch (cause) {
+        if (!stopped) setError(errorMessage(cause));
+      } finally { running = false; }
+    };
+    void reconcile();
+    const timer = window.setInterval(() => void reconcile(), 2_000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [setupOnly, surfaceContext?.operatingContext, surfaceContext?.sessionID, surfaceContext?.workspaceGeneration,
+    setup.network.multiEnabled, setup.network.multicastGroup, setup.network.multicastPort, setup.network.interface,
+    setup.network.stationName, setup.network.multiMaster, setup.operator, setup.pluginID, setup.settings.StartDate, setup.station.Call, request]);
+
+  useEffect(() => {
+    if (!registerMenuRoute) return;
+    const handle = async (route: string) => {
+      flushUnfinishedEditors();
+      if (["contest-dialog-operator", "contest-dialog-station", "contest-dialog-configuration", "contest-dialog-digital", "contest-dialog-macros", "contest-dialog-keys", "contest-dialog-rover", "contest-dialog-about"].includes(route)) {
+        if (["contest-dialog-macros", "contest-dialog-keys"].includes(route) && startupPending) return false;
+        if (["contest-dialog-macros", "contest-dialog-keys"].includes(route) && !projectionRef.current) { setManager(true); setError(`Open a contest session before editing ${route === "contest-dialog-keys" ? "keys" : "macros"}.`); return true; }
+        await openContestSetupDialog(route === "contest-dialog-operator" ? "operator" : route === "contest-dialog-station" ? "station" :
+          route === "contest-dialog-configuration" ? "configuration" : route === "contest-dialog-digital" ? "digital" : route === "contest-dialog-macros" ? "macros" : route === "contest-dialog-keys" ? "keys" : route === "contest-dialog-rover" ? "rover" : "about");
+        return true;
+      }
+      if (route === "contest-setup") {
+        await flushDraftRef.current();
+        setManager(true);
+        return true;
+      }
+      if (route === "contest-window-call-history") {
+        if (startupPending) return false;
+        if (!projectionRef.current || !detachedAvailable || !surfaceContext) {
+          setManager(true); setError("Open a contest session before opening Call History."); return true;
+        }
+        await flushDraftRef.current();
+        await openContestCallHistoryWindow(surfaceContext);
+        return true;
+      }
+      if (route === "contest-window-group-chat") {
+        if (startupPending) return false;
+        if (!projectionRef.current || !detachedAvailable || !surfaceContext) {
+          setManager(true); setError("Open a contest session before opening Group Chat."); return true;
+        }
+        await openContestGroupChatWindow(surfaceContext);
+        return true;
+      }
+      const panelID = route.startsWith("contest-window-") ? route.slice("contest-window-".length) as ContestSurfacePanelID : null;
+      if (!panelID || !contestSurfacePanelIDs.includes(panelID)) return false;
+      if (startupPending) return false;
+      const active = projectionRef.current;
+      if (!active || !detachedAvailable || !surfaceContext) {
+        setManager(true);
+        setError("Open a contest session before opening its windows.");
+        return true;
+      }
+      if (panelID !== "active-qso") await flushDraftRef.current();
+      await waitForSurfacePublication();
+      await openContestSurfaceWindow(surfaceContext, panelID);
+      return true;
+    };
+    registerMenuRoute(handle);
+    return () => registerMenuRoute(null);
+  }, [registerMenuRoute, detachedAvailable, surfaceContext?.operatingContext, surfaceContext?.sessionID,
+    surfaceContext?.workspaceGeneration, startupPending]);
+
+  const applyAssistanceCallsign = (callsign: string, selection: SCPSelectionScope) => {
+    const active = projectionRef.current;
+    if (!active || busyRef.current || retiring || selection.ownerLeaseID !== 0 ||
+        selection.sessionID !== active.sessionID || selection.workspaceGeneration !== active.workspaceGeneration ||
+        selection.draftID !== active.draftID || selection.inputCallsign !== (fieldsRef.current.callsign ?? "").trim().toUpperCase()) {
+      setError("The callsign suggestion no longer belongs to the active Not1MM draft.");
+      return;
+    }
+    const nextFields = { ...fieldsRef.current, callsign };
+    recordManualHeardCall(callsign);
+    editVersionRef.current += 1; fieldsRef.current = nextFields; setFields(nextFields);
+    void runMutation(base => mutate("contest_draft_apply", base, {
+      fields: nextFields, frequencyHz: operationFrequencyHz ?? base.frequencyHz,
+    }), false, false);
+  };
+
+  const fldigiPanelReady = Boolean(projection?.fldigiTransmitAvailable && fldigiSnapshot?.configuration.transmit_enabled);
+  const fldigiPanelOwned = fldigiPanelReady || fldigiReleaseBlocking || Boolean(fldigiSnapshot?.configuration_error);
+  const cwPanel = () => {
+    if(projection?.practice&&!fldigiPanelOwned)return <p role="status">Practice · native keyer, voice, modem and station output disabled. Manual logging is available.</p>;
+    if (!projection || projection.mode === "SSB" && !phoneOutputAvailable&&!fldigiPanelOwned) return null;
+    if(!["CW","SSB"].includes(projection.mode)&&!fldigiPanelOwned)return <section className="contest-operator" aria-label="fldigi controls"><strong>ESM and fldigi</strong>
+      <p>fldigi macro output is unavailable. Enable the supported fldigi transmit path in Digital Logging Setup before sending. Manual logging and received-text selection remain separate.</p>
+      <div className="contest-operator-keys">{projection.functionKeys.map(key=><button type="button" key={key.id} disabled>{key.id}</button>)}</div></section>;
+    const phone = projection.mode === "SSB" && phoneOutputAvailable;
+    const armed = fldigiReleaseBlocking || (phoneReleaseBlocking ? phoneSimulationArmed || Boolean(phoneReleaseUncertain) : phone ? phoneSimulationArmed : fldigiPanelReady || cw.state.armed);
+    const title = fldigiPanelOwned ? "ESM and fldigi" : phone ? "ESM and Phone" : "ESM and CW";
+    const description = fldigiPanelOwned
+      ? "Not1MM chooses the F-key text; xLog claims it once and sends it through fldigi XML-RPC."
+      : phoneSimulationAvailable
+        ? "CONTESTING TEST · simulated phone only · no RF, audio, PTT, radio, or network output"
+        : phone
+          ? "Not1MM chooses and claims each recorded message once; xLog requires fresh TX confirmation before audio."
+          : cw.state.canonical?.provider === "test-simulation"
+            ? "CONTESTING TEST · simulated CW only · no RF, audio, PTT, radio, or network output"
+            : "Not1MM chooses the F-key action; xLog owns the armed CW output lease.";
+    return <section className="contest-operator" aria-label={fldigiPanelOwned ? "fldigi controls" : phone ? "Phone controls" : "CW controls"}>
+      <header><div><strong>{title}</strong><p>{description}</p></div><span>{fldigiStopPending ? "fldigi release pending" : fldigiPanelOwned ? fldigiSnapshot?.status : phoneReleaseUncertain ? "Phone PTT release uncertain" : phoneReleaseBlocking ? "Phone PTT release pending" : phone ? phoneSimulationPending ? "Phone output pending" : armed ? "Phone output armed" : "Phone output disarmed" : cw.state.message}</span></header>
+      <div className="contest-operator-controls">{!fldigiPanelOwned&&<button type="button" disabled={busy || phoneSimulationPending || !phone&&cw.state.pending} onClick={() => phoneReleaseBlocking ? void stopPhoneOutput() : phone ? armed ? void stopPhoneOutput() : setPhoneSimulationArmed(true) : void cw.controller.arm(undefined,"setup")}>{phoneReleaseUncertain ? "Retry phone disarm" : phoneReleaseBlocking ? "Phone disarm pending" : phone ? armed ? "Disarm phone" : phoneSimulationAvailable ? "Arm phone simulation" : "Arm recorded phone" : cw.state.canonical?.provider === "test-simulation" ? "Arm simulation" : "Arm CW"}</button>}
+        <button type="button" className="contest-danger-secondary" disabled={fldigiStopPending} onClick={() => void stopAutoCQ().catch(cause=>setError(errorMessage(cause)))}>{fldigiReleaseBlocking ? "Retry fldigi release" : "Stop"}</button>
+        <span className={armed ? "is-armed" : ""}>{armed ? "Armed" : "Disarmed"}</span>{autoCQDeadlineMs !== null&&<span role="status">Auto CQ · {Math.max(0, Math.ceil((autoCQDeadlineMs-autoCQNowMs)/1000))}s</span>}
+      </div>{fldigiSnapshot?.configuration_error && <p className="contest-alert is-error">{fldigiSnapshot.configuration_error}</p>}{!phone && cw.state.error && <p className="contest-alert is-error">{cw.state.error}</p>}
+      {projection.mode==="CW"&&!fldigiPanelOwned&&<fieldset><legend>CW call options</legend>
+        <label><input type="checkbox" checked={earlyCWEnabled} disabled={busy||!projection.run||!cw.state.capabilities?.streaming||dualContestLanes(projection)} onChange={event=>{if(!event.target.checked&&earlyCWRef.current)void stopAutoCQ();else{earlyCWFaultRef.current="";earlyCWRef.current=null;setEarlyCWEnabled(event.target.checked);}}}/> Early start from deliberate typing</label>
+        <label>Start after characters<input aria-label="Early CW threshold" type="number" min={2} max={8} value={earlyCWThreshold} disabled={!!earlyCWRef.current} onChange={event=>setEarlyCWThreshold(Math.max(2,Math.min(8,Number(event.target.value)||3)))}/></label>
+        <button type="button" disabled={!earlyCWEnabled||!cw.state.armed||busy} onClick={()=>void queueEarlyCW({...fieldsRef.current},true)}>Start current call explicitly</button>
+        <p>{cw.state.capabilities?.streaming?"WinKeyer queue admission is shown; RF characters remain unverified. Paste, history and restored text do not start CW. Stop keeps your draft.":"Arm a supported WinKeyer route to review advanced capability. Flex and direct TCI are not qualified for early start or queued speed sections."} {dualContestLanes(projection)&&"Advanced early start is unavailable for exact operating lanes; ordinary lane output is preserved."}</p>
+        <label>Automatic corrected call<select aria-label="Corrected call policy" value={cwCorrectionPolicy} onChange={event=>setCWCorrectionPolicy(event.target.value as "full"|"partial")}><option value="full">Full call (default)</option><option value="partial">Changed component with complete provider evidence</option></select></label>
+        <p>Partial correction falls back to the full call after missing, queued-only, stopped, uncertain, portable or ambiguous evidence.</p>
+      </fieldset>}
+      {projection.mode==="CW"&&!fldigiPanelOwned&&!dualContestLanes(projection)&&<CWComposition context={cw.context} state={cw.state} mode={cw.profile.composition?.mode}
+        disabled={busy||retiring||earlyCWEnabled||autoCQActiveRef.current} compose={cw.controller.compose} stop={cw.controller.stop}/>}
+      <div className="contest-operator-keys">{projection.functionKeys.map(key => <button type="button" key={key.id} disabled={busy || retiring || fldigiReleaseBlocking || phoneReleaseBlocking || (phone ? !phoneCanSend : projection.mode !== "CW" && !fldigiPanelReady)} className={key.highlighted ? "contest-primary" : undefined} onClick={() => void hostAction("contest_function_key", { key: key.id })}>{key.id}</button>)}</div>
+    </section>;
+  };
+  const directDupeKey=projection?`${projection.draftID}|${(fields.callsign??"").trim().toUpperCase()}|${operationFrequencyHz}|${projection.mode}`:"";
+  const directAuthorityDupe=configuredClient&&authorityClientReady&&authorityDupe?.key===directDupeKey?authorityDupe:null;
+  const operatingLaneModels:ContestOperatingLane[]=dualContestLanes(projection)?projection!.operatingLanes!.lanes.map(lane=>{
+    const view=contestLaneProjection(projection!,lane.laneID),buffer=laneBuffersRef.current[lane.laneID];
+    const tx=laneNative?.txContext,canSend=!fldigiReleaseBlocking&&Boolean(tx&&tx.laneID===lane.laneID&&tx.draftID===lane.draftID&&tx.bindingVersion===lane.bindingVersion&&
+      canonicalJSON(tx.binding)===canonicalJSON(lane.binding)&&laneNative?.cw?.armed===true&&lane.mode==="CW");
+    const call=buffer?.fields.callsign??"",authoritativeCall=lane.fields.find(field=>field.id==="callsign")?.value??"";
+    return {laneID:lane.laneID,draftID:lane.draftID,bindingVersion:lane.bindingVersion,binding:lane.binding,
+      fields:view.fields.map(field=>({...field,value:buffer?.fields[field.id]??field.value})),
+      frequencyHz:buffer?Number(buffer.frequencyText):lane.frequencyHz,frequencyText:buffer?.frequencyText,
+      receiveFrequencyHz:lane.receiveFrequencyHz,receiveFrequencyText:buffer?.receiveFrequencyText,
+      mode:lane.mode,modes:view.supportedModes??[lane.mode],run:lane.run,reservedSerial:lane.reservedSerial??null,
+      rememberedCQHz:typeof lane.cqContext?.rememberedCQFrequencyHz==="number"?lane.cqContext.rememberedCQFrequencyHz:null,
+      enterPolicy:view.entryPolicy?.enter??(setup.preferences.useESM?"esm":"manual"),keyBindings:activeContestKeyBindings(setup.preferences.keyBindings),
+      functionKeys:view.functionKeys.map(key=>({key:key.id,label:key.label??key.template??"Message"})),
+      dupe:{state:call!==authoritativeCall?"unchecked":view.dupe?"duplicate":"clear",reason:view.dupe?view.dupeExplanation:undefined},
+      errors:buffer?.conflicts.length?[`Unresolved simultaneous edits: ${buffer.conflicts.join(", ")}`]:[],
+      canLog:Boolean(call.trim()&&!call.includes("?")&&(!view.dupe||view.allowDuplicateCommit)),canSend,
+      canStop:Boolean(laneNative?.txLaneID===lane.laneID),disabled:laneTransitionBusy[lane.laneID]===true,
+      outputUnavailableReason:canSend?null:laneCapabilities?.capabilities?.supported===false?"Exact physical lane output is unavailable. SO1V controls remain available.":
+        "Review native routes, then explicitly request TX for this exact lane and draft. Fake-provider qualification only."};
+  }):[];
+  const laneConfigurationPanel=<details className="contest-entry" aria-label="Operating lane configuration"><summary>Operating lanes · {projection?.operatingLanes?.mode??"SO1V"}</summary>
+    <p>SO1V keeps the existing entry. Two-lane routes are available only when the native owner supplies exact receiver bindings.</p>
+    <button type="button" disabled={busy||retiring} onClick={()=>void readLaneCapabilities().catch(cause=>setError(errorMessage(cause)))}>Review native lane routes</button>
+    {laneCapabilities&&<><p>{laneCapabilities.simulated===true?"Offline fake providers · no physical radio, audio or RF output.":"Native capability review; physical lane qualification is unavailable."}</p>
+      <label>Entry mode<select aria-label="Operating entry mode" value={laneModeChoice} onChange={event=>setLaneModeChoice(event.target.value as typeof laneModeChoice)}>
+        <option>SO1V</option><option disabled={!nativeLaneRoutes().length}>SO2V</option><option disabled={!nativeLaneRoutes().length}>SO2R</option></select></label>
+      {laneModeChoice!=="SO1V"&&(["laneA","laneB"] as const).map(laneID=><label key={laneID}>{laneID==="laneA"?"Lane A":"Lane B"} receiver
+        <select aria-label={`${laneID==="laneA"?"Lane A":"Lane B"} receiver binding`} value={laneRouteChoices[laneID]}
+          onChange={event=>setLaneRouteChoices(value=>({...value,[laneID]:event.target.value}))}>{nativeLaneRoutes().map((route,index)=>{const binding=route.binding??route;
+            return <option key={index} value={String(index)}>{binding.radioID} / {binding.receiverID} / VFO {binding.vfo} / generation {binding.generation}</option>;})}</select></label>)}
+      <button type="button" disabled={busy||retiring||configuredClient} onClick={()=>void configureOperatingLanes().catch(cause=>setError(errorMessage(cause)))}>Save operating lanes</button></>}
+  </details>;
+  const entryPanel: ReactNode = projection && (dualContestLanes(projection)?<>{fldigiReleaseBlocking&&cwPanel()}<ContestOperatingLanes mode={projection.operatingLanes!.mode}
+    lanes={operatingLaneModels} entryLaneID={projection.operatingLanes!.keyboardLaneID} listeningLaneID={laneNative?.listenLaneID??null}
+    requestedTransmitLaneID={laneNative?.txLaneID??null} observedTransmit={{state:"unknown"}} disabled={retiring||configuredClient}
+    onAction={onOperatingLaneAction} renderLaneTools={lane=>lane.mode==="CW"?<ContestCWCorrectionPanel
+      context={nativeLaneContext(captureContestLaneScope(projection,lane.laneID))} call={lane.fields.find(field=>field.id==="callsign")?.value??""}
+      serial={lane.fields.find(field=>field.id===projection.allocatedSerialFieldID)?.value??""} disabled={!lane.canSend||retiring}
+      onSend={async(text,operationID)=>{const scope=captureContestLaneScope(projection,lane.laneID);return enqueueLane(scope,async()=>{
+        if(fldigiReleaseBlocking||fldigiStopRef.current)throw Error("Release fldigi with Stop before sending from another operating lane.");
+        const value:any=await requestContestLaneOutput(nativeLaneContext(scope),"send",{text,operationID});acceptLaneNative(value);
+        return {accepted:value?.receipt?.accepted===true,confirmed:value?.receipt?.confirmed===true};});}}
+      onStop={async()=>{if(fldigiReleaseBlocking){await stopAutoCQ();return{confirmed:!fldigiSnapshotRef.current?.transmit_release_required&&!fldigiSnapshotRef.current?.transmit_release_uncertain};}
+        const value:any=await requestContestLaneOutput(nativeLaneContext(captureContestLaneScope(projection,lane.laneID)),"stop");acceptLaneNative(value);return {confirmed:value?.receipt?.confirmed===true};}}/>:null}/></>
+    :<form className="contest-entry" aria-label={`${projection.pluginName ?? projection.pluginID} entry`} onSubmit={event => { event.preventDefault(); void commitEntry().catch(cause=>setError(errorMessage(cause))); }} onKeyDown={keyDown}>
+    <header><div><h2><Radio size={15}/> {projection.pluginName ?? projection.pluginID} · Not1MM</h2><p>Actual pinned Python plugin · {projection.run ? "Run" : "Search & Pounce"}</p></div><span>{busy ? "Working…" : "Ready"}</span></header>
+    <ContestEntryFields callsign={visibleFields.slice(0, 1).map(field => <ContestTextField key={field.id} label={field.label} aria-label={field.accessibleName} className="contest-call" autoComplete="off" data-contest-field={field.id} inputRef={node => { fieldRefs.current[field.id] = node; }} disabled={busy || retiring || !field.enabled} readOnly={field.readOnly} value={fields[field.id] ?? ""} onFocus={() => focusField(field.id)} onChange={event => changeField(field.id, event.target.value.toUpperCase(), ["insertText","deleteContentBackward","deleteContentForward"].includes((event.nativeEvent as InputEvent).inputType))}/>) } reports={visibleFields.slice(1, 3).map(field => <ContestTextField key={field.id} label={field.label} aria-label={field.accessibleName} data-contest-field={field.id} inputRef={node => { fieldRefs.current[field.id] = node; }} disabled={busy || retiring || !field.enabled} readOnly={field.readOnly} value={fields[field.id] ?? ""} onFocus={() => focusField(field.id)} onChange={event => changeField(field.id, event.target.value)}/>) } exchange={visibleFields.slice(3).map(field => <ContestTextField key={field.id} label={field.label} aria-label={field.accessibleName} data-contest-field={field.id} inputRef={node => { fieldRefs.current[field.id] = node; }} disabled={busy || retiring || !field.enabled} readOnly={field.readOnly} value={fields[field.id] ?? ""} onFocus={() => focusField(field.id)} onChange={event => changeField(field.id, event.target.value.toUpperCase())}/>) } />
+    <div className="contest-entry-context"><div><span>Frequency</span>{observedFrequencyHz !== null
+      ? <strong>{(observedFrequencyHz / 1e6).toFixed(6)} MHz · radio observed</strong>
+      : <ContestTextField label="Manual frequency MHz" inputMode="decimal" disabled={busy || retiring}
+          value={manualFrequencyMHz} onChange={event => setManualFrequencyMHz(event.target.value)} onBlur={syncManualFrequency}/>}</div><div><span>Band / mode</span><strong>{bandLabels[String(projection.band)] ?? projection.band} · {projection.mode}</strong></div><div><span>Operating style</span><button type="button" disabled={busy || retiring} onClick={() => void runMutation(base => mutate("contest_run_state", base, { run: !base.run }), false)}>{projection.run ? "Run" : "S&P"}</button></div></div>
+    <div className={`contest-validation ${(configuredClient?directAuthorityDupe?.isDupe:projection.dupe) ? "is-duplicate" : "is-clear"}`}>
+      <strong>{configuredClient?!directAuthorityDupe?"Authority dupe check pending":directAuthorityDupe.isDupe?"Duplicate":"Dupe check":projection.dupe?"Duplicate":"Dupe check"}</strong>
+      <span>{projection.countryResolved ? "Country resolved by xLog CTY data." : "Unknown country is retained; scoring credit may be zero."}</span></div>
+    {cwPanel()}
+    <footer><button type="button" disabled={busy || retiring || fldigiReleaseBlocking || phoneReleaseBlocking || Boolean(projection.fldigiTransmitAvailable && !fldigiPanelReady)} onClick={() => void hostAction("contest_esm", { field: focusRef.current })}>Enter / ESM</button><button className="contest-primary" type="submit" disabled={busy || retiring}>Log Now</button></footer>
+  </form>);
+  const scorePanel = <aside className="contest-score" aria-label="Score and multipliers"><h2><Trophy size={15}/> Score</h2><ContestScoreSummary score={scoreView}/></aside>;
+  const checkPanel = <section className="contest-score" aria-label="Check Partial"><h2>Check Partial</h2>{projection && <ContestAssistancePanel
+    request={request as ContestRequest} ownerLeaseID={0} sessionID={projection.sessionID} workspaceGeneration={projection.workspaceGeneration}
+    draftID={projection.draftID} callsign={fields.callsign ?? ""} disabled={retiring}
+    onSelect={applyAssistanceCallsign} onSurfaceChange={setSCPSurface}/>}<p className="contest-source">{projection?.history || "Type a call to query Not1MM call history."}</p><p>{projection?.dupe
+      ? projection.dupeExplanation ?? "Worked in this contest" : projection?.countryResolved ? "Country resolved · not a duplicate" : "No country match yet"}</p></section>;
+  const matrixPanel = <section className="contest-score" aria-label="Country and zone matrices"><h2>Countries / zones</h2><div className="contest-multipliers">{[...(matrices.countries ?? []), ...(matrices.zones ?? [])].map((item: Data, index: number) => <span key={`${item.value}-${item.band}-${index}`}>{item.value || "Unknown"} · {bandLabels[String(item.band)] ?? item.band} · {item.qsos}</span>)}</div></section>;
+  const renderedPluginMetadata = pluginContactMetadataColumns(projection?.fields ?? []);
+  const logPanel = <section className="contest-log"><header><div><h2><BookOpen size={15}/> Contest log</h2><p>{logTotal} contacts in the Python-owned DXLOG store.</p></div><div className="contest-log-actions"><button type="button" disabled={busy} onClick={() => void exportLog("cabrillo")}><Download size={14}/>Cabrillo</button><button type="button" disabled={busy} onClick={() => void exportLog("adif")}><Download size={14}/>ADIF</button>{projection?.exportFormats?.includes("edi")&&<button type="button" disabled={busy} onClick={() => void exportLog("edi")}><Download size={14}/>EDI</button>}<button type="button" disabled={busy} onClick={() => void runMutation(base => mutate("contest_recalculate", base))}>Recalculate</button></div></header>{editing && <form className="contest-qso-editor" onSubmit={correct}><h2>Edit {editing.Call}</h2><div className="contest-qso-fields"><ContestTextField label="Callsign" value={editCall} onChange={event => setEditCall(event.target.value.toUpperCase())}/><ContestTextField label="UTC timestamp" value={editTimestamp} onChange={event => setEditTimestamp(event.target.value)}/><ContestTextField label="Frequency MHz" inputMode="decimal" value={editFrequencyMHz} onChange={event => setEditFrequencyMHz(event.target.value)}/><ContestTextField label="Operator" value={editOperator} onChange={event => setEditOperator(event.target.value.toUpperCase())}/><ContestTextField label="Sent report" value={editSent} onChange={event => setEditSent(event.target.value)}/><ContestTextField label="Received report" value={editReceived} onChange={event => setEditReceived(event.target.value)}/><ContestTextField label={projection?.fields.find(field => field.id === "other_1")?.label || "Sent exchange"} inputMode="numeric" value={editSentExchange} onChange={event => setEditSentExchange(event.target.value)}/><ContestTextField label={projection?.fields.find(field => field.id === "other_2")?.label || "Received exchange"} value={editZone} onChange={event => setEditZone(event.target.value)}/>{!renderedPluginMetadata.has("Name")&&<ContestTextField label="Name" value={editName} onChange={event => setEditName(event.target.value)}/>} {!renderedPluginMetadata.has("QTH")&&<ContestTextField label="QTH" value={editQTH} onChange={event => setEditQTH(event.target.value)}/>} {!renderedPluginMetadata.has("Comment")&&<ContestTextField label="Comment" value={editComment} onChange={event => setEditComment(event.target.value)}/>}</div><footer><button className="contest-danger" type="button" onClick={remove}>Delete</button><button type="button" onClick={() => setEditing(null)}>Cancel</button><button className="contest-primary" type="submit">Save correction</button></footer></form>}<ContestLogTable rows={logRows(rows, projection?.pluginID, bandLabels)} disabled={busy || retiring} onEdit={beginEdit}/><footer><button type="button" disabled={busy || logOffset === 0} onClick={() => void loadLogPage(Math.max(0, logOffset - logPageSize))}>Newer</button><span>{logTotal ? `${logOffset + 1}–${logOffset + rows.length} of ${logTotal}` : "No contacts"}</span><button type="button" disabled={busy || logOffset + rows.length >= logTotal} onClick={() => void loadLogPage(logOffset + logPageSize)}>Older</button></footer></section>;
+  const bandMapPanel = <BandMaps spots={spots} radioFrequencyHz={dualContestLanes(projection)?projection?.frequencyHz:radioFrequencyHz} compact onSelect={spot => void chooseSpot(spot)}
+    qtcOpportunities={qtcOpportunities} onQTCReview={spot=>{try{openQTCOpportunity({callsign:spot.callsign});}catch(cause){setError(errorMessage(cause));}}}
+    selectionHint={dualContestLanes(projection)?`Select a spot for ${projection!.operatingLanes!.keyboardLaneID==="laneA"?"Lane A":"Lane B"} and its exact bound receiver; no active-radio fallback.`:
+      "Select a spot to load the active Not1MM draft and tune the selected xLog radio once."}/>;
+  const clusterPanel = <ClusterPanel passive snapshot={cluster} selectedSpotId={selectedSpotId ?? undefined} onRequest={serviceRequest} onSelect={spot => void chooseSpot(spot as BandMapSpot)}/>;
+  const showSetup = (setupOnly || manager)&&!productivityOpen;
+  return <main className={`contest-workspace${setupOnly ? " is-setup-only" : ""}`}>
+    {setupOnly && <h1 className="contest-visually-hidden">Contest Setup</h1>}
+    {projection&&<nav className="contest-productivity-nav" aria-label="Contest workspace views"><button type="button" disabled={busy||retiring}
+      aria-pressed={!productivityOpen} onClick={()=>setProductivityOpen(false)}>Contest setup</button><button type="button" disabled={busy||retiring}
+      aria-pressed={productivityOpen} onClick={()=>setProductivityOpen(true)}>Productivity desk</button>
+      {projection.practice&&<strong role="status">Practice · station output and posting disabled</strong>}</nav>}
+    {productivityOpen&&error&&<p className="contest-alert is-error" role="alert">{error}</p>}
+    {productivityOpen&&notice&&<p className="contest-alert" role="status">{notice}</p>}
+    {setupOnly && !projection && startupOpenError && <section className="contest-alert is-error" role="alert">
+      <p>{startupOpenError}</p>
+      <button type="button" disabled={busy || retiring} onClick={() => setCatalogLoadAttempt(attempt => attempt + 1)}>
+        Retry opening contest
+      </button>
+    </section>}
+    {!setupOnly && <header className="contest-header"><div><h1>Contest Manager / Desk</h1><p>{projection
+      ? `${sessions.find(session => session.sessionID === projection.sessionID)?.name ?? projection.pluginID} · actual Not1MM Python plugin · xLog station services`
+      : "Actual Not1MM Python plugins · xLog station services"}</p></div><div className="contest-header-actions">{projection && <button type="button" disabled={busy} onClick={() => {
+      if (manager) { setManager(false); return; }
+      busyRef.current = true; setBusy(true); setError("");
+      void flushDraftRef.current().then(() => setManager(true)).catch(cause => setError(errorMessage(cause)))
+        .finally(() => { busyRef.current = false; setBusy(false); });
+    }}>{manager ? "Back to desk" : "Select contest"}</button>}</div></header>}
+    {showSetup && <div className="contest-entry-context">
+      <ContestTextField label="Manual frequency MHz" inputMode="decimal" disabled={busy || retiring}
+        value={manualFrequencyMHz} onChange={event => setManualFrequencyMHz(event.target.value)}/>
+      {catalogLoadError && <button type="button" disabled={busy || retiring}
+        onClick={() => setCatalogLoadAttempt(attempt => attempt + 1)}>Reload contest types</button>}
+    </div>}
+    {showSetup ? <ContestSetupPanel value={setup} effectiveMacros={effectiveMacros} sessions={sessions} activeSessionID={projection?.sessionID}
+      catalog={setupCatalog} busy={busy || retiring} newContestDisabled={!catalogReady}
+      onSave={saveSetup} onCreate={createSession} onCreatePractice={projection?createPractice:undefined}
+      preflightContext={{practice:Boolean(projection?.practice),referenceID:projection?.referenceID,scoringRevision:projection?.ruleIdentity?.version,
+        selectedRadio:observedFrequencyHz===null?"Manual frequency; no selected radio receipt.":`${(observedFrequencyHz/1e6).toFixed(6)} MHz observed; output acceptance remains separate.`}}
+      onOpen={session => openSession(session as Session)} onOpenSettings={openContestSetupService}
+      onOpenDialog={setupOnly ? openContestSetupDialog : undefined} onViewChange={setupViewChanged}
+      onOpenCallHistory={() => { if (!surfaceContext) { setError("Open a contest before opening Call History."); return; }
+        if (!setupOnly) setManager(false); void openContestCallHistoryWindow(surfaceContext); }}/>
+      : projection ? <><section className="contest-snapshot" aria-label="Contest identity"><div><span>Station</span><strong>{effectiveStationCall}</strong></div><div><span>Engine</span><strong>Not1MM Python</strong></div><div><span>Plugin</span><strong>{projection.pluginID}</strong></div><div><span>Revision</span><strong>{projection.revision}</strong></div><div><span>Source</span><small>{projection.sourceRevision.slice(0, 12)} · {projection.referenceID}</small></div></section>{detachedAvailable
+        ? !productivityOpen&&<section className="contest-welcome"><h2>Contest windows are ready</h2><p>Use the Contest menu to open and position Main Logging, Check Partial, Stats, Rates, Score Reporting, Messages, Logbook, Band Map, Cluster, Rotator, DXCC, Zone and Remote VFO windows.</p></section>
+        : !productivityOpen&&<section className="contest-welcome"><h2>Preserved contest session</h2><p>This session predates detached contest windows for the current xLog workspace. Its Python/SQLite log is preserved; create a current-workspace contest before opening independent windows.</p></section>}</> : <section className="contest-welcome"><h2>Open a contest session</h2></section>}
+    {productivityOpen&&projection&&<section className="contest-productivity-desk" aria-label="Productivity desk">
+      <UnfinishedEditorWarning/>
+      <nav className="contest-productivity-nav" aria-label="Productivity tools">{["Entry & stack","Check","Log & notes","Skeds","Opportunities","Info & time","Messages","QTC","VHF & sites","Developer kit","Historical import","Submission"].map(tab=><button key={tab}
+        type="button" aria-pressed={productivityTab===tab} onClick={()=>{try{flushUnfinishedEditors();setProductivityTab(tab);}catch(cause){setError(errorMessage(cause));}}}>{tab}</button>)}</nav>
+      {dualContestLanes(projection)&&<p className="contest-source">Selected tools: {projection.operatingLanes!.keyboardLaneID==="laneA"?"Lane A":"Lane B"} · draft {projection.draftID.slice(0,8)}. Stack, notes, messages and loaded suggestions retain their captured lane.</p>}
+      {productivityTab==="Developer kit"&&<ContestDeveloperKit scope={projection} request={request as ContestRequest}/>}
+      {productivityTab==="Historical import"&&<ContestHistoricalImport scope={projection} request={request as ContestRequest} disabled={busy||retiring||configuredClient}
+        onApply={async(records,progress)=>{const origin={sessionID:projection.sessionID,workspaceGeneration:projection.workspaceGeneration};let completed=0;
+          for(const record of records){const current=projectionRef.current;if(!current||current.sessionID!==origin.sessionID||current.workspaceGeneration!==origin.workspaceGeneration)throw Error("Import session changed.");
+            await savePlanning("contest_strategy_apply",{action:"adif_import",record});progress(`Reconciled ${++completed}/${records.length} historical contacts; entry draft preserved.`);}
+        }}/>}
+      {productivityTab==="QTC"&&<ContestQTC scope={projection} request={request as ContestRequest} disabled={busy||retiring||configuredClient}
+        opportunityIntent={qtcOpportunityIntent?.sessionID===projection.sessionID?qtcOpportunityIntent:undefined}
+        onMutate={(action,values)=>{
+          if(projectionRef.current?.sessionID!==projection.sessionID||projectionRef.current?.workspaceGeneration!==projection.workspaceGeneration)
+            throw Error("The QTC source session changed before its update.");
+          return savePlanning("contest_strategy_apply",{action,...values});
+        }} onOutput={intent=>{
+          if(projectionRef.current?.sessionID!==projection.sessionID||projectionRef.current?.workspaceGeneration!==projection.workspaceGeneration)
+            throw Error("The QTC source session changed before output admission.");
+          return sendQTC(intent);
+        }} onStop={()=>stopAutoCQ(true,false,true)}
+        onBookmark={intent=>bookmarkQTC({schema:1,sessionID:projection.sessionID,seriesID:intent.batchID,itemIndex:intent.index??null,
+          operationID:crypto.randomUUID(),event:intent.event},projection.workspaceGeneration)}
+        onReview={intent=>reviewQTC({logId:projection.sessionID,seriesID:intent.batchID,...(intent.index===undefined?{}:{itemIndex:intent.index})})}
+        onEntry={()=>{setProductivityTab("Entry & stack");
+          requestAnimationFrame(()=>{if(dualContestLanes(projection))document.querySelector<HTMLInputElement>(`[data-lane-id="${projection.operatingLanes!.keyboardLaneID}"] [data-contest-lane-field="callsign"]`)?.focus();
+            else fieldRefs.current.callsign?.focus();});}}/>}
+      {productivityTab==="VHF & sites"&&<ContestVHFDesk scope={{...projection,bandLabel:bandDefinitions.find(band=>band.value===projection.band)?.id}} request={request as ContestRequest} disabled={busy||retiring||configuredClient}
+        onMutate={(action,values)=>savePlanning("contest_strategy_apply",{action,...values})}
+        canMapTune={dualContestLanes(projection)&&laneCapabilities?.capabilities?.transverterMapping?.available===true}
+        onTune={async(mapping,origin)=>{const current=projectionRef.current;
+          if(!current||current.sessionID!==origin.sessionID||current.workspaceGeneration!==origin.workspaceGeneration||current.draftID!==origin.draftID||current.selectedLaneID!==origin.selectedLaneID)
+            throw Error("The reviewed transverter lane or draft changed. Review its mapping again.");
+          const scope=captureContestLaneScope(current);
+          return enqueueLane(scope,async base=>{if(base.frequencyHz!==origin.frequencyHz)throw Error("The reviewed RF changed; review the updated entry before tuning IF.");
+            const context=nativeLaneContext(scope);await bindNativeLane(context);
+            return acceptLaneNative(await requestContestLaneOutput(context,"transverter_tune",{mapping,rfFrequencyHz:origin.frequencyHz,mode:base.mode}));});}}/>}
+      <ContestReminders scope={projection} request={request as ContestRequest} disabled={busy||retiring||configuredClient} visible={productivityTab==="Skeds"}
+        prefill={{callsign:fields.callsign??"",frequencyHz:projection.frequencyHz,mode:projection.mode,source:"Current contest draft",...reminderPrefill}}
+        onMutate={(action,values)=>savePlanning("contest_strategy_apply",{action,nowUTC:new Date().toISOString(),...values})}
+        onLoad={loadReminder} onLoadAndTune={async(item,radioID)=>{assertStationAction();
+          const current=projectionRef.current,scope=current&&dualContestLanes(current)?captureContestLaneScope(current):null;
+          if(scope){const lane=assertContestLaneScope(current!,scope);if(lane.binding?.radioID!==radioID)
+            throw Error("The chosen radio does not match the selected lane binding. Select the intended lane and receiver explicitly.");}
+          await loadReminder(item);if(!item.frequencyHz)throw Error("Choose a frequency before tuning.");
+          if(scope){const context=nativeLaneContext(scope);await bindNativeLane(context);acceptLaneNative(await requestContestLaneOutput(context,"tune",{frequencyHz:item.frequencyHz,mode:item.mode}));}
+          else await tuneContestReminder(radioID,item.frequencyHz,item.mode);}}/>
+      {productivityTab==="Skeds"&&<button type="button" disabled={busy||retiring} onClick={()=>void(async()=>{
+        const base=projectionRef.current;if(!base)return;
+        const page=await result<Data>("contest_log_page",{sessionID:base.sessionID,expectedRevision:base.revision,offset:0,limit:1});
+        if(!page.rows.length)throw Error("No last QSO is available.");
+        if(projectionRef.current?.sessionID!==base.sessionID||projectionRef.current.revision!==base.revision)return;
+        const row=page.rows[0];prepareSked({callsign:row.Call,frequencyHz:Math.round(Number(row.Freq)*1000),
+          mode:["USB","LSB"].includes(row.Mode)?"SSB":row.Mode,source:`Last committed QSO ${row.ID} · ${row.TS} UTC`});
+        setNotice("Last QSO is ready as a new sked source. Choose New sked to review it.");
+      })().catch(cause=>setError(errorMessage(cause)))}>Prepare last-QSO sked</button>}
+      {localStorage.getItem(planningRecoveryKey(projection))&&<button type="button" disabled={busy||retiring} onClick={()=>void savePlanning(null).catch(cause=>setError(errorMessage(cause)))}>Recover saved planning action</button>}
+      {productivityTab==="Opportunities"&&<ContestOpportunities scope={projection} request={request as ContestRequest} spots={previewWorkflowSpots}
+        bands={bandDefinitions.filter(band=>configuredBands.includes(band.id)&&activeSupportedBands.includes(band.id)&&
+          ["ALL",band.id.toUpperCase()].includes(String(setup.settings.BandCategory??"ALL").toUpperCase())).map(band=>({id:band.id,
+            frequencyHz:band.lowHz+Math.min(band.highHz-band.lowHz,projection.mode==="SSB"?150000:25000)}))}
+        mode={projection.mode} currentCall={fields.callsign??""} disabled={busy||retiring||configuredClient}
+        onMutate={(action,values)=>savePlanning("contest_strategy_apply",{action,nowUTC:new Date().toISOString(),...values})} onLoad={loadOpportunity} onSked={prepareSked}/>}
+      {productivityTab==="Info & time"&&<><RatesClock lastQsoAt={rates?.lastQsoAt?new Date(rates.lastQsoAt).toISOString():null}
+        {...contestSchedule(setup.pluginID,setup.settings,rates?.lastQsoAt)}/><ContestOperatingInfo scope={projection} request={request as ContestRequest}
+        onPlanSave={async plan=>{await savePlanning("contest_operating_plan_save",{plan});}}/>
+        <ContestIntegrationDelivery scope={{sessionID:projection.sessionID,workspaceGeneration:projection.workspaceGeneration}} request={request as ContestRequest} disabled={busy||retiring}/></>}
+      {productivityTab==="Messages"&&<ContestMessageWorkbench scope={{mode:projection.mode as "CW"|"SSB"|"RTTY",contest:projection.pluginID,operator:setup.operator}}
+        effectiveMacros={effectiveMacros??[]} draft={{id:projection.draftID,fields}} serial={projection.reservedSerial}
+        disabled={busy||retiring||configuredClient} request={planningRequest} onMutate={(method,values)=>savePlanning(method,values)}
+        onExport={async(content,filename)=>{const saved=await invoke<{saved:boolean;cancelled:boolean}>("contest_messages_export",{filename,content});
+          setNotice(saved.saved?"Message bank exported.":"Message export cancelled.");}}/>}
+      {productivityTab==="Entry & stack"&&<>{laneConfigurationPanel}{entryPanel}{projection.digitalLoggingSupported&&<ContestDigitalOperating scope={projection} serviceRequest={serviceRequest} disabled={busy||retiring||configuredClient}
+        onApply={async values=>{const base=projectionRef.current;if(!base||!sameFields(fieldsRef.current,projectionFields(base)))throw Error("Preserve the current edited draft before loading digital evidence.");await runMutation(current=>mutate("contest_digital_select",current,{workspaceGeneration:base.workspaceGeneration,...values}),true,false,true,true);}}/>}
+        <ContestCallStackOwner draft={stackDraft()} getDraft={()=>stackDraft(projectionRef.current,undefined,projection.operatingLanes?.keyboardLaneID)} disabled={busy||retiring||configuredClient}
+        onController={onStackController}
+        mutate={mutateStack} receipt={recoverStack} onError={setError} rejected={cause=>cause instanceof ContestServerError&&cause.outcome!=="uncertain"}
+        classify={async(items,draft,scope)=>{const active=projectionRef.current;if(!active||active.sessionID!==draft.sessionID)throw new Error("Stack scope changed.");
+          const view=draft.laneID?contestLaneProjection(active,draft.laneID):active;
+          if(draft.laneID&&(view.draftID!==draft.draftID||view.bindingVersion!==draft.bindingVersion))throw Error("The classified lane changed.");
+          const value=await result<Data>("contest_spot_points_preview",{sessionID:draft.sessionID,workspaceGeneration:draft.workspaceGeneration,expectedRevision:draft.revision,
+            spots:items.map(item=>({spotID:item.id,callsign:item.callsign,frequencyHz:view.frequencyHz,mode:view.mode}))});
+          return items.map(item=>{const row=value.spots.find((row:Data)=>row.spotID===item.id);return {itemID:item.id,itemRevision:item.revision,scope,
+            state:row?.dupe===true?"duplicate" as const:row?.dupe===false?"clear" as const:"unknown" as const,reason:row?.reason||"Current plugin duplicate scope"};});}}/>
+        {configuredClient&&<p>Call Stack transitions require the local authoritative desk. The existing multi-op logging path remains available in Main Logging.</p>}</>}
+      {productivityTab==="Check"&&<><ContestReverseHistoryPanel request={request as ContestRequest} scope={projection} disabled={busy||retiring}
+        onSelect={(callsign,scope)=>{if(projectionRef.current?.draftID!==scope.draftID||projectionRef.current?.revision!==scope.revision)return;
+          if(fieldsRef.current.callsign?.trim()){setError("Entry is occupied. Park, swap or clear it before loading a history suggestion.");return;}changeField("callsign",callsign);}}/>
+        <ContestVisibleDupesheet request={request as ContestRequest} scope={projection} disabled={busy||retiring}/></>}
+      {productivityTab==="Log & notes"&&<><div className="contest-productivity-actions"><label>Whole-log order<select aria-label="Whole-log sort" value={logOrder.sort} onChange={event=>{
+        const next={...logOrderRef.current,sort:event.target.value};logOrderRef.current=next;setLogOrder(next);void loadLogPage(0);}}>
+          {[["utc","UTC"],["call","Callsign"],["frequency","Frequency"],["sentSerial","Sent serial"],["receivedSerial","Received serial"],["points","Points"],["mode","Mode"]].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
+        <label>Direction<select aria-label="Whole-log direction" value={logOrder.direction} onChange={event=>{const next={...logOrderRef.current,direction:event.target.value};logOrderRef.current=next;setLogOrder(next);void loadLogPage(0);}}><option value="ascending">Ascending</option><option value="descending">Descending</option></select></label>
+        <label>Callsign contains<input aria-label="Whole-log callsign filter" value={logQuery} maxLength={128} onChange={event=>{const value=event.target.value.toUpperCase();setLogQuery(value);logQueryRef.current=value;void loadLogPage(0);}}/></label></div>
+        {logPanel}<ContestNotesPanel scope={dualContestLanes(projection)?{...projection,...captureContestLaneScope(projection)}:projection} request={request as ContestRequest} disabled={busy||retiring}
+          onSave={async(target,text,noteID)=>{await saveNote(target,text,noteID);}} onLast={async()=>{const active=projectionRef.current;if(!active)throw new Error("No active contest.");
+            const origin=dualContestLanes(projection)?captureContestLaneScope(projection):null;if(origin)assertContestLaneScope(active,origin);
+            const page=await result<Data>("contest_log_page",{sessionID:active.sessionID,expectedRevision:active.revision,offset:0,limit:1,
+              ...(origin?contestLaneParams(origin):{})});
+            if(!page.rows.length)throw new Error(origin?"No committed QSO with known attribution is available in this lane.":"Log a QSO before adding a last-QSO note.");
+            return {qsoID:page.rows[0].ID,callsign:page.rows[0].Call,...(origin?{laneID:origin.laneID,bindingVersion:origin.bindingVersion,bindingGeneration:origin.bindingGeneration}:{})};}}/></>}
+      {productivityTab==="Submission"&&<ContestSubmissionPanel scope={projection} request={request as ContestRequest} formats={projection.exportFormats??["cabrillo","adif"]}
+        disabled={busy||retiring} onExport={(format,revision,digest,siteID)=>exportLog(format,true,undefined,revision,digest,siteID)}
+        onRecordingIndex={async()=>{const active=projectionRef.current;if(!active)throw Error("Open a contest.");
+          const base={logID:active.sessionID,observedAtUTC:new Date().toISOString(),audioIncluded:false,completeMediaInventory:false};
+          try{const status:any=await invoke("contest_recorder_request",{request:{action:"status"}});
+            if(status.context?.logId!==active.sessionID||!Array.isArray(status.captures))throw Error("Recorder context/index is unavailable for this log.");
+            const captures=status.captures.filter((item:any)=>(item.logId??item.log_id)===active.sessionID).map((item:any)=>({logID:active.sessionID,captureID:item.captureId??item.capture_id}));
+            const index={...base,status:"registered-capture-IDs-only",source:"native Recorder status",captures};
+            if(new TextEncoder().encode(JSON.stringify(index)).length>12000)throw Error("Recorder index exceeds the snapshot bound; no partial list was substituted.");return index;
+          }catch(cause){return {...base,status:"unavailable",reason:errorMessage(cause)};}}}
+        onArchive={async prepared=>{const active=projectionRef.current;if(!active||active.sessionID!==prepared.sessionID||active.workspaceGeneration!==prepared.workspaceGeneration||busyRef.current||retiring)
+            throw Error("The reviewed archive context changed.");busyRef.current=true;setBusy(true);try{const saved=await nativeContestExportSave(prepared);
+              if(saved.status==="failed")throw Error(saved.message);setNotice(saved.status==="saved"?`Saved immutable archive ${saved.filename}; not submitted.`:"Archive save cancelled.");return saved;
+            }finally{busyRef.current=false;setBusy(false);}}}
+        onInspectArchive={()=>invoke("contest_archive_choose_preview")}/>}
+    </section>}
+    <div hidden aria-hidden="true">{checkPanel}</div>
+  </main>;
+}
+
+export default Not1MMContestWorkspace;

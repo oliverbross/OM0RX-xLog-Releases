@@ -1,0 +1,248 @@
+import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+
+/// A single validated local selection for every restore component. Legacy local
+/// packages retain their original integrity limits; this is not a remote receipt.
+public struct XLogBackupRestoreEnvelope: Sendable {
+    public let preview: XLogBackupPreview
+    public let identity: RemoteBackupPackageIdentity
+    internal let files: [String: Data]
+    internal let hasPackageSeal: Bool
+    internal let legacyDatabaseSnapshot: XLogLegacyRestoreSnapshot?
+
+    internal init(preview: XLogBackupPreview, files: [String: Data], hasPackageSeal: Bool,
+                  legacyDatabaseSnapshot: XLogLegacyRestoreSnapshot? = nil) throws {
+        self.preview = preview
+        self.files = files
+        self.hasPackageSeal = hasPackageSeal
+        self.legacyDatabaseSnapshot = legacyDatabaseSnapshot
+        let captured = try BackupPackageSeal.encode(files)
+        // A legacy local fingerprint binds its validated database SHA/size through
+        // the captured manifest. It supplies neither a seal nor a remote receipt.
+        let databaseBytes = legacyDatabaseSnapshot == nil ? 0 : preview.manifest.databaseBytes
+        let total = Int64(captured.count).addingReportingOverflow(databaseBytes)
+        guard !total.overflow else { throw XLogBackupError.invalidPackage("legacy package size is invalid") }
+        identity = try RemoteBackupPackageIdentity(sha256: BackupPackageSeal.hash(captured), byteCount: total.partialValue)
+    }
+}
+
+/// Only the envelope owns this protected clone. Copies of the value retain it;
+/// dropping the final value removes its private staging directory.
+internal final class XLogLegacyRestoreSnapshot: Sendable {
+    let directory: URL
+    var databaseURL: URL { directory.appendingPathComponent("OM0RX-xLog.sqlite") }
+
+    init(directory: URL) { self.directory = directory }
+    deinit { try? FileManager.default.removeItem(at: directory) }
+}
+
+/// Content integrity, not authentication or encryption. A future executor must upload
+/// these exact bytes and independently verify their identity on the destination.
+public struct XLogBackupEnvelope: Sendable {
+    public let data: Data
+    public let identity: RemoteBackupPackageIdentity
+    public let manifest: XLogBackupManifest
+    public let settings: XLogSettings?
+    public let preferences: XLogBackupPreferences?
+
+    internal init(data: Data, preview: XLogBackupPreview) throws {
+        self.data = data
+        manifest = preview.manifest
+        settings = preview.settings
+        preferences = preview.preferences
+        identity = try RemoteBackupPackageIdentity(sha256: BackupPackageSeal.hash(data), byteCount: Int64(data.count))
+    }
+
+    public func validate(for plan: RemoteBackupUploadPlan, workspaceGeneration: UUID,
+                         destination: RemoteBackupDestination) throws {
+        try plan.validate(workspaceGeneration: workspaceGeneration, destination: destination)
+        guard identity == plan.package else { throw RemoteBackupPlanningError.invalidPackage }
+    }
+}
+
+internal struct BackupPackageSeal: Codable, Equatable {
+    struct FileMetadata {
+        let isDirectory: Bool
+        let isRegularFile: Bool
+        let isSymbolicLink: Bool
+        let fileSize: Int?
+    }
+
+    static func fileMetadata(at url: URL, fileManager: FileManager) throws -> FileMetadata {
+        #if os(Windows)
+        guard let path = LocalFilePath.nativeFileSystemPath(for: url) else {
+            throw XLogBackupError.invalidPackage("invalid payload path")
+        }
+        // URL.resourceValues also asks corelibs for private stat attributes,
+        // whose Windows open omits the extended prefix. Public attributes use
+        // the NT-aware, non-following handle and the same file-type mapping.
+        let attributes = try fileManager.attributesOfItem(atPath: path)
+        guard let type = attributes[.type] as? FileAttributeType else {
+            throw XLogBackupError.invalidPackage("payload type is missing")
+        }
+        let size: Int?
+        if type == .typeRegular {
+            guard let number = attributes[.size] as? NSNumber,
+                  ["C", "s", "S", "i", "I", "l", "L", "q", "Q"].contains(String(cString: number.objCType)),
+                  let value = Int(number.stringValue), value >= 0 else {
+                throw XLogBackupError.invalidPackage("payload size is invalid")
+            }
+            size = value
+        } else { size = nil }
+        return FileMetadata(isDirectory: type == .typeDirectory, isRegularFile: type == .typeRegular,
+                            isSymbolicLink: type == .typeSymbolicLink, fileSize: size)
+        #else
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        return FileMetadata(isDirectory: values.isDirectory == true, isRegularFile: values.isRegularFile == true,
+                            isSymbolicLink: values.isSymbolicLink == true, fileSize: values.fileSize)
+        #endif
+    }
+
+    struct Entry: Codable, Equatable {
+        let path: String
+        let byteCount: Int
+        let sha256: String
+    }
+    static let filename = "package-seal.json"
+    static let maximumBytes = 512 * 1_024 * 1_024
+    let version: Int
+    let entries: [Entry]
+
+    struct Payload: Codable {
+        let seal: BackupPackageSeal
+        let files: [String: Data]
+    }
+
+    static func hash(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func encode<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(value)
+    }
+
+    static func make(_ files: [String: Data]) -> Self {
+        Self(version: 1, entries: files.keys.sorted().map {
+            Entry(path: $0, byteCount: files[$0]!.count, sha256: hash(files[$0]!))
+        })
+    }
+
+    static func validPath(_ path: String) -> Bool {
+        guard !path.isEmpty, path.utf8.count <= 4_096,
+              path.split(separator: "/").count <= 128,
+              !path.hasPrefix("/"), !path.contains("\\"),
+              !path.contains(":"), !path.contains("%"),
+              path.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else { return false }
+        return path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy {
+            let component = String($0)
+            let stem = component.split(separator: ".", omittingEmptySubsequences: false).first?.uppercased() ?? ""
+            let devices = ["CON", "PRN", "AUX", "NUL"] + (1...9).flatMap { ["COM\($0)", "LPT\($0)"] }
+            return !component.isEmpty && component != "." && component != ".."
+                && !component.hasSuffix(".") && !component.hasSuffix(" ") && !devices.contains(stem)
+        }
+    }
+
+    func validate(_ files: [String: Data]) throws {
+        guard version == 1, entries.count <= 100_000,
+              entries.allSatisfy({ Self.validPath($0.path) && $0.path != Self.filename }),
+              Set(entries.map(\.path)).count == entries.count,
+              Set(entries.map { $0.path.precomposedStringWithCanonicalMapping.lowercased() }).count == entries.count,
+              files["manifest.json"] != nil, files["OM0RX-xLog.sqlite"] != nil,
+              self == Self.make(files) else {
+            throw XLogBackupError.invalidPackage("package seal does not match every payload file")
+        }
+    }
+
+    /// Reject links and special files. Never follows a package's link outside its root.
+    static func capture(_ root: URL, fileManager: FileManager, excludingPaths: Set<String> = []) throws -> [String: Data] {
+        let rootValues = try fileMetadata(at: root, fileManager: fileManager)
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
+            throw XLogBackupError.invalidPackage("package must be a real directory")
+        }
+        var files: [String: Data] = [:]
+        var total = 0
+        var directories = 0
+        func walk(_ directory: URL, prefix: String) throws {
+            for url in try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+                let path = prefix + url.lastPathComponent
+                guard validPath(path) else { throw XLogBackupError.invalidPackage("unsafe payload path") }
+                let values = try fileMetadata(at: url, fileManager: fileManager)
+                guard values.isSymbolicLink != true else { throw XLogBackupError.invalidPackage("symbolic links are unsupported") }
+                if values.isDirectory == true {
+                    directories += 1
+                    guard directories <= 100_000 else { throw XLogBackupError.invalidPackage("too many directories") }
+                    try walk(url, prefix: path + "/")
+                } else {
+                    guard values.isRegularFile == true, let size = values.fileSize else {
+                        throw XLogBackupError.invalidPackage("unsupported payload file")
+                    }
+                    if excludingPaths.contains(path) { continue }
+                    guard size <= maximumBytes - total, files.count < 100_000 else {
+                        throw XLogBackupError.invalidPackage("unsupported file or package exceeds staging limit")
+                    }
+                    guard files[path] == nil else {
+                        throw XLogBackupError.invalidPackage("payload filenames are ambiguous")
+                    }
+                    let handle = try openForReading(url)
+                    defer { try? handle.close() }
+                    var data = Data()
+                    while let chunk = try handle.read(upToCount: min(1_048_576, maximumBytes - total - data.count + 1)), !chunk.isEmpty {
+                        guard chunk.count <= maximumBytes - total - data.count else {
+                            throw XLogBackupError.invalidPackage("package exceeds staging limit")
+                        }
+                        data.append(chunk)
+                    }
+                    total += data.count
+                    files[path] = data
+                }
+            }
+        }
+        try walk(root, prefix: "")
+        return files
+    }
+
+    static func verifiedFiles(_ root: URL, fileManager: FileManager) throws -> (Self, [String: Data]) {
+        var files = try capture(root, fileManager: fileManager)
+        guard let data = files.removeValue(forKey: filename) else {
+            throw XLogBackupError.invalidPackage("legacy backup has no package seal; create a new backup for full-package validation")
+        }
+        let seal = try JSONDecoder().decode(Self.self, from: data)
+        try seal.validate(files)
+        return (seal, files)
+    }
+
+    static func openForReading(_ url: URL) throws -> FileHandle {
+        #if os(Windows)
+        guard let path = LocalFilePath.nativeFileSystemPath(for: url) else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        if let handle = FileHandle(forReadingAtPath: path) { return handle }
+        // Preserve Foundation's existing throwing open error if the extended
+        // path could not be opened. Reads and handle closure stay with callers.
+        #endif
+        return try FileHandle(forReadingFrom: url)
+    }
+
+    static func materialize(_ files: [String: Data], at root: URL, fileManager: FileManager) throws {
+        // Reject the same aliases as the package seal before a Windows write
+        // could overwrite one captured reference file with another.
+        guard Set(files.keys.map { $0.precomposedStringWithCanonicalMapping.lowercased() }).count == files.count else {
+            throw XLogBackupError.invalidPackage("payload filenames are ambiguous")
+        }
+        try LocalFilePermissions.createDirectoryWithoutParents(at: root,
+            attributes: LocalFilePermissions.directoryAttributes, fileManager: fileManager)
+        for path in files.keys.sorted() {
+            guard validPath(path) else { throw XLogBackupError.invalidPackage("unsafe payload path") }
+            let url = root.appendingPathComponent(path)
+            try LocalFilePermissions.createDirectoryWithParents(at: url.deletingLastPathComponent(),
+                attributes: LocalFilePermissions.directoryAttributes, fileManager: fileManager)
+            try files[path]!.write(to: url, options: .atomic)
+        }
+    }
+}

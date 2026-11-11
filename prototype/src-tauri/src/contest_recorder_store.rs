@@ -1,0 +1,2038 @@
+//! Recorder-owned files only. No contest SQL, station controls, or audio devices.
+use crate::durable_file::{self, PublishMode};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+pub type Result<T> = std::result::Result<T, String>;
+pub fn utc_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+fn err(e: impl std::fmt::Display) -> String {
+    format!("Recorder storage: {e}")
+}
+pub fn uuid(value: &str) -> Result<()> {
+    uuid::Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| "Invalid recorder identity".into())
+}
+
+/// Refuse symlinks in every existing component, including roots/export parents.
+pub fn safe_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err("Recorder paths must be absolute".into());
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("Unsafe recorder path".into());
+        }
+        current.push(component);
+        #[cfg(windows)]
+        if matches!(component, std::path::Component::Prefix(_)) {
+            // A drive prefix is not a directory until RootDir is appended.
+            // Inspect that real root and every descendant on later iterations.
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err("Recorder paths cannot contain symbolic links".into())
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(err(e)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+pub fn regular(path: &Path) -> Result<File> {
+    safe_path(path)?;
+    let meta = fs::symlink_metadata(path).map_err(err)?;
+    if !meta.is_file() {
+        return Err("Recorder media is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err("Linked recorder media rejected".into());
+        }
+    }
+    File::open(path).map_err(err)
+}
+pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    safe_path(path)?;
+    let parent = path.parent().ok_or("Missing recorder directory")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(err)?;
+    serde_json::to_writer(&mut file, value).map_err(err)?;
+    durable_file::publish_temp(file, path, PublishMode::Replace).map_err(err)
+}
+#[cfg(windows)]
+fn windows_directory_wide(path: &Path) -> Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    if !path.is_absolute() {
+        return Err("Recorder disk directory must be absolute".into());
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err("Recorder disk directory contains NUL".into());
+    }
+    // GetDiskFreeSpaceExW requires a trailing separator for UNC shares.
+    const BACKSLASH: u16 = b'\\' as u16;
+    if wide.last() != Some(&BACKSLASH) {
+        wide.push(BACKSLASH);
+    }
+    wide.push(0);
+    Ok(wide)
+}
+pub fn free_bytes(path: &Path) -> Result<u64> {
+    safe_path(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(err)?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(err(std::io::Error::last_os_error()));
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                available_to_caller: *mut u64,
+                total: *mut u64,
+                total_free: *mut u64,
+            ) -> i32;
+        }
+        let canonical = path.canonicalize().map_err(err)?;
+        let directory = windows_directory_wide(&canonical)?;
+        let mut available = 0u64;
+        // The caller's quota-aware allowance matches statvfs.f_bavail.
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                directory.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(err(std::io::Error::last_os_error()));
+        }
+        Ok(available)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err("Storage forecasting is unavailable on this platform".into())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Config {
+    pub input_id: String,
+    pub output_id: String,
+    pub channels: u16,
+    pub rate: u32,
+    pub mapping: String,
+    pub roles: Vec<String>,
+    pub route_verified: bool,
+    pub pre_seconds: u32,
+    pub post_seconds: u32,
+    pub reserve_bytes: u64,
+    pub warning_bytes: u64,
+}
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        if self.input_id.is_empty()
+            || self.input_id.len() > 512
+            || self.output_id.is_empty()
+            || self.output_id.len() > 512
+            || !(1..=2).contains(&self.channels)
+            || !(8000..=192000).contains(&self.rate)
+            || ![
+                "Receiver audio only",
+                "Operator headphone mix",
+                "Custom channel mapping",
+            ]
+            .contains(&self.mapping.as_str())
+            || self.roles.len() != self.channels as usize
+            || self
+                .roles
+                .iter()
+                .any(|r| r.trim().is_empty() || r.len() > 128)
+            || self.pre_seconds > 600
+            || self.post_seconds > 120
+            || self.reserve_bytes < 1024 * 1024 * 1024
+            || self.warning_bytes < self.reserve_bytes
+            || !self.route_verified
+        {
+            return Err("Choose an explicit mono/stereo source, channel labels, and verified listening route; reserve at least 1 GiB".into());
+        }
+        Ok(())
+    }
+    pub fn bytes_per_second(&self) -> u64 {
+        self.rate as u64 * self.channels as u64 * 2
+    }
+    pub fn reserve(&self) -> u64 {
+        self.reserve_bytes.max(self.bytes_per_second() * 600)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Segment {
+    pub id: u32,
+    pub first_frame: u64,
+    pub frames: u64,
+    pub bytes: u64,
+    pub hash: String,
+    pub recovered: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Link {
+    pub id: String,
+    pub qso_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub sequence: u64,
+    pub revision: u64,
+    pub frame: u64,
+    pub anchor_utc_ms: u64,
+    pub basis: String,
+    pub original: Value,
+    pub current: Value,
+    pub deleted: bool,
+    pub note: String,
+    /// Additive schema-1 QTC reference. Preserve unknown future metadata when
+    /// reopening archives; only newly authored references require schema 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qtc: Option<Value>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    pub schema: u32,
+    pub log_id: String,
+    pub capture_id: String,
+    pub source_version: String,
+    pub source_commit: String,
+    pub config: Config,
+    pub start_utc_ms: u64,
+    pub frames: u64,
+    #[serde(default)]
+    pub saved_frames: u64,
+    pub status: String,
+    pub segments: Vec<Segment>,
+    pub gaps: Vec<Value>,
+    pub cursor: u64,
+    pub time_basis: String,
+    pub consent: String,
+    #[serde(default)]
+    pub controlled_test: bool,
+}
+
+pub struct Archive {
+    pub dir: PathBuf,
+    pub manifest: Manifest,
+    pub links: BTreeMap<String, Link>,
+    admissions: BTreeMap<String, (u64, u64)>,
+    active: Option<File>,
+    active_frames: u64,
+    active_first: u64,
+    pub segment_frames: u64,
+    journal: File,
+    #[cfg(unix)]
+    directory_identity: (u64, u64),
+    #[cfg(windows)]
+    directory_identity: WindowsDirectoryIdentity,
+}
+#[derive(Clone)]
+pub struct Snapshot {
+    pub dir: PathBuf,
+    pub manifest: Manifest,
+    pub links: BTreeMap<String, Link>,
+    active: bool,
+    active_first: u64,
+}
+pub fn segment_path(dir: &Path, id: u32, partial: bool) -> PathBuf {
+    dir.join(format!(
+        "{id:06}.{}",
+        if partial { "partial" } else { "wav" }
+    ))
+}
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).map_err(err)?;
+    Ok((m.dev(), m.ino()))
+}
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsDirectoryIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> Result<WindowsDirectoryIdentity> {
+    use std::{
+        ffi::c_void,
+        os::windows::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawHandle,
+        },
+    };
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut c_void,
+            information_class: i32,
+            information: *mut c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_ID_INFO: i32 = 18;
+    let directory = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(err)?;
+    let metadata = directory.metadata().map_err(err)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("Recorder destination is not a regular directory".into());
+    }
+    let mut identity = WindowsDirectoryIdentity {
+        volume_serial_number: 0,
+        file_id: [0; 16],
+    };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle(),
+            FILE_ID_INFO,
+            &mut identity as *mut WindowsDirectoryIdentity as *mut c_void,
+            std::mem::size_of::<WindowsDirectoryIdentity>() as u32,
+        )
+    } == 0
+    {
+        return Err(err(std::io::Error::last_os_error()));
+    }
+    Ok(identity)
+}
+pub fn header(rate: u32, channels: u16, frames: u64) -> Result<[u8; 44]> {
+    let bytes = frames
+        .checked_mul(channels as u64 * 2)
+        .ok_or("WAV overflow")?;
+    if bytes > u32::MAX as u64 - 36 {
+        return Err("WAV must be exported in bounded parts".into());
+    }
+    let mut h = [0; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(bytes as u32 + 36).to_le_bytes());
+    h[8..16].copy_from_slice(b"WAVEfmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes());
+    h[20..22].copy_from_slice(&1u16.to_le_bytes());
+    h[22..24].copy_from_slice(&channels.to_le_bytes());
+    h[24..28].copy_from_slice(&rate.to_le_bytes());
+    h[28..32].copy_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
+    h[32..34].copy_from_slice(&(channels * 2).to_le_bytes());
+    h[34..36].copy_from_slice(&16u16.to_le_bytes());
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&(bytes as u32).to_le_bytes());
+    Ok(h)
+}
+type IntegrityStamp = (u64, Option<std::time::SystemTime>, u64, u64, i64, i64);
+fn stamp(meta: &fs::Metadata) -> IntegrityStamp {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.len(),
+            meta.modified().ok(),
+            meta.dev(),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        (meta.len(), meta.modified().ok(), 0, 0, 0, 0)
+    }
+}
+#[cfg(any(not(windows), test))]
+fn integrity_cache() -> &'static std::sync::Mutex<BTreeMap<PathBuf, (IntegrityStamp, String)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, (IntegrityStamp, String)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+fn verified(path: &Path, segment: &Segment) -> bool {
+    let Ok(file) = regular(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if meta.len() != segment.bytes {
+        return false;
+    }
+    let identity = stamp(&meta);
+    #[cfg(not(windows))]
+    {
+        let cached = integrity_cache().lock().ok().and_then(|c| {
+            c.get(path)
+                .filter(|(s, _)| *s == identity)
+                .map(|(_, h)| h.clone())
+        });
+        if let Some(hash) = cached { return hash == segment.hash; }
+    }
+    // Windows metadata can remain identical across changed file bytes, even
+    // with FileIdInfo and ChangeTime. Hash this opened file on every check.
+    digest_open(path, file, identity).is_ok_and(|hash| hash == segment.hash)
+}
+fn digest(path: &Path) -> Result<String> {
+    let file = regular(path)?;
+    let before = stamp(&file.metadata().map_err(err)?);
+    digest_open(path, file, before)
+}
+fn digest_open(_path: &Path, mut file: File, before: IntegrityStamp) -> Result<String> {
+    let mut hash = Sha256::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf).map_err(err)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    if before != stamp(&file.metadata().map_err(err)?) {
+        return Err("Recorder media changed during verification".into());
+    }
+    let hash = format!("{:x}", hash.finalize());
+    #[cfg(not(windows))]
+    if let Ok(mut cache) = integrity_cache().lock() {
+        if cache.len() >= 8192 {
+            cache.clear();
+        }
+        cache.insert(_path.into(), (before, hash.clone()));
+    }
+    Ok(hash)
+}
+impl Archive {
+    pub fn create(root: &Path, log_id: &str, config: Config) -> Result<Self> {
+        uuid(log_id)?;
+        config.validate()?;
+        safe_path(root)?;
+        if !root.is_dir() || free_bytes(root)? < config.reserve() {
+            return Err("Recorder disk reserve reached or root unavailable".into());
+        }
+        let capture_id = uuid::Uuid::new_v4().to_string();
+        let log_dir = root.join(log_id);
+        safe_path(&log_dir)?;
+        fs::create_dir_all(&log_dir).map_err(err)?;
+        let dir = log_dir.join(&capture_id);
+        fs::create_dir(&dir).map_err(err)?;
+        let journal = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(dir.join("events.jsonl"))
+            .map_err(err)?;
+        let manifest=Manifest{schema:1,log_id:log_id.into(),capture_id,source_version:env!("CARGO_PKG_VERSION").into(),
+            source_commit:option_env!("XLOG_SOURCE_COMMIT").unwrap_or("development-unrecorded").into(),
+            config:config.clone(),start_utc_ms:utc_ms(),frames:0,saved_frames:0,status:"starting".into(),segments:vec![],gaps:vec![],cursor:0,
+            time_basis:"Local callback arrival / monotonic frame order; hardware latency and distant RF timing unverified".into(),
+            consent:"Explicit Start; no restart auto-start; user-managed retention; no automatic pruning".into(),controlled_test:false};
+        #[cfg(any(unix, windows))]
+        let directory_identity = directory_identity(&dir)?;
+        let result = Self {
+            dir,
+            manifest,
+            links: BTreeMap::new(),
+            admissions: BTreeMap::new(),
+            active: None,
+            active_frames: 0,
+            active_first: 0,
+            segment_frames: config.rate as u64 * 60,
+            journal,
+            #[cfg(any(unix, windows))]
+            directory_identity,
+        };
+        result.checkpoint()?;
+        Ok(result)
+    }
+    pub fn load(root: &Path, log_id: &str, capture_id: &str) -> Result<Self> {
+        uuid(log_id)?;
+        uuid(capture_id)?;
+        let dir = root.join(log_id).join(capture_id);
+        let file = regular(&dir.join("manifest.json"))?;
+        if file.metadata().map_err(err)?.len() > 8 * 1024 * 1024 {
+            return Err("Recorder manifest too large".into());
+        }
+        let manifest: Manifest = serde_json::from_reader(file).map_err(err)?;
+        if manifest.schema != 1 || manifest.log_id != log_id || manifest.capture_id != capture_id {
+            return Err("Archive identity mismatch".into());
+        }
+        manifest.config.validate()?;
+        let mut first = 0;
+        for (index, s) in manifest.segments.iter().enumerate() {
+            if s.id != index as u32
+                || s.first_frame != first
+                || s.frames > manifest.config.rate as u64 * 61
+                || s.bytes != 44 + s.frames * manifest.config.channels as u64 * 2
+                || s.hash.len() != 64
+                || !s.hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("Invalid recorder segment inventory".into());
+            }
+            first = first
+                .checked_add(s.frames)
+                .ok_or("Recorder frame overflow")?;
+        }
+        if manifest.start_utc_ms > 253402300799999
+            || manifest.frames < first
+            || manifest.frames > first + manifest.config.rate as u64 * 60
+            || manifest.frames > manifest.config.rate as u64 * 7 * 86400
+            || manifest.gaps.len() > 10000
+        {
+            return Err("Invalid recorder time/frame inventory".into());
+        }
+        let path = dir.join("events.jsonl");
+        let file = regular(&path)?;
+        use std::io::BufRead;
+        let mut links = BTreeMap::new();
+        let mut admissions = BTreeMap::new();
+        // A torn final journal line is ignored, never extended into a valid event.
+        let mut reader = std::io::BufReader::new(file);
+        let mut bytes = Vec::new();
+        let mut valid_bytes = 0u64;
+        let mut torn = false;
+        loop {
+            bytes.clear();
+            let n = reader
+                .by_ref()
+                .take(32769)
+                .read_until(b'\n', &mut bytes)
+                .map_err(err)?;
+            if n == 0 {
+                break;
+            }
+            if n > 32768 {
+                return Err("Recorder journal entry too large".into());
+            }
+            if bytes.last() != Some(&b'\n') {
+                torn = true;
+                break;
+            }
+            let event: Value = serde_json::from_slice(&bytes).map_err(err)?;
+            if event["type"] == "link" {
+                let link: Link = serde_json::from_value(event["link"].clone()).map_err(err)?;
+                uuid(&link.id)?;
+                if link.note.len() > 1024
+                    || link.frame > manifest.config.rate as u64 * 7 * 86400
+                    || links.len() > 50000
+                {
+                    return Err("Invalid recorder bookmark inventory".into());
+                }
+                links.insert(link.id.clone(), link);
+            }
+            if event["type"] == "admission" {
+                if let (Some(op), Some(frame), Some(utc)) = (
+                    event["operationID"].as_str(),
+                    event["frame"].as_u64(),
+                    event["utcMs"].as_u64(),
+                ) {
+                    uuid(op)?;
+                    if admissions.len() < 50000 {
+                        admissions.insert(op.to_owned(), (frame, utc));
+                    }
+                }
+            }
+            valid_bytes += n as u64;
+        }
+        if torn {
+            drop(reader);
+            let original = dir.join(format!(
+                "events.torn-original-{}.jsonl",
+                uuid::Uuid::new_v4()
+            ));
+            fs::copy(&path, &original).map_err(err)?;
+            let file = OpenOptions::new().write(true).open(&path).map_err(err)?;
+            file.set_len(valid_bytes).map_err(err)?;
+            file.sync_all().map_err(err)?;
+        }
+        let journal = OpenOptions::new().append(true).open(path).map_err(err)?;
+        #[cfg(any(unix, windows))]
+        let directory_identity = directory_identity(&dir)?;
+        Ok(Self {
+            segment_frames: manifest.config.rate as u64 * 60,
+            dir,
+            manifest,
+            links,
+            admissions,
+            active: None,
+            active_frames: 0,
+            active_first: 0,
+            journal,
+            #[cfg(any(unix, windows))]
+            directory_identity,
+        })
+    }
+    fn check_destination(&self) -> Result<()> {
+        safe_path(&self.dir)?;
+        #[cfg(any(unix, windows))]
+        if directory_identity(&self.dir)? != self.directory_identity {
+            return Err(
+                "Recording directory/volume changed; no alternate destination permitted".into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn event(&mut self, event: Value) -> Result<()> {
+        self.check_destination()?;
+        let mut bytes = serde_json::to_vec(&event).map_err(err)?;
+        if bytes.len() > 32767 {
+            return Err("Recorder event too large".into());
+        }
+        bytes.push(b'\n');
+        self.journal
+            .write_all(&bytes)
+            .and_then(|_| self.journal.sync_data())
+            .map_err(err)?;
+        if event["type"] == "admission" {
+            if let (Some(op), Some(frame), Some(utc)) = (
+                event["operationID"].as_str(),
+                event["frame"].as_u64(),
+                event["utcMs"].as_u64(),
+            ) {
+                if self.admissions.len() < 50000 {
+                    self.admissions.entry(op.into()).or_insert((frame, utc));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn checkpoint(&self) -> Result<()> {
+        self.check_destination()?;
+        atomic_json(&self.dir.join("manifest.json"), &self.manifest)
+    }
+    fn open_segment(&mut self) -> Result<()> {
+        let id = self.manifest.segments.len() as u32;
+        let path = segment_path(&self.dir, id, true);
+        safe_path(&path)?;
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(err)?;
+        f.write_all(&header(
+            self.manifest.config.rate,
+            self.manifest.config.channels,
+            0,
+        )?)
+        .map_err(err)?;
+        self.active = Some(f);
+        self.active_frames = 0;
+        self.active_first = self.manifest.frames;
+        Ok(())
+    }
+    pub fn append(&mut self, samples: &[i16]) -> Result<()> {
+        self.check_destination()?;
+        if self.manifest.frames > self.manifest.config.rate as u64 * 7 * 86400 {
+            return Err("Seven-day capture bound reached; explicitly start a new capture".into());
+        }
+        let channels = self.manifest.config.channels as usize;
+        if samples.len() % channels != 0 {
+            return Err("Incomplete PCM frame".into());
+        }
+        let mut offset = 0;
+        while offset < samples.len() {
+            if self.active.is_none() {
+                self.open_segment()?;
+            }
+            let n = ((self.segment_frames - self.active_frames) as usize * channels)
+                .min(samples.len() - offset);
+            let mut bytes = Vec::with_capacity(n * 2);
+            for sample in &samples[offset..offset + n] {
+                bytes.extend(sample.to_le_bytes());
+            }
+            self.active
+                .as_mut()
+                .unwrap()
+                .write_all(&bytes)
+                .map_err(err)?;
+            let frames = (n / channels) as u64;
+            self.active_frames += frames;
+            self.manifest.frames += frames;
+            offset += n;
+            self.manifest.status = "recording".into();
+            if self.active_frames == self.segment_frames {
+                self.finalize_segment()?;
+            }
+        }
+        Ok(())
+    }
+    pub fn flush_tail(&mut self) -> Result<()> {
+        self.check_destination()?;
+        if let Some(file) = self.active.as_mut() {
+            file.seek(SeekFrom::Start(0)).map_err(err)?;
+            file.write_all(&header(
+                self.manifest.config.rate,
+                self.manifest.config.channels,
+                self.active_frames,
+            )?)
+            .map_err(err)?;
+            file.seek(SeekFrom::End(0)).map_err(err)?;
+            file.sync_data().map_err(err)?;
+        }
+        self.manifest.saved_frames = self.manifest.frames;
+        self.checkpoint()
+    }
+    pub fn finalize_segment(&mut self) -> Result<()> {
+        self.flush_tail()?;
+        if let Some(file) = self.active.take() {
+            file.sync_all().map_err(err)?;
+            drop(file);
+            let id = self.manifest.segments.len() as u32;
+            let partial = segment_path(&self.dir, id, true);
+            let path = segment_path(&self.dir, id, false);
+            safe_path(&path)?;
+            if path.exists() {
+                return Err("Recorder refuses to overwrite an original".into());
+            }
+            durable_file::move_noclobber(&partial, &path).map_err(err)?;
+            let segment = Segment {
+                id,
+                first_frame: self.active_first,
+                frames: self.active_frames,
+                bytes: fs::metadata(&path).map_err(err)?.len(),
+                hash: digest(&path)?,
+                recovered: false,
+            };
+            self.event(json!({"type":"segment","segment":segment}))?;
+            self.manifest.segments.push(segment);
+            self.active_frames = 0;
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+    pub fn finish(&mut self, status: &str, reason: Option<&str>) -> Result<()> {
+        self.finalize_segment()?;
+        self.manifest.status = status.into();
+        if let Some(reason) = reason {
+            let gap = json!({"utcMs":utc_ms(),"afterFrame":self.manifest.frames,"reason":reason,"end":"unknown"});
+            self.event(json!({"type":"gap","gap":gap}))?;
+            self.manifest.gaps.push(gap);
+        }
+        self.checkpoint()
+    }
+    pub fn manual(&mut self, note: &str) -> Result<Link> {
+        if note.len() > 1024 || self.manifest.frames == 0 {
+            return Err("Bookmark needs captured samples and a note of at most 1024 bytes".into());
+        }
+        let link = Link {
+            id: uuid::Uuid::new_v4().to_string(),
+            qso_id: None,
+            operation_id: None,
+            sequence: 0,
+            revision: 0,
+            frame: self.manifest.frames,
+            anchor_utc_ms: self.manifest.start_utc_ms
+                + self.manifest.frames * 1000 / self.manifest.config.rate as u64,
+            basis: "captured sample watermark".into(),
+            original: Value::Null,
+            current: Value::Null,
+            deleted: false,
+            note: note.into(),
+            qtc: None,
+        };
+        self.save_link(link.clone())?;
+        Ok(link)
+    }
+    pub fn qtc_marker(&mut self, reference: &Value, note: &str) -> Result<Link> {
+        let allowed=["schema","sessionID","seriesID","itemIndex","operationID","event"];
+        if reference["schema"] != 1 || reference.to_string().len()>1024 || !reference.as_object().is_some_and(|o|o.keys().all(|k|allowed.contains(&k.as_str())))
+            || reference["sessionID"] != self.manifest.log_id || !matches!(reference["event"].as_str(),Some("series_start"|"item"|"series_end"|"interruption"))
+            || !reference["itemIndex"].is_null() && !reference["itemIndex"].as_u64().is_some_and(|i|i<10) {
+            return Err("Invalid or foreign QTC bookmark reference".into());
+        }
+        for key in ["sessionID","seriesID","operationID"] { uuid(reference[key].as_str().ok_or("QTC bookmark identity missing")?)?; }
+        let id=reference["operationID"].as_str().unwrap();
+        if let Some(previous)=self.links.get(id) {
+            return if previous.qtc.as_ref()==Some(reference) && previous.note==note {Ok(previous.clone())}
+                else {Err("QTC bookmark operation was already consumed with other content".into())};
+        }
+        if note.len()>1024 || self.manifest.frames==0 { return Err("QTC bookmark needs captured samples and a bounded note".into()); }
+        let link=Link {id:id.into(),qso_id:None,operation_id:Some(id.into()),sequence:0,revision:0,frame:self.manifest.frames,
+            anchor_utc_ms:self.manifest.start_utc_ms+self.manifest.frames*1000/self.manifest.config.rate as u64,
+            basis:"captured sample watermark".into(),original:Value::Null,current:Value::Null,deleted:false,note:note.into(),qtc:Some(reference.clone())};
+        self.save_link(link.clone())?; Ok(link)
+    }
+    pub fn save_link(&mut self, link: Link) -> Result<()> {
+        if !self.links.contains_key(&link.id) && self.links.len() >= 50000 {
+            return Err("Recorder bookmark limit reached; originals retained".into());
+        }
+        self.event(json!({"type":"link","link":link}))?;
+        self.links.insert(link.id.clone(), link);
+        Ok(())
+    }
+    /// Idempotent committed audit catch-up. Admission markers never create contacts.
+    pub fn reconcile(
+        &mut self,
+        page: &Value,
+        markers: &BTreeMap<String, (u64, u64)>,
+    ) -> Result<()> {
+        if page["engine"] != "not1mm-python" || page["sessionID"] != self.manifest.log_id {
+            return Err("Wrong recorder audit scope".into());
+        }
+        let events = page["events"]
+            .as_array()
+            .ok_or("Invalid recorder audit page")?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.check_destination()?;
+        for event in events {
+            let seq = event["sequence"].as_u64().ok_or("Invalid audit sequence")?;
+            if seq <= self.manifest.cursor {
+                continue;
+            }
+            let id = event["qsoID"].as_str().ok_or("Missing QSO identity")?;
+            uuid(id)?;
+            if let Some(mut link) = self.links.get(id).cloned() {
+                link.current = event["after"].clone();
+                link.revision = event["revision"].as_u64().unwrap_or(0);
+                link.deleted = event["kind"] == "delete";
+                self.save_link(link)?;
+            } else if event["kind"] == "commit" && event["local"] == true {
+                let op = event["operationID"]
+                    .as_str()
+                    .ok_or("Missing commit operation")?;
+                let estimate = event["utcMs"].as_u64().unwrap_or(0);
+                let marker = markers.get(op).or_else(|| self.admissions.get(op)).copied();
+                let (frame, utc, basis) = if let Some((frame, utc)) = marker {
+                    (frame, utc, "local operation admission / callback watermark")
+                } else if estimate >= self.manifest.start_utc_ms
+                    && estimate
+                        <= self.manifest.start_utc_ms
+                            + self.manifest.frames * 1000 / self.manifest.config.rate as u64
+                {
+                    (
+                        (estimate - self.manifest.start_utc_ms) * self.manifest.config.rate as u64
+                            / 1000,
+                        estimate,
+                        "recorded QSO time estimate / no admission marker",
+                    )
+                } else {
+                    self.manifest.cursor = seq;
+                    continue;
+                };
+                let link = Link {
+                    id: id.into(),
+                    qso_id: Some(id.into()),
+                    operation_id: Some(op.into()),
+                    sequence: seq,
+                    revision: event["revision"].as_u64().unwrap_or(0),
+                    frame,
+                    anchor_utc_ms: utc,
+                    basis: basis.into(),
+                    original: event["after"].clone(),
+                    current: event["after"].clone(),
+                    deleted: false,
+                    note: String::new(),
+                    qtc: None,
+                };
+                self.save_link(link)?;
+            }
+            self.manifest.cursor = seq;
+        }
+        self.checkpoint()
+    }
+    /// Repair to a NEW file, retaining the partial original. No fabricated samples.
+    pub fn recover(&mut self) -> Result<()> {
+        self.check_destination()?;
+        let id = self.manifest.segments.len() as u32;
+        // Rename may have succeeded before manifest publication: verify and adopt it.
+        let final_path = segment_path(&self.dir, id, false);
+        let partial = segment_path(&self.dir, id, true);
+        let source = if final_path.exists() {
+            final_path.clone()
+        } else {
+            partial.clone()
+        };
+        if source.exists() {
+            let mut input = regular(&source)?;
+            let len = input.metadata().map_err(err)?.len();
+            let channels = self.manifest.config.channels;
+            let rate = self.manifest.config.rate;
+            let mut h = [0; 44];
+            input.read_exact(&mut h).map_err(err)?;
+            let expected = header(rate, channels, 0)?;
+            if h[0..4] != expected[0..4]
+                || h[8..40] != expected[8..40]
+                || len < 44
+                || len > 44 + rate as u64 * channels as u64 * 2 * 61
+            {
+                return Err("Unrecognized partial audio; retained for manual recovery".into());
+            }
+            let frames = (len - 44) / (channels as u64 * 2);
+            let path = if source == partial {
+                self.dir.join(format!("{id:06}.recovered.wav"))
+            } else {
+                source.clone()
+            };
+            if source == partial {
+                safe_path(&path)?;
+                let mut out = tempfile::NamedTempFile::new_in(&self.dir).map_err(err)?;
+                out.write_all(&header(rate, channels, frames)?)
+                    .map_err(err)?;
+                std::io::copy(&mut input.take(frames * channels as u64 * 2), &mut out)
+                    .map_err(err)?;
+                out.as_file().sync_all().map_err(err)?;
+                // A prior recovery may have synced its output before publishing
+                // the manifest. Adopt only byte-identical complete output.
+                let prepared_hash = digest(out.path())?;
+                if path.exists() && digest(&path).is_ok_and(|hash| hash == prepared_hash) {
+                    // Temp copy drops; prior complete recovery is preserved.
+                } else {
+                    if path.exists() {
+                        regular(&path)?;
+                        let retained = self.dir.join(format!(
+                            "{id:06}.interrupted-recovery-{}.wav",
+                            uuid::Uuid::new_v4()
+                        ));
+                        durable_file::move_noclobber(&path, &retained).map_err(err)?;
+                    }
+                    durable_file::publish_temp(out, &path, PublishMode::NoClobber).map_err(err)?;
+                }
+            }
+            let first = self
+                .manifest
+                .segments
+                .last()
+                .map(|s| s.first_frame + s.frames)
+                .unwrap_or(0);
+            self.manifest.segments.push(Segment {
+                id,
+                first_frame: first,
+                frames,
+                bytes: 44 + frames * channels as u64 * 2,
+                hash: digest(&path)?,
+                recovered: source == partial,
+            });
+            self.manifest.frames = first + frames;
+            self.event(json!({"type":"recovery","retainedOriginal":source.file_name().unwrap().to_string_lossy(),"discardedIncompleteFrameBytes":(len-44)%(channels as u64*2),"powerLossGuarantee":"OS sync checkpoint only; hardware cache durability unproven"}))?;
+        }
+        self.finish(
+            "recovered",
+            Some("Application interruption; explicit Start required, unknown missing interval"),
+        )
+    }
+    pub fn media_path(&self, segment: &Segment) -> PathBuf {
+        if segment.recovered {
+            self.dir.join(format!("{:06}.recovered.wav", segment.id))
+        } else {
+            segment_path(&self.dir, segment.id, false)
+        }
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            dir: self.dir.clone(),
+            manifest: self.manifest.clone(),
+            links: self.links.clone(),
+            active: self.active.is_some(),
+            active_first: self.active_first,
+        }
+    }
+    pub fn coverage(&self, start: u64, end: u64) -> String {
+        coverage(&self.dir, &self.manifest, start, end)
+    }
+    #[cfg(test)]
+    pub fn read_pcm(&self, start: u64, end: u64) -> Result<Vec<i16>> {
+        self.snapshot().read_pcm(start, end)
+    }
+}
+impl Snapshot {
+    pub fn coverage(&self, start: u64, end: u64) -> String {
+        coverage(&self.dir, &self.manifest, start, end)
+    }
+    /// One IPC response only; no verification state survives this call.
+    pub fn coverage_batch(&self, intervals: &[(u64, u64)]) -> Result<Vec<String>> {
+        if intervals.len() > 500 {
+            return Err("Query up to 500 coverage intervals".into());
+        }
+        #[cfg(windows)]
+        {
+            Ok(coverage_batch_with(&self.dir, &self.manifest, intervals, verified))
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(intervals.iter().map(|&(start, end)| self.coverage(start, end)).collect())
+        }
+    }
+    pub fn media_path(&self, segment: &Segment) -> PathBuf {
+        if segment.recovered {
+            self.dir.join(format!("{:06}.recovered.wav", segment.id))
+        } else {
+            segment_path(&self.dir, segment.id, false)
+        }
+    }
+    /// Bounded read; playback never loads an event-length recording into memory.
+    pub fn read_pcm(&self, start: u64, end: u64) -> Result<Vec<i16>> {
+        if start >= end
+            || end > self.manifest.frames
+            || end - start > self.manifest.config.rate as u64 * 720
+        {
+            return Err(
+                "Choose up to 12 minutes of captured audio; pending/gap intervals cannot play"
+                    .into(),
+            );
+        }
+        let channels = self.manifest.config.channels as u64;
+        let mut output = Vec::with_capacity(((end - start) * channels) as usize);
+        for s in &self.manifest.segments {
+            let a = start.max(s.first_frame);
+            let b = end.min(s.first_frame + s.frames);
+            if a >= b {
+                continue;
+            }
+            let path = self.media_path(s);
+            if digest(&path)? != s.hash {
+                return Err("Recorder media hash mismatch; original retained".into());
+            }
+            read_range(&path, a - s.first_frame, b - a, channels, &mut output)?;
+        }
+        if self.active {
+            let a = start.max(self.active_first);
+            if a < end {
+                let partial = segment_path(&self.dir, self.manifest.segments.len() as u32, true);
+                // Rotation may have renamed the frozen active tail while this reader prepared.
+                let path = if partial.exists() {
+                    partial
+                } else {
+                    segment_path(&self.dir, self.manifest.segments.len() as u32, false)
+                };
+                read_range(&path, a - self.active_first, end - a, channels, &mut output)?;
+            }
+        }
+        if output.len() as u64 != (end - start) * channels {
+            return Err("Audio interval has a coverage gap".into());
+        }
+        Ok(output)
+    }
+    pub fn export(&self, parent: &Path, include_notes: bool) -> Result<PathBuf> {
+        self.export_cancellable(
+            parent,
+            include_notes,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    pub fn export_cancellable(
+        &self,
+        parent: &Path,
+        include_notes: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<PathBuf> {
+        safe_path(parent)?;
+        if !parent.is_dir() || parent.starts_with(&self.dir) {
+            return Err("Choose a separate export folder".into());
+        }
+        let dir = parent.join(format!(
+            "xlog-audio-{}-{}",
+            self.manifest.capture_id,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&dir).map_err(err)?;
+        let mut manifest = self.manifest.clone();
+        manifest.frames = manifest
+            .segments
+            .last()
+            .map(|s| s.first_frame + s.frames)
+            .unwrap_or(0);
+        manifest.status = "export snapshot / finalized segments only".into();
+        // No completion manifest until EVERY member is copied and independently hashed.
+        for s in &manifest.segments {
+            let source = self.media_path(s);
+            if digest(&source)? != s.hash {
+                return Err(
+                    "Export stopped: missing/corrupt original; incomplete folder has no manifest"
+                        .into(),
+                );
+            }
+            let target = dir.join(source.file_name().ok_or("Missing media name")?);
+            let mut input = regular(&source)?;
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&target)
+                .map_err(err)?;
+            let mut buffer = [0u8; 65536];
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(
+                        "Export cancelled; incomplete directory has no completion manifest".into(),
+                    );
+                }
+                let n = input.read(&mut buffer).map_err(err)?;
+                if n == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..n]).map_err(err)?;
+            }
+            output.sync_all().map_err(err)?;
+            if digest(&target)? != s.hash {
+                return Err("Export integrity check failed".into());
+            }
+        }
+        let mut links: Vec<_> = self.links.values().cloned().collect();
+        if !include_notes {
+            for link in &mut links {
+                link.note.clear();
+            }
+        }
+        atomic_json(&dir.join("bookmarks.json"), &links)?;
+        let playlist = manifest
+            .segments
+            .iter()
+            .map(|s| {
+                self.media_path(s)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(dir.join("continuous.m3u"), format!("#EXTM3U\n{playlist}\n")).map_err(err)?;
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Export cancelled; no completion manifest".into());
+        }
+        atomic_json(&dir.join("manifest.json"), &manifest)?;
+        Ok(dir)
+    }
+}
+fn coverage_range_status(m: &Manifest, start: u64, end: u64) -> Option<&'static str> {
+    if start >= end || start >= m.frames {
+        Some("unavailable")
+    } else if end > m.frames {
+        Some(if m.status == "recording" { "pending-tail" } else { "partial" })
+    } else {
+        None
+    }
+}
+fn coverage(dir: &Path, m: &Manifest, start: u64, end: u64) -> String {
+    if let Some(status) = coverage_range_status(m, start, end) {
+        return status.into();
+    }
+    for s in &m.segments {
+        let path = if s.recovered {
+            dir.join(format!("{:06}.recovered.wav", s.id))
+        } else {
+            segment_path(dir, s.id, false)
+        };
+        if s.first_frame < end && s.first_frame + s.frames > start && !verified(&path, s) {
+            return "file missing/corrupt".into();
+        }
+    }
+    coverage_tail(dir, m, end)
+}
+fn coverage_tail(dir: &Path, m: &Manifest, end: u64) -> String {
+    let finalized = m
+        .segments
+        .last()
+        .map(|s| s.first_frame + s.frames)
+        .unwrap_or(0);
+    if end > finalized {
+        let path = segment_path(dir, m.segments.len() as u32, true);
+        let minimum = 44 + (end - finalized) * m.config.channels as u64 * 2;
+        if !regular(&path)
+            .and_then(|f| f.metadata().map_err(err))
+            .is_ok_and(|meta| meta.len() >= minimum)
+        {
+            return "file missing/corrupt".into();
+        }
+    }
+    "available".into()
+}
+// Production uses this only for Windows. The test build exercises the same
+// interval algorithm on every host; Unix IPC keeps its original per-row path.
+#[cfg(any(windows, test))]
+fn coverage_batch_with(
+    dir: &Path,
+    m: &Manifest,
+    intervals: &[(u64, u64)],
+    mut verify: impl FnMut(&Path, &Segment) -> bool,
+) -> Vec<String> {
+    let mut statuses: Vec<_> = intervals.iter()
+        .map(|&(start, end)| coverage_range_status(m, start, end))
+        .collect();
+    if intervals.is_empty() { return Vec::new(); }
+    for segment in &m.segments {
+        if !intervals.iter().enumerate().any(|(index, &(start, end))| {
+            statuses[index].is_none() && segment.first_frame < end
+                && segment.first_frame + segment.frames > start
+        }) {
+            continue;
+        }
+        let path = if segment.recovered {
+            dir.join(format!("{:06}.recovered.wav", segment.id))
+        } else {
+            segment_path(dir, segment.id, false)
+        };
+        // This exact path/expected bytes/hash entry is checked once and used
+        // only by its intersecting rows in this immutable snapshot response.
+        if !verify(&path, segment) {
+            for (index, &(start, end)) in intervals.iter().enumerate() {
+                if statuses[index].is_none()
+                    && segment.first_frame < end
+                    && segment.first_frame + segment.frames > start {
+                    statuses[index] = Some("file missing/corrupt");
+                }
+            }
+        }
+    }
+    intervals.iter().enumerate().map(|(index, &(_, end))| {
+        statuses[index].map(str::to_owned).unwrap_or_else(|| coverage_tail(dir, m, end))
+    }).collect()
+}
+fn read_range(
+    path: &Path,
+    first: u64,
+    frames: u64,
+    channels: u64,
+    output: &mut Vec<i16>,
+) -> Result<()> {
+    let mut file = regular(path)?;
+    file.seek(SeekFrom::Start(44 + first * channels * 2))
+        .map_err(err)?;
+    let mut bytes = vec![0; (frames * channels * 2) as usize];
+    file.read_exact(&mut bytes).map_err(err)?;
+    output.extend(
+        bytes
+            .chunks_exact(2)
+            .map(|v| i16::from_le_bytes([v[0], v[1]])),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn config(channels: u16) -> Config {
+        Config {
+            input_id: "fixture-input-uid".into(),
+            output_id: "fixture-headphones-uid".into(),
+            channels,
+            rate: 8000,
+            mapping: "Custom channel mapping".into(),
+            roles: (0..channels)
+                .map(|i| format!("Receiver {} / fixture only", i + 1))
+                .collect(),
+            route_verified: true,
+            pre_seconds: 45,
+            post_seconds: 10,
+            reserve_bytes: 1 << 30,
+            warning_bytes: 5 << 30,
+        }
+    }
+    fn root() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap();
+        (temp, path)
+    }
+    #[test]
+    fn coverage_batch_preserves_range_tail_statuses_and_request_limit() {
+        let (_temp, root) = root();
+        let mut archive = archive(&root, 1);
+        archive.append(&signal(10, 1)).unwrap();
+        archive.flush_tail().unwrap();
+        let intervals = [(0, 0), (10, 11), (0, 11), (0, 10), (2, 8)];
+        for recording in [false, true] {
+            archive.manifest.status = if recording { "recording" } else { "stopped" }.into();
+            let snapshot = archive.snapshot();
+            let expected: Vec<_> = intervals.iter().map(|&(a, b)| snapshot.coverage(a, b)).collect();
+            assert_eq!(coverage_batch_with(&snapshot.dir, &snapshot.manifest, &intervals, verified), expected);
+            assert_eq!(snapshot.coverage_batch(&intervals).unwrap(), expected);
+        }
+        let snapshot = archive.snapshot();
+        let partial = segment_path(&archive.dir, 0, true);
+        drop(archive); // Close fixture-owned active handles before Windows removal.
+        fs::remove_file(partial).unwrap();
+        assert_eq!(coverage_batch_with(&snapshot.dir, &snapshot.manifest, &[(0, 10)], verified), ["file missing/corrupt"]);
+        assert!(snapshot.coverage_batch(&vec![(0, 1); 501]).is_err());
+        assert!(snapshot.coverage_batch(&[]).unwrap().is_empty());
+    }
+    #[test]
+    fn coverage_batch_preserves_finalized_and_recovered_segment_results() {
+        let (_temp, root) = root();
+        let mut archive = archive(&root, 1);
+        archive.segment_frames = 10;
+        archive.append(&signal(20, 1)).unwrap();
+        archive.finish("stopped", None).unwrap();
+        let mut snapshot = archive.snapshot();
+        let intervals = [(0, 5), (5, 15), (10, 20), (0, 21), (20, 21)];
+        fs::rename(snapshot.media_path(&snapshot.manifest.segments[0]),
+            snapshot.dir.join("000000.recovered.wav")).unwrap();
+        snapshot.manifest.segments[0].recovered = true;
+        for corrupt_second in [false, true] {
+            if corrupt_second { snapshot.manifest.segments[1].hash = "0".repeat(64); }
+            let expected: Vec<_> = intervals.iter().map(|&(a, b)| snapshot.coverage(a, b)).collect();
+            assert_eq!(coverage_batch_with(&snapshot.dir, &snapshot.manifest, &intervals, verified), expected);
+            assert_eq!(snapshot.coverage_batch(&intervals).unwrap(), expected);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_coverage_batch_reads_overlapping_media_once_and_next_response_is_fresh() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_temp, root) = root();
+        let mut cfg = config(2);
+        cfg.rate = 48000;
+        let mut archive = Archive::create(&root, &uuid::Uuid::new_v4().to_string(), cfg).unwrap();
+        let pcm: Vec<i16> = (0..48000 * 60).flat_map(|frame| {
+            let sample = (frame % 16000) as i16;
+            [sample, -sample]
+        }).collect();
+        assert_eq!(pcm.len(), 48000 * 60 * 2);
+        archive.append(&pcm).unwrap();
+        archive.finish("stopped", None).unwrap();
+        let snapshot = archive.snapshot();
+        assert_eq!(snapshot.manifest.segments.len(), 1);
+        let media = snapshot.media_path(&snapshot.manifest.segments[0]);
+        let original = fs::read(&media).unwrap();
+        let metadata = fs::metadata(&media).unwrap();
+        let original_stamp = stamp(&metadata);
+        let original_modified = metadata.modified().unwrap();
+        let intervals = vec![(0, 48000 * 55); 100];
+        let started = std::time::Instant::now();
+        let (mut reads, mut bytes) = (0usize, 0u64);
+        let first = coverage_batch_with(&snapshot.dir, &snapshot.manifest, &intervals, |path, segment| {
+            reads += 1;
+            bytes += segment.bytes;
+            verified(path, segment)
+        });
+        assert!(first.iter().all(|status| status == "available"));
+        assert_eq!(reads, 1);
+        assert_eq!(bytes, original.len() as u64);
+        eprintln!("coverage_batch_timing {}", json!({"rows":intervals.len(),"freshSegmentReads":reads,
+            "bytes":bytes,"elapsedMicros":started.elapsed().as_micros()}));
+
+        let mut corrupt = original.clone();
+        corrupt[44] ^= 1;
+        let mut writer = OpenOptions::new().write(true).truncate(true).open(&media).unwrap();
+        writer.write_all(&corrupt).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        let attributes = OpenOptions::new().access_mode(0x100).open(&media).unwrap();
+        attributes.set_times(fs::FileTimes::new().set_modified(original_modified)).unwrap();
+        drop(attributes);
+        assert_eq!(stamp(&fs::metadata(&media).unwrap()), original_stamp);
+        let trace = readonly_integrity_trace(&media, &original);
+        let started = std::time::Instant::now();
+        let mut next_reads = 0;
+        let next = coverage_batch_with(&snapshot.dir, &snapshot.manifest, &intervals, |path, segment| {
+            next_reads += 1;
+            verified(path, segment)
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(next_reads, 1);
+        assert!(next.iter().all(|status| status == "file missing/corrupt"), "trace={trace}; next={next:?}");
+        eprintln!("coverage_batch_fresh_response {}", json!({"rows":intervals.len(),"freshSegmentReads":next_reads,
+            "bytes":original.len(),"elapsedMicros":elapsed.as_micros()}));
+        assert!(snapshot.coverage_batch(&intervals).unwrap().iter().all(|status| status == "file missing/corrupt"));
+    }
+    #[test]
+    fn atomic_manifest_requires_existing_parent_and_replaces_complete_document() {
+        let (_temp, root) = root();
+        let missing = root.join("removed-capture");
+        assert!(atomic_json(&missing.join("manifest.json"), &json!({"frames": 1})).is_err());
+        assert!(!missing.exists());
+
+        let path = root.join("manifest.json");
+        atomic_json(&path, &json!({"frames": 1, "status": "starting"})).unwrap();
+        atomic_json(&path, &json!({"frames": 2, "status": "stopped"})).unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, json!({"frames": 2, "status": "stopped"}));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn admitted_directory_replacement_rejects_writes_before_any_bytes_change() {
+        let (_temp, root) = root();
+        let mut archive = archive(&root, 1);
+        archive.append(&signal(10, 1)).unwrap();
+        archive.flush_tail().unwrap();
+        let admitted = archive.dir.clone();
+        let manifest = fs::read(admitted.join("manifest.json")).unwrap();
+        let journal = fs::read(admitted.join("events.jsonl")).unwrap();
+        let media = fs::read(segment_path(&admitted, 0, true)).unwrap();
+        let frames = archive.manifest.frames;
+        let retained = replace_admitted_directory_for_test(&mut archive);
+
+        let expected = "Recording directory/volume changed; no alternate destination permitted";
+        assert_eq!(archive.append(&[123]).unwrap_err(), expected);
+        assert_eq!(archive.event(json!({"type": "must-not-publish"})).unwrap_err(), expected);
+        assert_eq!(archive.checkpoint().unwrap_err(), expected);
+        assert_eq!(archive.manifest.frames, frames);
+        assert_eq!(fs::read_dir(&admitted).unwrap().count(), 0);
+        assert_eq!(fs::read(retained.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(fs::read(retained.join("events.jsonl")).unwrap(), journal);
+        assert_eq!(fs::read(segment_path(&retained, 0, true)).unwrap(), media);
+    }
+    #[cfg(any(unix, windows))]
+    fn directory_bytes(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fs::read_dir(directory).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            (PathBuf::from(entry.file_name()), fs::read(entry.path()).unwrap())
+        }).collect()
+    }
+    #[cfg(any(unix, windows))]
+    fn recorder_state(archive: &mut Archive) -> Value {
+        let position = archive.active.as_mut().map(|file| file.stream_position().unwrap());
+        json!({"manifest":archive.manifest,"links":archive.links,"admissions":archive.admissions,
+            "activeFrames":archive.active_frames,"activeFirst":archive.active_first,"activePosition":position})
+    }
+    #[cfg(any(unix, windows))]
+    fn replace_admitted_directory_for_test(archive: &mut Archive) -> PathBuf {
+        let admitted = archive.dir.clone();
+        let retained = admitted.with_extension("retained-original");
+        let identity = archive.directory_identity;
+        let state = recorder_state(archive);
+        #[cfg(windows)]
+        let positions = {
+            // Windows refuses this move with live child handles. Close only
+            // during fixture reconstruction, then reopen the same retained
+            // files without replacing the admitted logical identity.
+            let active = archive.active.as_mut().map(|file| file.stream_position().unwrap());
+            let journal = archive.journal.stream_position().unwrap();
+            drop(archive.active.take());
+            drop(std::mem::replace(&mut archive.journal, tempfile::tempfile().unwrap()));
+            (active, journal)
+        };
+        fs::rename(&admitted, &retained).unwrap();
+        fs::create_dir(&admitted).unwrap();
+        #[cfg(windows)]
+        {
+            let partial = segment_path(&retained, archive.manifest.segments.len() as u32, true);
+            archive.active = positions.0.map(|position| {
+                let mut file = OpenOptions::new().read(true).write(true).open(&partial).unwrap();
+                file.seek(SeekFrom::Start(position)).unwrap();
+                file
+            });
+            let mut journal = OpenOptions::new().append(true).open(retained.join("events.jsonl")).unwrap();
+            journal.seek(SeekFrom::Start(positions.1)).unwrap();
+            drop(std::mem::replace(&mut archive.journal, journal));
+            assert_eq!(archive.journal.stream_position().unwrap(), positions.1);
+        }
+        assert_eq!(archive.directory_identity, identity);
+        assert_eq!(directory_identity(&retained).unwrap(), identity);
+        assert_ne!(directory_identity(&admitted).unwrap(), identity);
+        assert_eq!(recorder_state(archive), state);
+        retained
+    }
+    #[cfg(windows)]
+    fn native_integrity_trace(file: &File) -> Value {
+        use std::{ffi::c_void, os::windows::io::AsRawHandle};
+        #[repr(C)]
+        #[derive(Default)]
+        struct BasicInfo {
+            creation_time: i64,
+            last_access_time: i64,
+            last_write_time: i64,
+            change_time: i64,
+            attributes: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileInformationByHandleEx(handle: *mut c_void, class: i32, output: *mut c_void, size: u32) -> i32;
+        }
+        let mut basic = BasicInfo::default();
+        let basic_ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 0,
+            &mut basic as *mut BasicInfo as *mut c_void, std::mem::size_of::<BasicInfo>() as u32) } != 0;
+        let basic_error = (!basic_ok).then(|| std::io::Error::last_os_error().to_string());
+        let mut identity = WindowsDirectoryIdentity { volume_serial_number: 0, file_id: [0; 16] };
+        let identity_ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 18,
+            &mut identity as *mut WindowsDirectoryIdentity as *mut c_void,
+            std::mem::size_of::<WindowsDirectoryIdentity>() as u32) } != 0;
+        let identity_error = (!identity_ok).then(|| std::io::Error::last_os_error().to_string());
+        // Observation only: timestamps do not prove that file bytes match.
+        json!({"basicOK":basic_ok,"basicError":basic_error,
+            "lastWriteTime":basic.last_write_time.to_string(),"changeTime":basic.change_time.to_string(),
+            "identityOK":identity_ok,"identityError":identity_error,
+            "volumeSerial":identity.volume_serial_number.to_string(),"fileId":identity.file_id})
+    }
+    #[cfg(not(windows))]
+    fn native_integrity_trace(_file: &File) -> Value { Value::Null }
+    fn readonly_integrity_trace(path: &Path, expected_bytes: &[u8]) -> Value {
+        // Clone the entry before coverage. Never invoke digest or change cache.
+        let cached = integrity_cache().lock().ok().and_then(|cache| cache.get(path).cloned());
+        let mut file = File::open(path).unwrap();
+        let before = stamp(&file.metadata().unwrap());
+        let native = native_integrity_trace(&file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let mut independent = Sha256::new();
+        independent.update(&bytes);
+        let hash = format!("{:x}", independent.finalize());
+        json!({"weakStamp":format!("{before:?}"),
+            "weakStampAfterRead":format!("{:?}",stamp(&file.metadata().unwrap())),
+            "cachedBeforeCoverage":cached.map(|(stamp,hash)|json!({"stamp":format!("{stamp:?}"),"hash":hash})),
+            "cachePoisoned":integrity_cache().is_poisoned(),"nativeSameHandle":native,
+            "independentSHA256":hash,"readbackLength":bytes.len(),"readbackMatchesOriginal":bytes==expected_bytes})
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replaced_directory_rejects_unflushed_tail_finalization_and_finish_before_any_mutation() {
+        for operation in ["flush_tail", "finalize_segment", "finish"] {
+            let (_temp, root) = root();
+            let mut archive = archive(&root, 1);
+            archive.append(&signal(10, 1)).unwrap();
+            let admitted = archive.dir.clone();
+            let original = directory_bytes(&admitted);
+            assert_eq!(&original[&PathBuf::from("000000.partial")][40..44], &0u32.to_le_bytes());
+            assert_eq!(archive.manifest.saved_frames, 0);
+            let state = recorder_state(&mut archive);
+            let retained = replace_admitted_directory_for_test(&mut archive);
+            fs::write(admitted.join("replacement-owner"), b"do not modify").unwrap();
+            let replacement = directory_bytes(&admitted);
+
+            let result = match operation {
+                "flush_tail" => archive.flush_tail(),
+                "finalize_segment" => archive.finalize_segment(),
+                "finish" => archive.finish("stopped", Some("must not publish")),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.unwrap_err(), "Recording directory/volume changed; no alternate destination permitted", "{operation}");
+            assert_eq!(recorder_state(&mut archive), state, "{operation}");
+            assert_eq!(directory_bytes(&retained), original, "{operation}");
+            assert_eq!(directory_bytes(&admitted), replacement, "{operation}");
+        }
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replaced_directory_rejects_copied_partial_recovery_before_publication_or_state_changes() {
+        let (_temp, root) = root();
+        let mut archive = archive(&root, 1);
+        archive.append(&signal(10, 1)).unwrap();
+        archive.flush_tail().unwrap();
+        let key = (archive.manifest.log_id.clone(), archive.manifest.capture_id.clone());
+        drop(archive);
+        let mut archive = Archive::load(&root, &key.0, &key.1).unwrap();
+        let admitted = archive.dir.clone();
+        let original = directory_bytes(&admitted);
+        let state = recorder_state(&mut archive);
+        let retained = replace_admitted_directory_for_test(&mut archive);
+        for (name, bytes) in &original {
+            fs::write(admitted.join(name), bytes).unwrap();
+        }
+        fs::write(admitted.join("replacement-owner"), b"do not modify").unwrap();
+        let replacement = directory_bytes(&admitted);
+
+        assert_eq!(archive.recover().unwrap_err(), "Recording directory/volume changed; no alternate destination permitted");
+        assert_eq!(recorder_state(&mut archive), state);
+        assert_eq!(directory_bytes(&retained), original);
+        assert_eq!(directory_bytes(&admitted), replacement);
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replaced_directory_preserves_bookmarks_and_audit_cursor_on_rejected_writes() {
+        let (_temp, root) = root();
+        let mut archive = archive(&root, 1);
+        archive.append(&signal(10, 1)).unwrap();
+        let mut changed_link = archive.manual("retained note").unwrap();
+        changed_link.note = "must not replace the retained note".into();
+        let admitted = archive.dir.clone();
+        let original = directory_bytes(&admitted);
+        let state = recorder_state(&mut archive);
+        let retained = replace_admitted_directory_for_test(&mut archive);
+        fs::write(admitted.join("replacement-owner"), b"do not modify").unwrap();
+        let replacement = directory_bytes(&admitted);
+        let remote = json!({"engine":"not1mm-python","sessionID":archive.manifest.log_id,
+            "events":[{"sequence":1,"qsoID":uuid::Uuid::new_v4().to_string(),"kind":"commit","local":false}]});
+
+        for operation in ["manual", "save_link", "reconcile"] {
+            let result = match operation {
+                "manual" => archive.manual("must not publish").map(|_| ()),
+                "save_link" => archive.save_link(changed_link.clone()),
+                "reconcile" => archive.reconcile(&remote, &BTreeMap::new()),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.unwrap_err(), "Recording directory/volume changed; no alternate destination permitted", "{operation}");
+            assert_eq!(recorder_state(&mut archive), state, "{operation}");
+            assert_eq!(directory_bytes(&retained), original, "{operation}");
+            assert_eq!(directory_bytes(&admitted), replacement, "{operation}");
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_extended_path_checks_ancestors_and_forecasts_actual_available_space() {
+        use std::os::windows::{ffi::OsStrExt, fs::symlink_dir};
+        let (_temp, root) = root();
+        let directory = root.join("receiver-žluť-電台").join("recording-".repeat(23));
+        fs::create_dir_all(&directory).unwrap();
+        let canonical = directory.canonicalize().unwrap();
+        assert!(canonical.as_os_str().encode_wide().count() > 260);
+        safe_path(&canonical).unwrap();
+        assert!(free_bytes(&canonical).unwrap() > 0);
+        assert!(free_bytes(&canonical.join("missing-directory")).is_err());
+        let mut literal_parent = canonical.as_os_str().to_os_string();
+        literal_parent.push(r"\..");
+        let literal_parent = Path::new(&literal_parent);
+        assert!(literal_parent.components().any(|component| matches!(component, std::path::Component::ParentDir)));
+        assert!(safe_path(literal_parent).is_err());
+
+        let other = root.join("other-capture");
+        fs::create_dir(&other).unwrap();
+        let alias = root.join("linked-capture");
+        symlink_dir(&other, &alias).unwrap();
+        assert!(safe_path(&alias.join("media.wav")).is_err());
+        assert!(free_bytes(&alias).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_metadata_preserving_rewrite_must_not_reuse_cached_integrity() {
+        use std::{ffi::c_void, os::windows::{fs::OpenOptionsExt, io::AsRawHandle}};
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileTime { low: u32, high: u32 }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileTime(handle: *mut c_void, created: *mut FileTime, accessed: *mut FileTime, written: *mut FileTime) -> i32;
+            fn SetFileTime(handle: *mut c_void, created: *const FileTime, accessed: *const FileTime, written: *const FileTime) -> i32;
+        }
+        let (_temp, root) = root();
+        let mut archive = archive(&root, 1);
+        archive.append(&signal(10, 1)).unwrap();
+        archive.finish("stopped", None).unwrap();
+        let media = archive.media_path(&archive.manifest.segments[0]);
+        let original = fs::read(&media).unwrap();
+        assert_eq!(archive.coverage(0, 10), "available");
+        let original_stamp = stamp(&fs::metadata(&media).unwrap());
+        // Neither finalization nor coverage may publish a Windows cache entry.
+        assert!(!integrity_cache().lock().unwrap().contains_key(&media));
+        // Deliberately retain a matching stale entry in this fixture's unique
+        // path. Production Windows checks must ignore it without clearing it.
+        let cached = (original_stamp, archive.manifest.segments[0].hash.clone());
+        integrity_cache().lock().unwrap().insert(media.clone(), cached.clone());
+        assert_eq!(cached.1, archive.manifest.segments[0].hash);
+        let original_trace = readonly_integrity_trace(&media, &original);
+        let reader = File::open(&media).unwrap();
+        let mut original_write_time = FileTime::default();
+        assert_ne!(unsafe { GetFileTime(reader.as_raw_handle(), std::ptr::null_mut(),
+            std::ptr::null_mut(), &mut original_write_time) }, 0, "{}", std::io::Error::last_os_error());
+        drop(reader);
+
+        let mut corrupt = original.clone();
+        corrupt[44] ^= 1;
+        let mut writer = OpenOptions::new().write(true).truncate(true).open(&media).unwrap();
+        writer.write_all(&corrupt).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        // Restore only the fixture file's LastWriteTime after its data writer
+        // closes. The current weak cache key must be identical despite bad bytes.
+        let attributes = OpenOptions::new().access_mode(0x100).open(&media).unwrap();
+        assert_ne!(unsafe { SetFileTime(attributes.as_raw_handle(), std::ptr::null(),
+            std::ptr::null(), &original_write_time) }, 0, "{}", std::io::Error::last_os_error());
+        drop(attributes);
+        let rewritten_stamp = stamp(&fs::metadata(&media).unwrap());
+        assert_eq!(rewritten_stamp, original_stamp);
+        let trace = readonly_integrity_trace(&media, &original);
+        let coverage = archive.coverage(0, 10);
+        assert_eq!(coverage, "file missing/corrupt",
+            "original_trace={original_trace}; original_weak_stamp={original_stamp:?}; original_cached={cached:?}; trace={trace}; coverage={coverage}");
+        let corrupt_hash = digest(&media).unwrap();
+        assert_ne!(corrupt_hash, archive.manifest.segments[0].hash);
+        assert_eq!(integrity_cache().lock().unwrap().get(&media).cloned(), Some(cached));
+
+        // Also reject the inverse stale-negative result after restoring exact
+        // bytes and the same weak metadata. Fresh hashing must leave even a
+        // retained corrupt-hash entry untouched.
+        let cached_corrupt = (rewritten_stamp, corrupt_hash);
+        integrity_cache().lock().unwrap().insert(media.clone(), cached_corrupt.clone());
+        fs::write(&media, &original).unwrap();
+        let attributes = OpenOptions::new().access_mode(0x100).open(&media).unwrap();
+        assert_ne!(unsafe { SetFileTime(attributes.as_raw_handle(), std::ptr::null(),
+            std::ptr::null(), &original_write_time) }, 0, "{}", std::io::Error::last_os_error());
+        drop(attributes);
+        assert_eq!(stamp(&fs::metadata(&media).unwrap()), original_stamp);
+        let restored_trace = readonly_integrity_trace(&media, &original);
+        let restored_coverage = archive.coverage(0, 10);
+        assert_eq!(restored_coverage, "available", "restored_trace={restored_trace}; coverage={restored_coverage}");
+        assert_eq!(digest(&media).unwrap(), archive.manifest.segments[0].hash);
+        assert_eq!(integrity_cache().lock().unwrap().get(&media).cloned(), Some(cached_corrupt));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_forecast_paths_preserve_unicode_unc_and_native_prefixes() {
+        let long = format!(r"\\?\C:\{}", "録音".repeat(180));
+        for text in [
+            r"\\?\C:\録音",
+            r"\\?\UNC\server\share-žluť",
+            r"\\server\share-電台\",
+            long.as_str(),
+        ] {
+            let wide = windows_directory_wide(Path::new(text)).unwrap();
+            assert_eq!(wide.last(), Some(&0));
+            assert_eq!(wide.iter().filter(|value| **value == 0).count(), 1);
+            assert_eq!(
+                String::from_utf16(&wide[..wide.len() - 1]).unwrap(),
+                format!("{}\\", text.trim_end_matches('\\'))
+            );
+        }
+        assert!(windows_directory_wide(Path::new("relative-capture")).is_err());
+        assert!(windows_directory_wide(Path::new("C:\\capture\0other")).is_err());
+    }
+    fn archive(root: &Path, channels: u16) -> Archive {
+        Archive::create(root, &uuid::Uuid::new_v4().to_string(), config(channels)).unwrap()
+    }
+    fn signal(frames: usize, channels: usize) -> Vec<i16> {
+        (0..frames)
+            .flat_map(|f| {
+                (0..channels).map(move |c| if c == 0 { f as i16 } else { -(f as i16) - 100 })
+            })
+            .collect()
+    }
+    #[test]
+    fn mono_stereo_rotation_and_frozen_replay_inspect_every_sample() {
+        for channels in [1, 2] {
+            let (_t, root) = root();
+            let mut a = archive(&root, channels);
+            a.segment_frames = 11;
+            let samples = signal(90, channels as usize);
+            a.append(&samples[..27 * channels as usize]).unwrap();
+            let snapshot = a.snapshot();
+            let end = snapshot.manifest.frames;
+            a.append(&samples[27 * channels as usize..]).unwrap();
+            assert_eq!(
+                snapshot.read_pcm(0, end).unwrap(),
+                samples[..27 * channels as usize]
+            );
+            a.finish("stopped", None).unwrap();
+            assert_eq!(a.manifest.frames, 90);
+            assert_eq!(a.read_pcm(0, 90).unwrap(), samples);
+            assert!(a
+                .manifest
+                .segments
+                .windows(2)
+                .all(|s| s[0].first_frame + s[0].frames == s[1].first_frame));
+        }
+    }
+    #[test]
+    fn qtc_sample_bookmarks_are_idempotent_and_survive_old_links_reopen_and_export() {
+        let (_temp,root)=root(); let mut a=archive(&root,1);
+        let log=a.manifest.log_id.clone(); let capture=a.manifest.capture_id.clone();
+        let reference=json!({"schema":1,"sessionID":log,"seriesID":uuid::Uuid::new_v4().to_string(),"itemIndex":0,
+            "operationID":uuid::Uuid::new_v4().to_string(),"event":"item"});
+        assert!(a.qtc_marker(&reference,"").is_err());
+        a.append(&signal(100,1)).unwrap(); let manual=a.manual("old bookmark").unwrap();
+        let old=serde_json::to_value(&manual).unwrap(); assert!(old.get("qtc").is_none());
+        let decoded:Link=serde_json::from_value(old).unwrap(); assert!(decoded.qtc.is_none());
+        let marker=a.qtc_marker(&reference,"row").unwrap(); a.append(&signal(40,1)).unwrap();
+        assert_eq!(a.qtc_marker(&reference,"row").unwrap().frame,marker.frame); assert_eq!(a.links.len(),2);
+        let mut changed=reference.clone(); changed["itemIndex"]=json!(1); assert!(a.qtc_marker(&changed,"row").is_err());
+        a.finish("stopped",None).unwrap(); let hashes=a.manifest.segments.iter().map(|s|s.hash.clone()).collect::<Vec<_>>();drop(a);
+        let a=Archive::load(&root,&log,&capture).unwrap(); assert_eq!(a.links[&marker.id].qtc,Some(reference.clone()));
+        assert!(a.links[&manual.id].qtc.is_none()); assert_eq!(a.manifest.segments.iter().map(|s|s.hash.clone()).collect::<Vec<_>>(),hashes);
+        let export=tempfile::tempdir().unwrap(); let target=a.snapshot().export(&export.path().canonicalize().unwrap(),false).unwrap();
+        let links:Vec<Link>=serde_json::from_slice(&fs::read(target.join("bookmarks.json")).unwrap()).unwrap();
+        assert_eq!(links.iter().find(|l|l.id==marker.id).unwrap().qtc,Some(reference));
+        assert!(links.iter().all(|l|l.note.is_empty()));
+    }
+    #[test]
+    fn crash_partial_recovery_preserves_original_and_reports_torn_frame() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 2);
+        let id = a.manifest.capture_id.clone();
+        let log = a.manifest.log_id.clone();
+        let samples = signal(42, 2);
+        a.append(&samples).unwrap();
+        a.flush_tail().unwrap();
+        let partial = segment_path(&a.dir, 0, true);
+        drop(a);
+        OpenOptions::new()
+            .append(true)
+            .open(&partial)
+            .unwrap()
+            .write_all(&[99])
+            .unwrap();
+        let original = fs::read(&partial).unwrap();
+        let mut recovered = Archive::load(&root, &log, &id).unwrap();
+        recovered.recover().unwrap();
+        assert_eq!(fs::read(&partial).unwrap(), original);
+        assert_eq!(recovered.read_pcm(0, 42).unwrap(), samples);
+        assert_eq!(recovered.manifest.status, "recovered");
+        assert!(!recovered.manifest.gaps.is_empty());
+        let again = Archive::load(&root, &log, &id).unwrap();
+        assert_eq!(again.read_pcm(0, 42).unwrap(), samples);
+    }
+    #[test]
+    fn recovery_output_before_manifest_can_be_retried_and_partial_outputs_are_retained() {
+        for interrupted in [false, true] {
+            let (_t, root) = root();
+            let mut a = archive(&root, 2);
+            let samples = signal(42, 2);
+            a.append(&samples).unwrap();
+            a.flush_tail().unwrap();
+            let key = (a.manifest.log_id.clone(), a.manifest.capture_id.clone());
+            let partial = segment_path(&a.dir, 0, true);
+            let original = fs::read(&partial).unwrap();
+            let recovered = a.dir.join("000000.recovered.wav");
+            let mut output = header(8000, 2, 42).unwrap().to_vec();
+            output.extend_from_slice(&original[44..]);
+            if interrupted {
+                output.truncate(50);
+            }
+            fs::write(&recovered, &output).unwrap();
+            drop(a);
+            let mut a = Archive::load(&root, &key.0, &key.1).unwrap();
+            a.recover().unwrap();
+            assert_eq!(a.read_pcm(0, 42).unwrap(), samples);
+            assert_eq!(fs::read(partial).unwrap(), original);
+            if interrupted {
+                assert!(fs::read_dir(&a.dir).unwrap().flatten().any(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("interrupted-recovery")));
+            }
+            a.recover().unwrap();
+            assert_eq!(a.manifest.segments.len(), 1);
+        }
+    }
+    #[test]
+    fn rename_before_manifest_is_adopted_without_overwrite() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 1);
+        a.append(&signal(10, 1)).unwrap();
+        a.flush_tail().unwrap();
+        let key = (a.manifest.log_id.clone(), a.manifest.capture_id.clone());
+        let dir = a.dir.clone();
+        drop(a);
+        fs::rename(segment_path(&dir, 0, true), segment_path(&dir, 0, false)).unwrap();
+        let hash = digest(&segment_path(&dir, 0, false)).unwrap();
+        let mut a = Archive::load(&root, &key.0, &key.1).unwrap();
+        a.recover().unwrap();
+        assert_eq!(a.manifest.segments.len(), 1);
+        assert_eq!(a.manifest.segments[0].hash, hash);
+        assert_eq!(a.read_pcm(0, 10).unwrap(), signal(10, 1));
+    }
+    #[test]
+    fn journal_torn_tail_keeps_backup_and_manual_bookmark_survives_restart() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 1);
+        a.append(&signal(20, 1)).unwrap();
+        let link = a.manual("Operator note").unwrap();
+        a.finish("paused", Some("pause fixture")).unwrap();
+        let key = (a.manifest.log_id.clone(), a.manifest.capture_id.clone());
+        let dir = a.dir.clone();
+        drop(a);
+        OpenOptions::new()
+            .append(true)
+            .open(dir.join("events.jsonl"))
+            .unwrap()
+            .write_all(b"{\"type\":")
+            .unwrap();
+        let mut a = Archive::load(&root, &key.0, &key.1).unwrap();
+        assert_eq!(a.links[&link.id].frame, 20);
+        assert_eq!(a.links[&link.id].note, "Operator note");
+        a.manual("After restart").unwrap();
+        drop(a);
+        assert_eq!(Archive::load(&root, &key.0, &key.1).unwrap().links.len(), 2);
+        assert!(fs::read_dir(&dir).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("events.torn-original")));
+    }
+    #[test]
+    fn actual_python_commit_correction_delete_retry_and_durable_admission() {
+        let (_t, root) = root();
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let result = std::process::Command::new(
+            std::env::var("XLOG_TEST_PYTHON").unwrap_or_else(|_| "python3.12".into()),
+        )
+        .arg(project.join("python/tests/recorder_fixture.py"))
+        .env("PYTHONPATH", project.join("python"))
+        .output()
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let fixture: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let commit = &fixture["commit"];
+        let log = commit["sessionID"].as_str().unwrap();
+        let mut a = Archive::create(&root, log, config(2)).unwrap();
+        a.append(&signal(100, 2)).unwrap();
+        let event = &commit["events"][0];
+        let op = event["operationID"].as_str().unwrap();
+        let qso = event["qsoID"].as_str().unwrap();
+        a.event(json!({"type":"admission","operationID":op,"frame":70,"utcMs":a.manifest.start_utc_ms+8})).unwrap();
+        let key = a.manifest.capture_id.clone();
+        a.finish("stopped", None).unwrap();
+        drop(a);
+        let mut a = Archive::load(&root, log, &key).unwrap();
+        let markers = BTreeMap::new();
+        a.reconcile(commit, &markers).unwrap();
+        a.reconcile(commit, &markers).unwrap();
+        assert_eq!(a.links.len(), 1);
+        let original = a.links[qso].clone();
+        assert_eq!(original.frame, 70);
+        assert!(original.basis.starts_with("local operation"));
+        a.reconcile(&fixture["correction"], &markers).unwrap();
+        assert_eq!(a.links[qso].frame, 70);
+        assert_eq!(a.links[qso].original, original.original);
+        assert_eq!(a.links[qso].current["Call"], "DL1ABC");
+        a.reconcile(&fixture["deletion"], &markers).unwrap();
+        assert!(a.links[qso].deleted);
+        assert_eq!(a.read_pcm(0, 100).unwrap(), signal(100, 2));
+        let mut other = archive(&root, 2);
+        assert!(other.reconcile(commit, &markers).is_err());
+        assert!(other.links.is_empty());
+    }
+    #[test]
+    fn remote_contacts_never_inherit_local_audio_and_pending_tail_is_truthful() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 1);
+        a.append(&signal(100, 1)).unwrap();
+        let qso = uuid::Uuid::new_v4().to_string();
+        let op = uuid::Uuid::new_v4().to_string();
+        let mut page = json!({"engine":"not1mm-python","sessionID":a.manifest.log_id,"events":[{"sequence":1,"revision":1,"operationID":op,"qsoID":qso,"kind":"commit","after":{"Call":"K1ABC"},"local":false}]});
+        let markers = BTreeMap::from([(op, (90, a.manifest.start_utc_ms + 10))]);
+        a.reconcile(&page, &markers).unwrap();
+        assert!(a.links.is_empty());
+        page["events"][0]["local"] = json!(true);
+        page["events"][0]["sequence"] = json!(2);
+        a.reconcile(&page, &markers).unwrap();
+        assert_eq!(a.coverage(0, 101), "pending-tail");
+        a.finish("stopped", None).unwrap();
+        assert_eq!(a.coverage(0, 101), "partial");
+    }
+    #[test]
+    fn export_independently_decodes_order_and_preserves_original_hashes() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 2);
+        a.segment_frames = 13;
+        let samples = signal(101, 2);
+        a.append(&samples).unwrap();
+        a.finish("stopped", Some("Explicit fixture gap")).unwrap();
+        let hashes: Vec<_> = a.manifest.segments.iter().map(|s| s.hash.clone()).collect();
+        let export = a.snapshot().export(&root, false).unwrap();
+        let result=std::process::Command::new("python3").arg("-c").arg("import wave,struct,json,sys,pathlib; p=pathlib.Path(sys.argv[1]); m=json.loads((p/'manifest.json').read_text()); data=[]\nfor s in m['segments']:\n f=wave.open(str(p/(str(s['id']).zfill(6)+'.wav'))); assert f.getnchannels()==2 and f.getframerate()==8000; b=f.readframes(f.getnframes()); data.extend(struct.unpack('<'+'h'*(len(b)//2),b))\nassert data==[v for i in range(101) for v in (i,-i-100)]; assert m['gaps']; print('independent PCM decoder: 101 stereo frames match')").arg(&export).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(export.join("manifest.json").is_file());
+        assert_eq!(
+            a.manifest
+                .segments
+                .iter()
+                .map(|s| digest(&a.media_path(s)).unwrap())
+                .collect::<Vec<_>>(),
+            hashes
+        );
+    }
+    #[test]
+    fn corrupt_missing_symlink_and_volume_replacement_are_rejected() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 1);
+        a.append(&signal(10, 1)).unwrap();
+        a.finish("stopped", None).unwrap();
+        let media = a.media_path(&a.manifest.segments[0]);
+        let original = fs::read(&media).unwrap();
+        assert_eq!(a.coverage(0, 10), "available");
+        let mut changed = original.clone();
+        changed[44] ^= 1;
+        fs::write(&media, changed).unwrap();
+        assert_eq!(a.coverage(0, 10), "file missing/corrupt");
+        let corrupt_trace = readonly_integrity_trace(&media, &original);
+        fs::write(&media, &original[..50]).unwrap();
+        assert_eq!(a.coverage(0, 10), "file missing/corrupt");
+        fs::write(&media, &original).unwrap();
+        let restored_trace = readonly_integrity_trace(&media, &original);
+        let restored_coverage = a.coverage(0, 10);
+        assert_eq!(restored_coverage, "available",
+            "corrupt_trace={corrupt_trace}; restored_trace={restored_trace}; coverage={restored_coverage}; manifest_hash={}",
+            a.manifest.segments[0].hash);
+        fs::write(&media, &original[..50]).unwrap();
+        assert!(a.read_pcm(0, 10).is_err());
+        fs::remove_file(&media).unwrap();
+        assert_eq!(a.coverage(0, 10), "file missing/corrupt");
+        assert!(a.snapshot().export(&root, false).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", &media).unwrap();
+            assert_eq!(a.coverage(0, 10), "file missing/corrupt");
+            assert!(a.read_pcm(0, 10).is_err());
+            let moved = a.dir.with_extension("retained-original");
+            fs::rename(&a.dir, &moved).unwrap();
+            fs::create_dir(&a.dir).unwrap();
+            assert!(a.append(&[1]).is_err());
+            assert_eq!(fs::read_dir(&a.dir).unwrap().count(), 0);
+        }
+    }
+    #[test]
+    fn low_disk_refuses_start_without_pruning_and_riff_overflow_is_rejected() {
+        let (_t, root) = root();
+        let mut c = config(2);
+        c.reserve_bytes = u64::MAX;
+        c.warning_bytes = u64::MAX;
+        fs::write(root.join("retain-me"), b"operator archive").unwrap();
+        assert!(Archive::create(&root, &uuid::Uuid::new_v4().to_string(), c).is_err());
+        assert_eq!(
+            fs::read(root.join("retain-me")).unwrap(),
+            b"operator archive"
+        );
+        assert!(header(48000, 2, 48 * 3600 * 48000).is_err());
+        assert_eq!(config(2).bytes_per_second(), 32000);
+    }
+    #[test]
+    fn full_event_index_uses_u64_and_reports_missing_media_without_allocating_audio() {
+        let (_t, root) = root();
+        let mut a = archive(&root, 2);
+        let frames = 8000u64 * 60;
+        a.manifest.segments = (0..2880)
+            .map(|id| Segment {
+                id,
+                first_frame: id as u64 * frames,
+                frames,
+                bytes: 44 + frames * 4,
+                hash: "0".repeat(64),
+                recovered: false,
+            })
+            .collect();
+        a.manifest.frames = 8000 * 48 * 3600;
+        a.manifest.status = "stopped".into();
+        a.checkpoint().unwrap();
+        let key = (a.manifest.log_id.clone(), a.manifest.capture_id.clone());
+        drop(a);
+        let a = Archive::load(&root, &key.0, &key.1).unwrap();
+        assert_eq!(a.manifest.segments.len(), 2880);
+        assert!(a.manifest.frames * 4 > u32::MAX as u64);
+        assert_eq!(
+            a.coverage(a.manifest.frames - 1, a.manifest.frames),
+            "file missing/corrupt"
+        );
+    }
+}

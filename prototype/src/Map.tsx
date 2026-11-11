@@ -1,0 +1,1242 @@
+import { formatSpotFrequency } from "./spotFrequency";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import * as maplibregl from "maplibre-gl";
+import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
+import geometryUrl from "../../Sources/XLogCore/Resources/dxcc-boundaries.geojson?url";
+import { dxccPrefixLabel, mapSpotBounds, mapSpotDetails, normalizedMapCall, normalizeMapSpots, type MapSpot } from "./MapSpots";
+import { describeMapError } from "./MapErrors";
+import { acceptanceActive, interiorLandProbe, landPixelMatches } from "./acceptance";
+import { bearingAndDistance, grayline, greatCircle, nightHemisphere, solarPosition, type Coordinate } from "./MapGeography";
+import { maidenheadGrid } from "./MapGrid";
+import { clusterBandColors, clusterStatusColors, paletteColor } from "./live/clusterPalette";
+import { expeditionLabelOffset } from "./MapMarkerLayout";
+import "./Map.css";
+import SoftwareWorldMap from "./SoftwareWorldMap";
+import { useOwnRbn } from "./live/useOwnRbn";
+import type { OwnRBNTransport } from "./live/ownRbnFeed";
+import { ownRbnReceivers, type RBNReceiver } from "./live/ownRbnMap";
+import { bandForRadio, BAND_ORDER } from "./live/band";
+// MapLibre 6 resolves its default worker relative to import.meta.url. Vite's
+// optimized module and packaged bundle do not preserve that adjacent path.
+// Emit the standalone worker as a local asset and configure it before any map.
+maplibregl.setWorkerUrl(new URL(workerUrl, window.location.href).href);
+type MapPoint = { call?: string; lat: number; lon: number; grid?: string; country?: string };
+type OverlayMode = "Spots" | "DXCC" | "Both";
+type MapAppearance = "Hybrid" | "Satellite" | "Standard";
+type MapPreset = "Simple" | "Detailed" | "DX";
+type DXCCStatus = "needed" | "worked" | "confirmed";
+type SpotColorMode = "band" | "status";
+type MapCamera = { center: Coordinate; zoom: number; bearing: number; pitch: number; routeKey: string | null;
+  fitToDataKey?: string; selected: string | null; homeKey: string | null };
+type StoredMapState = { overlayMode?: OverlayMode; appearance?: MapAppearance; preset?: MapPreset; showSun?: boolean;
+  showGrayline?: boolean; showGrid?: boolean; longPath?: boolean; statusFilter?: DXCCStatus[]; camera?: MapCamera };
+type GeoJSONGeometry = { type: "MultiPolygon" | "Polygon"; coordinates: number[][][][] | number[][][] };
+type DXCCFeature = { properties: { dxcc_entity_code: number; dxcc_name: string | null; dxcc_prefix: string | null }; geometry: GeoJSONGeometry };
+const imageryTiles = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/2004-08-01/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpeg";
+const emptyLines = { type: "FeatureCollection" as const, features: [] };
+const gridPreferenceKey = "xlog.worldMap.maidenheadGrid";
+
+function storedMapState(key: string | undefined): StoredMapState | null {
+  if (!key) return null;
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(`xlog.worldMap.${key}.v1`) || "null");
+    return parsed && typeof parsed === "object" ? parsed as StoredMapState : null;
+  } catch { return null; }
+}
+
+function validCamera(value: MapCamera | undefined): MapCamera | null {
+  if (!value || !Array.isArray(value.center) || value.center.length !== 2
+    || ![...value.center, value.zoom, value.bearing, value.pitch].every(Number.isFinite)) return null;
+  return value;
+}
+
+function routeStateKey(home: MapPoint | null | undefined, target: MapPoint | null | undefined, longPath: boolean) {
+  return home && target && [home.lon, home.lat, target.lon, target.lat].every(Number.isFinite)
+    ? `${home.call?.trim().toUpperCase() ?? ""}:${home.lon},${home.lat}:${target.call?.trim().toUpperCase() ?? ""}:${target.lon},${target.lat}:${longPath}` : null;
+}
+
+function homeStateKey(home: MapPoint | null | undefined) {
+  return home && [home.lon, home.lat].every(Number.isFinite) ? `${home.lon},${home.lat}` : null;
+}
+
+function savedGridPreference() {
+  try { return window.localStorage.getItem(gridPreferenceKey) === "true"; } catch { return false; }
+}
+
+function spotStatusColor(spot: MapSpot, palette: { status?: Record<string, string> } | null | undefined) {
+  return typeof spot.statusHex === "string" && /^#[0-9a-fA-F]{6}$/.test(spot.statusHex)
+    ? spot.statusHex : paletteColor(spot.callStatus ?? "Unknown", palette?.status, clusterStatusColors);
+}
+
+function spotMarkerColor(spot: MapSpot, palette: { status?: Record<string, string>; band?: Record<string, string> } | null | undefined,
+    mode: SpotColorMode) {
+  return mode === "status" ? spotStatusColor(spot, palette) : paletteColor(spot.band, palette?.band, clusterBandColors);
+}
+
+function lineFeatures(lines: Coordinate[][]) {
+  return { type: "FeatureCollection" as const, features: lines.map((line) => ({
+    type: "Feature" as const, properties: {}, geometry: { type: "LineString" as const, coordinates: line },
+  })) };
+}
+
+// The geography helper splits at the antimeridian for MapLibre, but does not
+// include the crossing itself. Complete both sides so the displayed route and
+// its camera bounds include the whole great circle, including its endpoints.
+function completeRoute(from: Coordinate, to: Coordinate, longPath: boolean): Coordinate[][] {
+  const sections = greatCircle(from, to, longPath).map(section => [...section]);
+  if (!sections.length) return [];
+  const samePoint = (a: Coordinate, b: Coordinate) =>
+    Math.abs(a[0] - b[0] - 360 * Math.round((a[0] - b[0]) / 360)) < 1e-6 && Math.abs(a[1] - b[1]) < 1e-6;
+  if (!samePoint(sections[0][0], from)) {
+    if (Math.abs(sections[0][0][0] - from[0]) > 180) sections.unshift([from]);
+    else sections[0].unshift(from);
+  } else if (Math.abs(sections[0][0][0] - from[0]) < 180) sections[0][0] = from;
+  const last = sections[sections.length - 1];
+  if (!samePoint(last[last.length - 1], to)) {
+    if (Math.abs(last[last.length - 1][0] - to[0]) > 180) sections.push([to]);
+    else last.push(to);
+  } else if (Math.abs(last[last.length - 1][0] - to[0]) < 180) last[last.length - 1] = to;
+  for (let index = 0; index < sections.length - 1; index++) {
+    const before = sections[index];
+    const after = sections[index + 1];
+    const a = before[before.length - 1], b = after[0];
+    const crossing = a[0] > 0 ? 180 : -180;
+    const bUnwrapped = b[0] + (crossing > 0 ? 360 : -360);
+    const fraction = (crossing - a[0]) / (bUnwrapped - a[0]);
+    const latitude = a[1] + fraction * (b[1] - a[1]);
+    before.push([crossing, latitude]);
+    after.unshift([-crossing, latitude]);
+  }
+  return sections;
+}
+
+export function routeBounds(from: Coordinate, to: Coordinate, longPath: boolean): [[number, number], [number, number]] | null {
+  const sections = completeRoute(from, to, longPath);
+  if (!sections.length) return null;
+  // Unwrap adjacent samples instead of taking min/max of wrapped longitude:
+  // 179°E to 179°W is a 2° short path, not a 358° viewport.
+  let previous = from[0];
+  let west = previous, east = previous, south = from[1], north = from[1];
+  for (const point of sections.flat()) {
+    const longitude = point[0] + 360 * Math.round((previous - point[0]) / 360);
+    previous = longitude;
+    west = Math.min(west, longitude);
+    east = Math.max(east, longitude);
+    south = Math.min(south, point[1]);
+    north = Math.max(north, point[1]);
+  }
+  return [[west, south], [east, north]];
+}
+
+export function routeLabelPosition(sections: Coordinate[][]): { point: Coordinate; before: Coordinate; after: Coordinate } | null {
+  const total = sections.reduce((count, section) => count + Math.max(0, section.length - 1), 0);
+  if (!total) return null;
+  const halfway = total / 2;
+  let traversed = 0;
+  for (const section of sections) {
+    const edges = Math.max(0, section.length - 1);
+    if (edges && halfway <= traversed + edges) {
+      const middle = Math.max(0, Math.min(section.length - 1, Math.round(halfway - traversed)));
+      return { point: section[middle], before: section[Math.max(0, middle - 2)],
+        after: section[Math.min(section.length - 1, middle + 2)] };
+    }
+    traversed += edges;
+  }
+  return null;
+}
+
+export function routeFrequencyLabel(frequencyHz?: number): string | null {
+  if (typeof frequencyHz !== "number" || !Number.isSafeInteger(frequencyHz) || frequencyHz <= 0) return null;
+  const mhz = formatSpotFrequency(frequencyHz);
+  return `${mhz} MHz`;
+}
+
+export function routeFitPadding(compact: boolean, topOverlayInset = 0, bottomOverlayInset = 0) {
+  if (compact) return { top: 28, right: 34, bottom: 34, left: 34 };
+  return {
+    top: Math.max(74, Math.ceil(topOverlayInset) + 40),
+    right: 54,
+    bottom: Math.max(100, Math.ceil(bottomOverlayInset) + 40),
+    left: 54,
+  };
+}
+
+function representativePoint(feature: DXCCFeature): Coordinate | null {
+  const polygons = feature.geometry.type === "Polygon" ? [feature.geometry.coordinates as number[][][]]
+    : feature.geometry.coordinates as number[][][][];
+  let best: number[][] | null = null;
+  let bestArea = 0;
+  for (const polygon of polygons) {
+    const ring = polygon[0];
+    if (!ring?.length) continue;
+    let area = 0;
+    for (let i = 1; i < ring.length; i++) area += ring[i - 1][0] * ring[i][1] - ring[i][0] * ring[i - 1][1];
+    if (Math.abs(area) > bestArea) { bestArea = Math.abs(area); best = ring; }
+  }
+  if (!best) return null;
+  const longitudes = best.map(point => point[0]);
+  const latitudes = best.map(point => point[1]);
+  return [(Math.min(...longitudes) + Math.max(...longitudes)) / 2,
+    (Math.min(...latitudes) + Math.max(...latitudes)) / 2];
+}
+
+export default function WorldMap<T extends MapSpot = MapSpot>({
+  selected,
+  onSpot,
+  data = [],
+  fixture = false,
+  home,
+  target,
+  dxccStatuses,
+  palette,
+  longPath: initialLongPath = false,
+  compact = false,
+  frequencyHz,
+  spotActionLabel = "Activate to tune",
+  locationLabel = "CTY approximate spot locations",
+  fitToDataKey,
+  persistenceKey,
+  spotColorMode = "band",
+  spotLegend,
+  expeditionLabels = false,
+  ownCall,
+  ownRbnContext = "",
+  ownRbnTransport,
+}: {
+  selected: string | null;
+  onSpot?: (spot: T) => void;
+  data?: T[];
+  fixture?: boolean;
+  home?: MapPoint | null;
+  target?: MapPoint | null;
+  dxccStatuses?: Record<number, DXCCStatus> | null;
+  palette?: { status?: Record<string, string>; band?: Record<string, string> } | null;
+  longPath?: boolean;
+  compact?: boolean;
+  frequencyHz?: number;
+  spotActionLabel?: string;
+  locationLabel?: string;
+  fitToDataKey?: string;
+  persistenceKey?: string;
+  spotColorMode?: SpotColorMode;
+  spotLegend?: { label: string; color: string }[];
+  expeditionLabels?: boolean;
+  ownCall?: string;
+  ownRbnContext?: string;
+  ownRbnTransport?: OwnRBNTransport;
+}) {
+  const [restoredState] = useState(() => storedMapState(persistenceKey));
+  const mappedSpots = useMemo(() => normalizeMapSpots(data, expeditionLabels), [data, expeditionLabels]);
+  const expeditionLabelsRef = useRef(expeditionLabels);
+  expeditionLabelsRef.current = expeditionLabels;
+  const selectedIDRef = useRef(selected);
+  selectedIDRef.current = selected;
+  const detailID = useId();
+  const container = useRef<HTMLDivElement>(null);
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const legendRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<maplibregl.Map | null>(null);
+  const [viewportRevision, setViewportRevision] = useState(0);
+  const [heardMe, setHeardMe] = useState(false), [heardBand, setHeardBand] = useState("follow"), [receiver, setReceiver] = useState<RBNReceiver | null>(null);
+  const [surfaceVisible, setSurfaceVisible] = useState(true);
+  useEffect(() => {
+    const ancestors: HTMLElement[] = [];
+    for (let node: HTMLElement | null = container.current; node; node = node.parentElement) ancestors.push(node);
+    const update = () => setSurfaceVisible(!ancestors.some(node => node.hidden || node.inert || getComputedStyle(node).display === "none"));
+    update();
+    const observer = new MutationObserver(update);
+    ancestors.forEach(node => observer.observe(node, { attributes: true, attributeFilter: ["hidden", "inert", "style", "class"] }));
+    return () => observer.disconnect();
+  }, []);
+  const monitoredCall = (ownCall ?? home?.call ?? "").trim().toUpperCase();
+  const rbn = useOwnRbn(monitoredCall, heardMe && surfaceVisible, ownRbnContext, ownRbnTransport);
+  const scopedBand = heardBand === "follow" ? bandForRadio(frequencyHz) ?? "unavailable" : heardBand === "all" ? null : heardBand;
+  const receivers = useMemo(() => ownRbnReceivers(rbn.spots, monitoredCall, scopedBand, rbn.now), [rbn.spots, monitoredCall, scopedBand, rbn.now]);
+  const locatedReceivers = receivers.filter(row => row.location);
+  useEffect(() => { setReceiver(current => current ? receivers.find(row => row.key === current.key) ?? null : null); }, [receivers]);
+  useEffect(() => { setReceiver(null); }, [monitoredCall, ownRbnContext, heardMe, heardBand]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const markers: maplibregl.Marker[] = [];
+    for (const row of locatedReceivers) {
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "map-rbn-receiver";
+      button.textContent = `◇ ${row.spotter}`;
+      button.title = `RBN heard ${row.call} · ${row.band} · ${row.location!.provenance}`;
+      button.setAttribute("aria-label", button.title);
+      button.onclick = event => { event.stopPropagation(); setReceiver(row); };
+      markers.push(new maplibregl.Marker({ element: button }).setLngLat([row.location!.lon, row.location!.lat]).addTo(map));
+    }
+    return () => markers.forEach(marker => marker.remove());
+  }, [receivers, viewportRevision]);
+  const [error, setError] = useState("");
+  const [softwareMap, setSoftwareMap] = useState(false);
+  const [imageryUnavailable, setImageryUnavailable] = useState(false);
+  const restoredOverlay = ["Spots", "DXCC", "Both"].includes(restoredState?.overlayMode ?? "") ? restoredState!.overlayMode : undefined;
+  const restoredAppearance = ["Hybrid", "Satellite", "Standard"].includes(restoredState?.appearance ?? "") ? restoredState!.appearance : undefined;
+  const restoredPreset = ["Simple", "Detailed", "DX"].includes(restoredState?.preset ?? "") ? restoredState!.preset : undefined;
+  const restoredStatuses = Array.isArray(restoredState?.statusFilter)
+    ? restoredState.statusFilter.filter(status => ["needed", "worked", "confirmed"].includes(status)) : undefined;
+  const [overlayMode, setOverlayMode] = useState<OverlayMode>(restoredOverlay ?? (fixture || acceptanceActive ? "Spots" : "Both"));
+  const [appearance, setAppearance] = useState<MapAppearance>(restoredAppearance ?? (fixture || acceptanceActive ? "Standard" : "Hybrid"));
+  const [preset, setPreset] = useState<MapPreset>(restoredPreset ?? (fixture || acceptanceActive ? "Simple" : "Detailed"));
+  const [showSun, setShowSun] = useState(typeof restoredState?.showSun === "boolean" ? restoredState.showSun : !(fixture || acceptanceActive));
+  const [showGrayline, setShowGrayline] = useState(typeof restoredState?.showGrayline === "boolean" ? restoredState.showGrayline : !(fixture || acceptanceActive));
+  const [showGrid, setShowGrid] = useState(() => typeof restoredState?.showGrid === "boolean"
+    ? restoredState.showGrid : !(fixture || acceptanceActive) && savedGridPreference());
+  const [longPath, setLongPath] = useState(typeof restoredState?.longPath === "boolean" ? restoredState.longPath : initialLongPath);
+  const initialLongPathRef = useRef(initialLongPath);
+  useEffect(() => {
+    if (initialLongPathRef.current === initialLongPath) return;
+    initialLongPathRef.current = initialLongPath;
+    setLongPath(initialLongPath);
+  }, [initialLongPath]);
+  const [statusFilter, setStatusFilter] = useState<DXCCStatus[]>(restoredStatuses ?? ["needed", "worked", "confirmed"]);
+  const [solarDate, setSolarDate] = useState(() => new Date());
+  const routeKey = routeStateKey(home, target, longPath);
+  const routeKeyRef = useRef(routeKey);
+  routeKeyRef.current = routeKey;
+  const homeKey = homeStateKey(home);
+  const restoredCamera = validCamera(restoredState?.camera);
+  const initialCamera = restoredCamera?.routeKey === routeKey && restoredCamera?.fitToDataKey === fitToDataKey
+    && restoredCamera?.selected === selected && restoredCamera?.homeKey === homeKey ? restoredCamera : null;
+  const restoredSelection = initialCamera && selected ? mappedSpots.find(spot => spot.id === selected) : undefined;
+  const cameraRef = useRef<MapCamera | null>(initialCamera);
+  const cameraContextRef = useRef({ routeKey, fitToDataKey, selected, homeKey });
+  cameraContextRef.current = { routeKey, fitToDataKey, selected, homeKey };
+  const optionsRef = useRef({ overlayMode, appearance, preset, showSun, showGrayline, showGrid, longPath, statusFilter });
+  optionsRef.current = { overlayMode, appearance, preset, showSun, showGrayline, showGrid, longPath, statusFilter };
+  const persistState = () => {
+    if (!persistenceKey) return;
+    try { window.localStorage.setItem(`xlog.worldMap.${persistenceKey}.v1`, JSON.stringify({ ...optionsRef.current, camera: cameraRef.current })); }
+    catch { /* Map state persistence is optional. */ }
+  };
+  useEffect(persistState, [persistenceKey, overlayMode, appearance, preset, showSun, showGrayline, showGrid, longPath, statusFilter]);
+  const callback = useRef(onSpot);
+  const actionLabel = useRef(spotActionLabel); actionLabel.current = spotActionLabel;
+  const fitDataRef = useRef(fitToDataKey); fitDataRef.current = fitToDataKey;
+  const fittedDataKey = useRef<string | null>(initialCamera && fitToDataKey != null ? fitToDataKey : null);
+  const selection = useRef(selected);
+  const preserveCamera = useRef(Boolean(selected) || Boolean(initialCamera));
+  const fittedRouteKey = useRef<string | null>(initialCamera ? routeKey : null);
+  const automaticRouteFit = useRef<{ key: string; width: number; height: number } | null>(null);
+  const centeredSelectionKey = useRef<string | null>(restoredSelection ? `${selected}:${restoredSelection.call}` : null);
+  const spotsRef = useRef(mappedSpots);
+  const selectedCallRef = useRef<string | null>(null);
+  const previousSelectionRef = useRef(selected);
+  const currentSelected = data.find(spot => spot.id === selected);
+  if (currentSelected) selectedCallRef.current = normalizedMapCall(currentSelected.call);
+  else if (previousSelectionRef.current !== selected || selected === null) selectedCallRef.current = null;
+  previousSelectionRef.current = selected;
+  const selectedSpot = mappedSpots.find(spot => spot.id === selected)
+    ?? mappedSpots.find(spot => spot.call === selectedCallRef.current);
+  const homeRef = useRef(home);
+  const targetRef = useRef(target);
+  const routeLabelPointRef = useRef<Coordinate | null>(null);
+  const labelsRef = useRef<{ id: number; label: string; name: string; coordinate: Coordinate }[]>([]);
+  const entityIDsRef = useRef<number[]>([]);
+  const markersRef = useRef(new Map<string, maplibregl.Marker>());
+  const spotMarkersRef = useRef(new Map<string, maplibregl.Marker>());
+  const gridMarkersRef = useRef(new Map<string, maplibregl.Marker>());
+  const redrawRef = useRef(() => {});
+  const redrawGridRef = useRef(() => {});
+  const appearanceRef = useRef(appearance);
+  const overlayRef = useRef(overlayMode);
+  const statusFilterRef = useRef(statusFilter);
+  const dxccRef = useRef(dxccStatuses);
+  const paletteRef = useRef(palette);
+  const spotColorModeRef = useRef(spotColorMode);
+  const showGridRef = useRef(showGrid);
+  appearanceRef.current = appearance;
+  overlayRef.current = overlayMode;
+  statusFilterRef.current = statusFilter;
+  dxccRef.current = dxccStatuses;
+  paletteRef.current = palette;
+  spotColorModeRef.current = spotColorMode;
+  showGridRef.current = showGrid;
+  spotsRef.current = mappedSpots;
+  homeRef.current = home;
+  targetRef.current = target;
+  callback.current = onSpot;
+  selection.current = selected;
+  useEffect(() => {
+    if (!container.current) return;
+    const element = container.current;
+    let constructionWidth = 0, constructionHeight = 0;
+    let map: maplibregl.Map;
+    let resize: ResizeObserver | null = null;
+    let resizeFrame: number | null = null;
+    let disposed = false;
+    let landFeatures = 0;
+    let captureRequested = acceptanceActive;
+    let inspectedCall: string | null = null;
+    let popup: maplibregl.Popup | null = null;
+    const clearGridLabels = () => {
+      gridMarkersRef.current.forEach(marker => marker.remove());
+      gridMarkersRef.current.clear();
+    };
+    const hideDetails = () => { popup?.remove(); popup = null; inspectedCall = null; };
+    const showDetails = (call: string, refresh = false) => {
+      if (disposed) return;
+      const spot = spotsRef.current.find(value => value.call === call);
+      if (!spot || overlayRef.current === "DXCC") { hideDetails(); return; }
+      if (inspectedCall === call && popup && !refresh) return;
+      inspectedCall = call;
+      const content = document.createElement("div");
+      content.className = "map-spot-details";
+      content.id = detailID;
+      content.setAttribute("role", "tooltip");
+      const heading = document.createElement("strong");
+      heading.textContent = spot.call;
+      heading.style.color = spotStatusColor(spot, paletteRef.current);
+      content.append(heading);
+      for (const [index, text] of mapSpotDetails(spot).entries()) {
+        const line = document.createElement("span");
+        line.className = index === 0 ? "map-spot-frequency" : "";
+        line.textContent = text;
+        content.append(line);
+      }
+      popup ??= new maplibregl.Popup({ closeButton: false, closeOnClick: false, maxWidth: "280px", offset: 12, className: "map-spot-popup" });
+      popup.setLngLat([spot.lon, spot.lat]).setDOMContent(content).addTo(map);
+    };
+    const redrawLabels = () => {
+      if (disposed) return;
+      const width = map.getContainer().clientWidth, height = map.getContainer().clientHeight;
+      const occupied: { x: number; y: number }[] = [];
+      // Endpoint callsigns and the route annotation remain primary; lower
+      // priority spot/DXCC labels must move out of their immediate vicinity.
+      for (const point of [homeRef.current, targetRef.current]) {
+        if (point?.call?.trim() && Number.isFinite(point.lon) && Number.isFinite(point.lat))
+          occupied.push(map.project([point.lon, point.lat]));
+      }
+      if (routeLabelPointRef.current) occupied.push(map.project(routeLabelPointRef.current));
+      const visible = new Set<string>();
+      const displayLabel = (id: string, coordinate: Coordinate, className: string, value: string, title: string, color: string) => {
+        visible.add(id);
+        let marker = markersRef.current.get(id);
+        if (!marker) {
+          const element = document.createElement("span");
+          element.className = className;
+          marker = new maplibregl.Marker({ element, anchor: "left" }).setLngLat(coordinate).addTo(map);
+          markersRef.current.set(id, marker);
+        }
+        const element = marker.getElement();
+        if (element.textContent !== value) element.textContent = value;
+        if (element.title !== title) element.title = title;
+        if (element.style.color !== color) element.style.color = color;
+        marker.setLngLat(coordinate);
+      };
+      const drawDXCCLabels = () => { if (!expeditionLabelsRef.current && overlayRef.current !== "Spots") {
+        for (const entity of labelsRef.current) {
+          const status = dxccRef.current?.[entity.id] ?? "unknown";
+          if (status !== "unknown" && !statusFilterRef.current.includes(status)) continue;
+          const position = map.project(entity.coordinate);
+          if (position.x < 8 || position.x > width - 55 || position.y < 8 || position.y > height - 20) continue;
+          if (occupied.some(other => Math.abs(other.x - position.x) < 88 && Math.abs(other.y - position.y) < 26)) continue;
+          occupied.push({ x: position.x, y: position.y });
+          displayLabel(`dxcc-${entity.id}`, entity.coordinate, "map-dxcc-label", entity.label,
+            `${entity.name} · DXCC ${entity.id} · ${status}`,
+            status === "unknown" ? "#8fa7c0" :
+              status === "needed" ? "#8fb3d9" : status === "worked" ? "#ff9d2e" : "#12d6a0");
+        }
+      } };
+      if (!expeditionLabelsRef.current && overlayRef.current !== "DXCC" && map.getZoom() >= 3) {
+        const seen = new Set<string>();
+        for (const spot of spotsRef.current) {
+          const call = spot.call.trim().toUpperCase();
+          if (!call || seen.has(call)) continue;
+          seen.add(call);
+          const coordinate: Coordinate = [spot.lon, spot.lat];
+          const position = map.project(coordinate);
+          if (position.x < 8 || position.x > width - 110 || position.y < 8 || position.y > height - 20) continue;
+          if (occupied.some(other => Math.abs(other.x - position.x) < 145 && Math.abs(other.y - position.y) < 23)) continue;
+          occupied.push({ x: position.x, y: position.y });
+          displayLabel(`spot-${call}`, coordinate, "map-spot-label", call,
+            `${call} · ${spot.band} · ${spot.mode} · ${spot.callStatus ?? spot.state}`,
+            spotStatusColor(spot, paletteRef.current));
+        }
+      }
+      // Callsigns take priority over approximate country labels at regional zoom.
+      drawDXCCLabels();
+      for (const [id, marker] of markersRef.current) {
+        if (!visible.has(id)) { marker.remove(); markersRef.current.delete(id); }
+      }
+      // Focusable hit targets sit over the existing palette-coloured circles.
+      // Hover and focus inspect only; activation retains the existing tune action.
+      const visibleSpots = new Set<string>();
+      const placed: { x: number; y: number; width?: number; height?: number }[] = [];
+      const expedition = expeditionLabelsRef.current;
+      const markerSpots = expedition ? [...spotsRef.current].sort((a, b) => Number(b.id === selectedIDRef.current) - Number(a.id === selectedIDRef.current)) : spotsRef.current;
+      if (expedition || overlayRef.current !== "DXCC") for (const spot of markerSpots) {
+        const position = map.project([spot.lon, spot.lat]);
+        if (position.x < 0 || position.x > width || position.y < 0 || position.y > height) continue;
+        const markerKey = expedition ? spot.id : spot.call;
+        visibleSpots.add(markerKey);
+        let marker = spotMarkersRef.current.get(markerKey);
+        if (!marker) {
+          const button = document.createElement("button");
+          const call = spot.call, id = spot.id;
+          button.type = "button";
+          button.className = "map-spot-hit";
+          button.setAttribute("aria-describedby", detailID);
+          button.addEventListener("mouseenter", () => showDetails(call));
+          button.addEventListener("focus", () => showDetails(call));
+          button.addEventListener("mouseleave", () => { if (document.activeElement !== button) hideDetails(); });
+          button.addEventListener("blur", hideDetails);
+          button.addEventListener("keydown", event => { if (event.key === "Escape") { event.preventDefault(); hideDetails(); } });
+          button.addEventListener("click", event => {
+            event.stopPropagation();
+            const current = spotsRef.current.find(value => expedition ? value.id === id : value.call === call);
+            if (current) callback.current?.(current);
+          });
+          marker = new maplibregl.Marker({ element: button, anchor: "center" }).setLngLat([spot.lon, spot.lat]).addTo(map);
+          spotMarkersRef.current.set(markerKey, marker);
+        }
+        const button = marker.getElement();
+        if (expedition) {
+          button.classList.remove("map-spot-hit");
+          button.classList.add("dxp-pin");
+          button.dataset.activity = (spot.callStatus || "on air").replaceAll("_", " ");
+          button.style.setProperty("--pin-color", spotStatusColor(spot, paletteRef.current));
+          button.setAttribute("aria-current", selectedIDRef.current === spot.id ? "true" : "false");
+          button.style.zIndex = selectedIDRef.current === spot.id ? "10" : "2";
+          const labelWidth = Math.min(140, Math.max(68, spot.call.length * 7 + 16, spot.locationOnly ? 0 : 122));
+          button.style.width = `${labelWidth}px`;
+          const offset = expeditionLabelOffset(position, placed, width, height, labelWidth, spot.locationOnly ? 40 : 52);
+          marker.setOffset(offset);
+          // Create DOM text nodes only: publisher text never becomes HTML.
+          const line = document.createElement("span"); line.className = "dxp-pin-leader"; line.setAttribute("aria-hidden", "true");
+          line.style.width = `${Math.hypot(...offset)}px`;
+          line.style.transform = `rotate(${Math.atan2(-offset[1], -offset[0])}rad)`;
+          const body = document.createElement("span"); body.className = "dxp-pin-body";
+          const call = document.createElement("strong"); call.textContent = spot.call;
+          const status = document.createElement("span"); status.textContent = (spot.callStatus || "on air").replaceAll("_", " ");
+          body.append(call, status);
+          if (!spot.locationOnly) { const frequency = document.createElement("small"); frequency.textContent = `${spot.mhz.toFixed(4)} MHz · ${spot.mode}`; body.append(frequency); }
+          button.replaceChildren(line, body);
+        }
+        button.setAttribute("aria-label", `${spot.call} · ${expedition ? `${spot.callStatus} · ` : ""}${mapSpotDetails(spot)[0]}${callback.current ? `. ${actionLabel.current}.` : ". Inspect spot."}`);
+        if (!expedition) button.setAttribute("aria-current", selectedCallRef.current === spot.call ? "true" : "false");
+        marker.setLngLat([spot.lon, spot.lat]);
+      }
+      for (const [call, marker] of spotMarkersRef.current) {
+        if (!visibleSpots.has(call)) { marker.remove(); spotMarkersRef.current.delete(call); }
+      }
+      if (inspectedCall) {
+        if (visibleSpots.has(inspectedCall)) showDetails(inspectedCall, true); else hideDetails();
+      }
+    };
+    const redrawGrid = () => {
+      if (disposed) return;
+      const source = map.getSource("maidenhead-grid") as maplibregl.GeoJSONSource | undefined;
+      if (!source) return;
+      if (!showGridRef.current) { source.setData(emptyLines); clearGridLabels(); return; }
+      const bounds = map.getBounds();
+      const grid = maidenheadGrid({ west: bounds.getWest(), east: bounds.getEast(),
+        south: bounds.getSouth(), north: bounds.getNorth() }, map.getZoom());
+      source.setData(lineFeatures(grid.lines));
+      const visible = new Set<string>();
+      for (const label of grid.labels) {
+        visible.add(label.key);
+        let marker = gridMarkersRef.current.get(label.key);
+        if (!marker) {
+          const element = document.createElement("span");
+          element.className = "map-grid-label";
+          element.setAttribute("aria-hidden", "true");
+          marker = new maplibregl.Marker({ element, anchor: "center" }).setLngLat(label.coordinate).addTo(map);
+          gridMarkersRef.current.set(label.key, marker);
+        }
+        const element = marker.getElement();
+        if (element.textContent !== label.locator) element.textContent = label.locator;
+        element.dataset.precision = String(grid.precision);
+        marker.setLngLat(label.coordinate);
+      }
+      for (const [key, marker] of gridMarkersRef.current) {
+        if (!visible.has(key)) { marker.remove(); gridMarkersRef.current.delete(key); }
+      }
+    };
+    const repaint = () => {
+      if (disposed || !element.clientWidth || !element.clientHeight) return;
+      map.resize();
+      map.triggerRepaint();
+    };
+    const requestEvidence = () => {
+      if (!acceptanceActive || disposed) return;
+      captureRequested = true;
+      element.dataset.capturedAt = "0";
+      repaint();
+    };
+    const evidence = () => {
+      if (disposed || !acceptanceActive || !captureRequested) return;
+      const canvas = map.getCanvas();
+      const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+      element.dataset.canvasWidth = String(canvas.width);
+      element.dataset.canvasHeight = String(canvas.height);
+      element.dataset.webgl = String(Boolean(gl && !gl.isContextLost() && gl.getError() === gl.NO_ERROR));
+      element.dataset.landFeatures = String(landFeatures);
+      element.dataset.renderedLandFeatures = String(map.isStyleLoaded() ? map.queryRenderedFeatures(undefined, { layers: ["land"] }).length : 0);
+      element.dataset.mapLoaded = String(map.isStyleLoaded() && map.isSourceLoaded("land") && landFeatures > 0);
+      element.dataset.tilesLoaded = String(map.areTilesLoaded());
+      if (!gl || !landFeatures || !map.isStyleLoaded() || !map.isSourceLoaded("land") || !map.areTilesLoaded()) return;
+      let probes = 0;
+      let matches = 0;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const pixels = new Uint8Array(36);
+      const mismatches: { x: number; y: number; rgba: number[] }[] = [];
+      const framebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      // A distributed grid catches missing GPU tiles even when the CPU feature
+      // index still contains the complete geography. Only acceptance reads pixels.
+      for (let row = 0; row < 16; row++) {
+        for (let column = 0; column < 24; column++) {
+          const point: [number, number] = [(column + 0.5) * width / 24, (row + 0.5) * height / 16];
+          if (!interiorLandProbe(point, (neighbor, layers) => map.queryRenderedFeatures(neighbor, { layers }).length > 0)) continue;
+          probes++;
+          const x = Math.max(0, Math.min(canvas.width - 3, Math.round(point[0] * canvas.width / width) - 1));
+          const y = Math.max(0, Math.min(canvas.height - 3, canvas.height - Math.round(point[1] * canvas.height / height) - 1));
+          gl.readPixels(x, y, 3, 3, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+          if (landPixelMatches(pixels)) matches++;
+          else if (mismatches.length < 4) mismatches.push({ x: point[0], y: point[1], rgba: [...pixels.slice(16, 20)] });
+        }
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      element.dataset.landPixelProbes = String(probes);
+      element.dataset.matchedLandPixels = String(matches);
+      element.dataset.pixelMismatches = JSON.stringify(mismatches);
+      element.dataset.webgl = String(!gl.isContextLost() && gl.getError() === gl.NO_ERROR);
+      element.dataset.capturedAt = String(Date.now());
+      captureRequested = false;
+    };
+    const fitFixture = () => {
+      const station = homeRef.current;
+      if (!fixture && station && !fitDataRef.current) {
+        map.jumpTo({ center: [station.lon, station.lat], zoom: 2.55 });
+        return;
+      }
+      const points = spotsRef.current;
+      const bounds: [[number, number], [number, number]] = points.length ?
+        [[Math.min(...points.map(s => s.lon)), Math.min(...points.map(s => s.lat))],
+         [Math.max(...points.map(s => s.lon)), Math.max(...points.map(s => s.lat))]] : [[-170, -55], [175, 75]];
+      map.fitBounds(bounds, {
+        padding: { top: 24, right: 48, bottom: 75, left: 24 },
+        duration: 0,
+        maxZoom: 2,
+      });
+    };
+    const visible = () => { if (document.visibilityState === "visible") repaint(); };
+    const disposeMap = () => {
+      if (disposed) return;
+      disposed = true;
+      // Retire all entry points before releasing a partially initialized map.
+      // In particular, later React effects must never call a constructor that
+      // failed through a previously published redraw closure.
+      redrawRef.current = () => {};
+      redrawGridRef.current = () => {};
+      if (mapRef.current === map) mapRef.current = null;
+      document.removeEventListener("xlog-native-acceptance", requestEvidence);
+      document.removeEventListener("xlog-native-map-evidence", requestEvidence);
+      document.removeEventListener("visibilitychange", visible);
+      window.removeEventListener("focus", repaint);
+      resize?.disconnect();
+      if (resizeFrame !== null) { window.cancelAnimationFrame(resizeFrame); resizeFrame = null; }
+      markersRef.current.forEach(marker => marker.remove());
+      markersRef.current.clear();
+      spotMarkersRef.current.forEach(marker => marker.remove());
+      spotMarkersRef.current.clear();
+      clearGridLabels();
+      hideDetails();
+      try { map?.remove(); }
+      catch (cause) {
+        // Keep the original initialization failure visible even if MapLibre
+        // cannot fully remove its partially initialized renderer.
+        element.dataset.mapCleanupError = cause instanceof Error ? cause.message : String(cause);
+      }
+    };
+    try {
+      map = new maplibregl.Map({
+        container: container.current,
+        // This retained map has one visible-size owner below. MapLibre's own
+        // observer otherwise resizes hidden panes to its 400x300 fallback.
+        trackResize: false,
+        // This is a world overview, not a slippy map that should repeat the
+        // same countries. A transient fallback camera must never render
+        // multiple wrapped copies while the Desk is returning.
+        renderWorldCopies: false,
+        center: initialCamera?.center ?? [-15, 38],
+        zoom: initialCamera?.zoom ?? 1.65,
+        bearing: initialCamera?.bearing ?? 0,
+        pitch: initialCamera?.pitch ?? 0,
+        attributionControl: false,
+        style: {
+          version: 8,
+          sources: {
+            land: { type: "geojson", data: geometryUrl, promoteId: "dxcc_entity_code" },
+            imagery: { type: "raster", tiles: [imageryTiles], tileSize: 256, maxzoom: 8,
+              attribution: '<a href="https://www.earthdata.nasa.gov/data/visualization/worldview" target="_blank" rel="noopener noreferrer">NASA GIBS Blue Marble</a>' },
+            route: { type: "geojson", data: emptyLines },
+            grayline: { type: "geojson", data: emptyLines },
+            "maidenhead-grid": { type: "geojson", data: emptyLines },
+            night: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+            landmarks: { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+            spots: {
+              type: "geojson",
+              data: {
+                type: "FeatureCollection",
+                features: spotsRef.current.map((s) => ({
+                  type: "Feature",
+                  id: `spot-${s.call}`, properties: { id: s.id, state: s.state,
+                    spotColor: spotMarkerColor(s, paletteRef.current, spotColorModeRef.current) },
+                  geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+                })),
+              },
+            },
+          },
+          layers: [
+            {
+              id: "ocean",
+              type: "background",
+              paint: { "background-color": "#123347" },
+            },
+            { id: "imagery", type: "raster", source: "imagery", layout: { visibility: appearanceRef.current === "Standard" ? "none" : "visible" },
+              paint: { "raster-opacity": 0.84, "raster-fade-duration": 0 } },
+            {
+              id: "land",
+              type: "fill",
+              source: "land",
+              paint: { "fill-color": "#314741", "fill-opacity": appearanceRef.current === "Standard" ? 1 : 0.08 },
+            },
+            {
+              id: "borders",
+              type: "line",
+              source: "land",
+              paint: { "line-color": "#a4b3be", "line-opacity": appearanceRef.current === "Satellite" ? 0 : 0.65, "line-width": 0.7 },
+            },
+            { id: "dxcc-status", type: "fill", source: "land", paint: {
+              "fill-color": ["match", ["feature-state", "status"], "needed", "#8FB3D9", "worked", "#FF9D2E", "confirmed", "#12D6A0", "#61758D"],
+              "fill-opacity": 0.12,
+            } },
+            { id: "maidenhead-grid", type: "line", source: "maidenhead-grid",
+              layout: { visibility: showGridRef.current ? "visible" : "none" },
+              paint: { "line-color": "#35c8f5", "line-opacity": 0.46, "line-width": 1 } },
+            { id: "night-fill", type: "fill", source: "night", layout: { visibility: showGrayline ? "visible" : "none" },
+              paint: { "fill-color": "#c7d0d8", "fill-opacity": 0.27 } },
+            { id: "grayline-band", type: "line", source: "grayline", paint: { "line-color": "#07111f", "line-opacity": 0.42, "line-width": 30 } },
+            { id: "grayline-edge", type: "line", source: "grayline", paint: { "line-color": "#a9b6c8", "line-opacity": 0.78, "line-width": 1.25, "line-dasharray": [4, 5] } },
+            { id: "route-line", type: "line", source: "route", paint: { "line-color": "#35c8f5", "line-width": 3, "line-opacity": 0.95, "line-dasharray": [8, 5] } },
+            {
+              id: "spots",
+              type: "circle",
+              source: "spots",
+              paint: {
+                "circle-radius": 5,
+                "circle-color": ["get", "spotColor"],
+                "circle-stroke-color": "#07111f",
+                "circle-stroke-width": 1.5,
+              },
+            },
+            { id: "landmarks", type: "circle", source: "landmarks", paint: {
+              "circle-radius": ["match", ["get", "kind"], "sun", 9, "home", 8, 8],
+              "circle-color": ["get", "color"], "circle-stroke-color": "#e6edf6", "circle-stroke-width": 1.5,
+            } },
+          ],
+        },
+      });
+      constructionWidth = element.clientWidth;
+      constructionHeight = element.clientHeight;
+      map.on("load", () => {
+        if (disposed) return;
+        redrawGrid();
+        fetch(geometryUrl).then(response => {
+          if (!response.ok) throw new Error(`DXCC geometry HTTP ${response.status}`);
+          return response.json();
+        }).then((data: { type: string; features?: DXCCFeature[] }) => {
+          if (disposed) return;
+          landFeatures = data.type === "FeatureCollection" ? data.features?.length ?? 0 : 0;
+          if (data.type === "FeatureCollection" && data.features) {
+            entityIDsRef.current = [...new Set(data.features.map(feature => feature.properties.dxcc_entity_code).filter(Number.isFinite))];
+            labelsRef.current = data.features.flatMap(feature => {
+              const coordinate = representativePoint(feature);
+              const label = dxccPrefixLabel(feature.properties.dxcc_prefix);
+              return coordinate && label && Number.isFinite(feature.properties.dxcc_entity_code) ? [{ id: feature.properties.dxcc_entity_code,
+                label, name: feature.properties.dxcc_name ?? "DXCC entity", coordinate }] : [];
+            }).sort((a, b) => a.id - b.id);
+            for (const id of entityIDsRef.current) map.setFeatureState({ source: "land", id },
+              { status: dxccRef.current?.[id] ?? "unknown" });
+            redrawLabels();
+          }
+          // Loading bundled geography only resolves its own failure. It is
+          // not evidence that a different source or the renderer recovered.
+          if (!element.dataset.mapError || element.dataset.mapErrorSource === "land") {
+            element.dataset.mapError = "";
+            element.dataset.mapErrorSource = "";
+            setError("");
+          }
+          requestEvidence();
+        }).catch((cause: unknown) => {
+          if (!disposed) {
+            element.dataset.mapError = cause instanceof Error ? cause.message : "Loaded geography could not be read back";
+            setError("Map geography could not be read back. Try reloading the map.");
+          }
+        });
+      });
+      // Read framebuffer pixels synchronously at the end of a requested frame,
+      // before the browser discards its non-preserved drawing buffer.
+      map.on("render", evidence);
+      const rememberCamera = () => {
+        if (disposed) return;
+        const center = map.getCenter(), context = cameraContextRef.current;
+        cameraRef.current = { center: [center.lng, center.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(), ...context };
+        persistState();
+      };
+      map.on("moveend", redrawLabels);
+      map.on("moveend", redrawGrid);
+      map.on("moveend", rememberCamera);
+      document.addEventListener("xlog-native-acceptance", requestEvidence);
+      document.addEventListener("xlog-native-map-evidence", requestEvidence);
+      window.addEventListener("focus", repaint);
+      document.addEventListener("visibilitychange", visible);
+      if (!initialCamera) fitFixture();
+      map.on("movestart", (event) => {
+        if (disposed) return;
+        if (event.originalEvent) {
+          preserveCamera.current = true;
+          automaticRouteFit.current = null;
+        }
+      });
+      map.addControl(
+        new maplibregl.NavigationControl({ showCompass: true }),
+        "top-right",
+      );
+      map.addControl(
+        new maplibregl.AttributionControl({
+          compact: false,
+          customAttribution:
+            '<a href="https://github.com/amazingproducer/dxcc-world-map" target="_blank" rel="noopener noreferrer">DXCC geometry: amazingproducer/dxcc-world-map</a>',
+        }),
+        "bottom-right",
+      );
+      map.addControl(
+        new maplibregl.ScaleControl({ unit: "metric" }),
+        "top-right",
+      );
+      map.on("click", "spots", (e) => {
+        const id = e.features?.[0]?.properties?.id;
+        const s = spotsRef.current.find((s) => s.id === id);
+        if (s) callback.current?.(s);
+      });
+      map.on("mouseenter", "spots", () => {
+        if (callback.current) map.getCanvas().style.cursor = "pointer";
+      });
+      map.on("mouseleave", "spots", () => {
+        map.getCanvas().style.cursor = "";
+      });
+      map.on("mousemove", "spots", (event) => {
+        const spot = spotsRef.current.find(value => value.id === event.features?.[0]?.properties?.id);
+        if (spot) showDetails(spot.call);
+      });
+      map.on("mouseleave", "spots", () => {
+        if (!container.current?.contains(document.activeElement) || !document.activeElement?.classList.contains("map-spot-hit")) hideDetails();
+      });
+      map.on("error", (event) => {
+        if (disposed) return;
+        // Raster failures must not hide the bundled DXCC geography.
+        const diagnostic = describeMapError(event);
+        if (diagnostic.imagery) {
+          setImageryUnavailable(true);
+          appearanceRef.current = "Standard";
+          if (map.getLayer("imagery")) map.setLayoutProperty("imagery", "visibility", "none");
+          if (map.getLayer("land")) map.setPaintProperty("land", "fill-opacity", 1);
+        } else {
+          const message = `Map error (${diagnostic.source}): ${diagnostic.detail}`;
+          element.dataset.mapError = message;
+          element.dataset.mapErrorSource = diagnostic.source;
+          setError(`${message} Logging and cluster selection remain available.`);
+        }
+      });
+      let initialViewportFinalized = false;
+      const scheduleResize = () => {
+        // A retained Desk map can be hidden or change split rows several times
+        // in one layout pass. Measure its final visible size before resizing
+        // WebGL. Do not infer MapLibre's viewport from the CSS canvas size: on
+        // route return those dimensions can agree while its transform is still
+        // the hidden/fallback size.
+        if (disposed || resizeFrame !== null) return;
+        resizeFrame = window.requestAnimationFrame(() => {
+          resizeFrame = null;
+          if (disposed) return;
+          const nextWidth = element.clientWidth, nextHeight = element.clientHeight;
+          if (!nextWidth || !nextHeight) return;
+          map.resize();
+          let refreshAutomaticFit = false;
+          const routeFit = automaticRouteFit.current;
+          if (routeFit && routeFit.key === routeKeyRef.current
+            && (routeFit.width !== nextWidth || routeFit.height !== nextHeight)) {
+            // The Desk may still be opening its logbook/history rows when the
+            // route first fits. Repeat that automatic fit at the settled size
+            // so neither endpoint remains underneath an overlay.
+            fittedRouteKey.current = null;
+            refreshAutomaticFit = true;
+          }
+          if (!initialViewportFinalized) {
+            initialViewportFinalized = true;
+            const fallbackConstruction = !constructionWidth || !constructionHeight
+              || constructionWidth === 400 && constructionHeight === 300;
+            if (fallbackConstruction && (nextWidth !== constructionWidth || nextHeight !== constructionHeight)) {
+              // Camera effects may have run against MapLibre's 400x300
+              // construction fallback before the returning Desk settled.
+              // Repeat only those automatic fits once at the actual size;
+              // ordinary operator resizes must continue to preserve camera.
+              fittedRouteKey.current = null;
+              fittedDataKey.current = null;
+              if (!preserveCamera.current) fitFixture();
+              refreshAutomaticFit = true;
+            }
+          }
+          if (refreshAutomaticFit) setViewportRevision(value => value + 1);
+          // A layout change only updates the viewport. Refitting a shallow
+          // split can zoom out to several wrapped worlds and discard the camera.
+          map.triggerRepaint();
+          redrawLabels();
+          redrawGrid();
+        });
+      };
+      resize = new ResizeObserver(scheduleResize);
+      resize.observe(element);
+      // MapLibre can be constructed while an incoming route is still hidden.
+      // Resize once after layout even when ResizeObserver coalesces that reveal.
+      scheduleResize();
+      // Publish only after construction and setup succeed. A WebGL failure
+      // must leave the later selection/data effects as safe no-ops.
+      mapRef.current = map;
+      redrawRef.current = redrawLabels;
+      redrawGridRef.current = redrawGrid;
+      return () => {
+        try { rememberCamera(); } finally { disposeMap(); }
+      };
+    } catch (e) {
+      disposeMap();
+      element.dataset.mapError = e instanceof Error ? e.message : String(e);
+      if (/WebGL/i.test(element.dataset.mapError)) {
+        setSoftwareMap(true);
+        return disposeMap;
+      }
+      setError(
+        `Map unavailable: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return disposeMap;
+    }
+  }, []);
+  useEffect(() => {
+    const s = selectedSpot;
+    const key = selected && s ? `${selected}:${s.call}` : null;
+    if (s && key && key !== centeredSelectionKey.current && !(home && target) && mapRef.current) {
+      preserveCamera.current = true;
+      mapRef.current.easeTo({
+        center: [s.lon, s.lat],
+        duration: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? 0
+          : 180,
+      });
+    }
+    centeredSelectionKey.current = key;
+    redrawRef.current();
+  }, [selected, selectedSpot?.call, home?.lat, home?.lon, target?.lat, target?.lon]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!routeKey || !home || !target || !map) {
+      fittedRouteKey.current = null;
+      automaticRouteFit.current = null;
+      return;
+    }
+    if (fittedRouteKey.current === routeKey) return;
+    const bounds = routeBounds([home.lon, home.lat], [target.lon, target.lat], longPath);
+    if (!bounds) return;
+    fittedRouteKey.current = routeKey;
+    preserveCamera.current = true;
+    const element = container.current;
+    const mapRect = element?.getBoundingClientRect();
+    const toolbarRect = toolbarRef.current?.getBoundingClientRect();
+    const legendRect = legendRef.current?.getBoundingClientRect();
+    const topOverlayInset = mapRect && toolbarRect
+      ? Math.max(0, toolbarRect.bottom - mapRect.top)
+      : toolbarRect?.height ?? 0;
+    const bottomOverlayInset = mapRect && legendRect
+      ? Math.max(0, mapRect.bottom - legendRect.top)
+      : legendRect?.height ?? 0;
+    map.fitBounds(bounds, {
+      padding: routeFitPadding(compact, topOverlayInset, bottomOverlayInset),
+      maxZoom: 6,
+      duration: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 350,
+    });
+    automaticRouteFit.current = element
+      ? { key: routeKey, width: element.clientWidth, height: element.clientHeight }
+      : null;
+  }, [routeKey, home?.lon, home?.lat, target?.lon, target?.lat, longPath, compact, viewportRevision]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (fitToDataKey == null || !map || !mappedSpots.length || fittedDataKey.current === fitToDataKey) return;
+    const fit = () => {
+      const bounds = mapSpotBounds(mappedSpots);
+      if (!bounds) return;
+      fittedDataKey.current = fitToDataKey; preserveCamera.current = true;
+      map.fitBounds(bounds, { padding: { top: 38, right: 38, bottom: 38, left: 38 }, maxZoom: 5,
+        duration: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 220 });
+    };
+    if (map.isStyleLoaded()) fit(); else map.once("load", fit);
+    return () => { map.off("load", fit); };
+  }, [fitToDataKey, mappedSpots, viewportRevision]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!fixture && home && map && !preserveCamera.current && !selected) {
+      map.easeTo({ center: [home.lon, home.lat], zoom: 2.55, duration: 0 });
+    }
+  }, [fixture, home?.lat, home?.lon, selected]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const update = () => {
+      if (!map.getLayer("imagery")) return;
+      const offline = appearance === "Standard" || imageryUnavailable;
+      map.setLayoutProperty("imagery", "visibility", offline ? "none" : "visible");
+      map.setPaintProperty("land", "fill-opacity", offline ? 1 : 0.08);
+      map.setPaintProperty("borders", "line-opacity", appearance === "Satellite" && !offline ? 0 : 0.65);
+    };
+    if (map.isStyleLoaded()) update(); else map.once("load", update);
+    return () => { map.off("load", update); };
+  }, [appearance, imageryUnavailable]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const update = () => {
+      if (!map.getLayer("spots")) return;
+      map.setLayoutProperty("spots", "visibility", overlayMode === "DXCC" ? "none" : "visible");
+      map.setLayoutProperty("dxcc-status", "visibility", overlayMode === "Spots" ? "none" : "visible");
+      map.setPaintProperty("dxcc-status", "fill-opacity", ["case",
+        ["in", ["feature-state", "status"], ["literal", statusFilter]], 0.12,
+        ["==", ["feature-state", "status"], "unknown"], 0.07, 0]);
+      redrawRef.current();
+    };
+    if (map.isStyleLoaded()) update(); else map.once("load", update);
+    return () => { map.off("load", update); };
+  }, [overlayMode, statusFilter]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const update = () => {
+      if (!map.getLayer("maidenhead-grid")) return;
+      map.setLayoutProperty("maidenhead-grid", "visibility", showGrid ? "visible" : "none");
+      redrawGridRef.current();
+    };
+    if (map.isStyleLoaded()) update(); else map.once("load", update);
+    return () => { map.off("load", update); };
+  }, [showGrid]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const update = () => {
+      if (mapRef.current !== map || !map.getSource("land")) return;
+      for (const id of entityIDsRef.current) map.setFeatureState({ source: "land", id },
+        { status: dxccStatuses?.[id] ?? "unknown" });
+      redrawRef.current();
+    };
+    // Source existence is the safe probe: isSourceLoaded emits an error before
+    // registration, while isStyleLoaded can become false during later tile work
+    // even though the source remains ready and the initial load will not repeat.
+    if (map.getSource("land")) update(); else map.once("load", update);
+    return () => { map.off("load", update); };
+  }, [dxccStatuses]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const update = () => {
+      const sun = solarPosition(solarDate);
+      const route = home && target ? completeRoute([home.lon, home.lat], [target.lon, target.lat], longPath) : [];
+      (map.getSource("route") as maplibregl.GeoJSONSource | undefined)?.setData(lineFeatures(route));
+      (map.getSource("grayline") as maplibregl.GeoJSONSource | undefined)?.setData(lineFeatures(showGrayline ? grayline(solarDate) : []));
+      (map.getSource("night") as maplibregl.GeoJSONSource | undefined)?.setData({
+        type: "FeatureCollection", features: showGrayline ? [{ type: "Feature", properties: {},
+          geometry: { type: "Polygon", coordinates: nightHemisphere(sun) } }] : [],
+      });
+      map.setLayoutProperty("night-fill", "visibility", showGrayline ? "visible" : "none");
+      map.setLayoutProperty("grayline-band", "visibility", showGrayline ? "visible" : "none");
+      map.setLayoutProperty("grayline-edge", "visibility", showGrayline ? "visible" : "none");
+      map.setPaintProperty("route-line", "line-color", longPath ? "#f47ac4" : "#35c8f5");
+      (map.getSource("landmarks") as maplibregl.GeoJSONSource | undefined)?.setData({
+        type: "FeatureCollection", features: [
+          ...(home ? [{ type: "Feature" as const, properties: { kind: "home", color: "#12d6a0", call: home.call ?? "My station" },
+            geometry: { type: "Point" as const, coordinates: [home.lon, home.lat] } }] : []),
+          ...(target ? [{ type: "Feature" as const, properties: { kind: "target", color: "#f3b23c", call: target.call ?? "Active DX" },
+            geometry: { type: "Point" as const, coordinates: [target.lon, target.lat] } }] : []),
+          ...(showSun ? [{ type: "Feature" as const, properties: { kind: "sun", color: "#ffd75a", call: "Sun" },
+            geometry: { type: "Point" as const, coordinates: sun } }] : []),
+        ],
+      });
+    };
+    if (map.isStyleLoaded()) update(); else map.once("load", update);
+    return () => { map.off("load", update); };
+  }, [home, target, showSun, showGrayline, solarDate, longPath]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const markers: maplibregl.Marker[] = [];
+    routeLabelPointRef.current = null;
+    const endpoint = (point: MapPoint | null | undefined, kind: "home" | "target") => {
+      const call = point?.call?.trim();
+      if (!point || !call || !Number.isFinite(point.lon) || !Number.isFinite(point.lat)) return;
+      const label = document.createElement("span");
+      label.className = `map-route-endpoint map-route-${kind}`;
+      label.textContent = call;
+      label.setAttribute("aria-label", `${kind === "home" ? "Home station" : "Target"} ${call}`);
+      markers.push(new maplibregl.Marker({ element: label, anchor: kind === "home" ? "bottom" : "top",
+        offset: [0, kind === "home" ? -14 : 14] })
+        .setLngLat([point.lon, point.lat]).addTo(map));
+    };
+    endpoint(home, "home");
+    endpoint(target, "target");
+    let orient = () => {};
+    if (home && target && [home.lon, home.lat, target.lon, target.lat].every(Number.isFinite)) {
+      const sections = completeRoute([home.lon, home.lat], [target.lon, target.lat], longPath);
+      const position = routeLabelPosition(sections);
+      if (position) {
+        routeLabelPointRef.current = position.point;
+        const distance = bearingAndDistance([home.lon, home.lat], [target.lon, target.lat]).distanceKm;
+        const pathDistance = longPath ? 2 * Math.PI * 6371.0088 - distance : distance;
+        const frequency = routeFrequencyLabel(frequencyHz);
+        const markerElement = document.createElement("div");
+        markerElement.className = "map-route-annotation";
+        markerElement.setAttribute("role", "note");
+        markerElement.setAttribute("aria-label", `${longPath ? "Long" : "Short"} path ${Math.round(pathDistance).toLocaleString()} kilometres${frequency ? `, ${frequency}` : ""}`);
+        const inner = document.createElement("div");
+        inner.className = "map-route-annotation-inner";
+        const distanceLabel = document.createElement("span");
+        distanceLabel.className = "map-route-distance";
+        distanceLabel.textContent = `${longPath ? "LP" : "SP"} · ${Math.round(pathDistance).toLocaleString()} km`;
+        inner.append(distanceLabel);
+        const gap = document.createElement("span");
+        gap.className = "map-route-label-gap";
+        inner.append(gap);
+        if (frequency) {
+          const frequencyLabel = document.createElement("span");
+          frequencyLabel.className = "map-route-frequency";
+          frequencyLabel.textContent = frequency;
+          inner.append(frequencyLabel);
+        }
+        markerElement.append(inner);
+        markers.push(new maplibregl.Marker({ element: markerElement, anchor: "center" })
+          .setLngLat(position.point).addTo(map));
+        redrawRef.current();
+        orient = () => {
+          const before = map.project(position.before), after = map.project(position.after);
+          let angle = Math.atan2(after.y - before.y, after.x - before.x) * 180 / Math.PI;
+          if (angle > 90) angle -= 180;
+          if (angle < -90) angle += 180;
+          inner.style.transform = `rotate(${Math.max(-70, Math.min(70, angle))}deg)`;
+        };
+        orient();
+        map.on("moveend", orient);
+      }
+    }
+    return () => { map.off("moveend", orient); markers.forEach(marker => marker.remove()); routeLabelPointRef.current = null; };
+  }, [home?.call, home?.lon, home?.lat, target?.call, target?.lon, target?.lat, longPath, frequencyHz]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setSolarDate(new Date()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const update = () => {
+      const source = map.getSource("spots") as maplibregl.GeoJSONSource | undefined;
+      source?.setData({ type: "FeatureCollection", features: mappedSpots.map(s => ({
+        type: "Feature", id: `spot-${s.call}`, properties: { id: s.id, state: s.state,
+          spotColor: spotMarkerColor(s, palette, spotColorMode) },
+        geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+      })) });
+      redrawRef.current();
+    };
+    if (map.isStyleLoaded()) update(); else map.once("load", update);
+    return () => { map.off("load", update); };
+  }, [mappedSpots, palette, spotColorMode]);
+  const routeSummary = home && target ? bearingAndDistance([home.lon, home.lat], [target.lon, target.lat]) : null;
+  const activeBands = [...new Set(mappedSpots.map(spot => spot.band))].slice(0, 9);
+  const changePreset = (next: MapPreset) => {
+    setPreset(next);
+    if (next === "Simple") { setOverlayMode("Spots"); setShowSun(false); setShowGrayline(false); }
+    else if (next === "Detailed") { setOverlayMode("Both"); setShowSun(true); setShowGrayline(true); }
+    else { setOverlayMode("DXCC"); setShowSun(true); setShowGrayline(true); }
+  };
+  const toggleGrid = () => setShowGrid(current => {
+    const next = !current;
+    try { window.localStorage.setItem(gridPreferenceKey, String(next)); } catch { /* preference storage is optional */ }
+    return next;
+  });
+  return (
+    <div className={`map-wrap${compact ? " map-compact" : ""}${error ? " map-has-error" : ""}`}>
+      <div
+        ref={container}
+        className={`map${softwareMap ? " software-map-replaced" : ""}`}
+        aria-hidden={softwareMap || undefined}
+        role="region"
+        aria-label="Interactive world map, arrow keys pan, plus and minus zoom"
+      />
+      {softwareMap && <SoftwareWorldMap spots={mappedSpots} selected={selected} onSpot={onSpot} home={home} target={target}
+        longPath={longPath} overlay={overlayMode} statuses={dxccStatuses} statusFilter={statusFilter}
+        spotColor={spot => spotMarkerColor(spot, palette, spotColorMode)} showGrid={showGrid} showSun={showSun}
+        showGrayline={showGrayline} date={solarDate} actionLabel={spotActionLabel} persistenceKey={persistenceKey}
+        receivers={locatedReceivers.map(row => ({ key: row.key, spotter: row.spotter, location: row.location! }))}
+        onReceiver={key => setReceiver(receivers.find(row => row.key === key) ?? null)} />}
+      {!compact && <div ref={toolbarRef} className="map-toolbar" aria-label="World map controls">
+        <strong>World map</strong>
+        <button type="button" aria-pressed={heardMe} onClick={() => setHeardMe(!heardMe)}>Heard me</button>
+        <label>Preset <select aria-label="Map preset" disabled={softwareMap} value={preset} onChange={event => changePreset(event.target.value as MapPreset)}>
+          <option>Simple</option><option>Detailed</option><option>DX</option>
+        </select></label>
+        <label>Overlay <select aria-label="Map overlay" value={overlayMode} onChange={event => setOverlayMode(event.target.value as OverlayMode)}>
+          <option>Spots</option><option>DXCC</option><option>Both</option>
+        </select></label>
+        <label>Map <select aria-label="Map appearance" disabled={softwareMap} value={softwareMap ? "Standard" : appearance} onChange={event => { setImageryUnavailable(false); setAppearance(event.target.value as MapAppearance); }}>
+          <option>Hybrid</option><option>Satellite</option><option>Standard</option>
+        </select></label>
+        <button type="button" aria-pressed={showSun} onClick={() => setShowSun(!showSun)}>Sun</button>
+        <button type="button" aria-pressed={showGrayline} onClick={() => setShowGrayline(!showGrayline)}>Greyline</button>
+        <button type="button" aria-pressed={showGrid} onClick={toggleGrid} title="Show Maidenhead locator grid">Grid</button>
+        <button type="button" aria-pressed={longPath} onClick={() => setLongPath(!longPath)} title="Switch the displayed great-circle path; does not move the rotor">{longPath ? "Long path" : "Short path"}</button>
+        <span className="map-count">{mappedSpots.length} mapped</span>
+      </div>}
+      {compact && <button className="map-rbn-toggle" type="button" aria-pressed={heardMe} onClick={() => setHeardMe(!heardMe)}>Heard me</button>}
+      {heardMe && <aside className="map-rbn-panel" aria-label="Heard me reception reports">
+        <label>Heard me · {monitoredCall || "No station call"} <select aria-label="Heard me band scope" value={heardBand} onChange={event => setHeardBand(event.target.value)}><option value="follow">Selected radio band {bandForRadio(frequencyHz) || "unknown"}</option><option value="all">All bands</option>{BAND_ORDER.map(band => <option key={band}>{band}</option>)}</select></label>
+        <p role="status">{rbn.status}{rbn.status === "Unavailable" && receivers.length ? " · stale retained data" : ""} · {locatedReceivers.length} located · {receivers.length - locatedReceivers.length} unlocated · last 10 min</p>
+        {rbn.status === "Current" && !receivers.length && <p>No reports in this scope.</p>}
+        <small>RBN receiver positions; radio and antenna attribution unavailable.</small>
+        {!!locatedReceivers.length && !softwareMap && <button type="button" onClick={() => { const points = locatedReceivers.map(row => row.location!); mapRef.current?.fitBounds([[Math.min(...points.map(p => p.lon)), Math.min(...points.map(p => p.lat))], [Math.max(...points.map(p => p.lon)), Math.max(...points.map(p => p.lat))]], { padding: 70, maxZoom: 7 }); }}>Frame receivers</button>}
+        {receiver && receivers.some(row => row.key === receiver.key) && <div aria-label="RBN receiver details"><strong>{receiver.spotter} heard {receiver.call}</strong><p>{receiver.band} · {(receiver.frequencyKHz / 1000).toFixed(4)} MHz · {receiver.mode}</p><p>{new Date(receiver.time).toISOString()} · {Math.max(0, Math.floor((rbn.now - receiver.time) / 1000))} s ago · {receiver.updates} reports</p><p>SNR {receiver.snr === null ? "unknown" : `${receiver.snr} dB`} · Speed {receiver.speed ?? "unknown"} · {receiver.location?.provenance}</p><button type="button" onClick={() => setReceiver(null)}>Close receiver details</button></div>}
+      </aside>}
+      {imageryUnavailable && appearance !== "Standard" && <p className="map-offline" role="status">Imagery unavailable · showing bundled map</p>}
+      {error && (
+        <p className="map-error" role="alert">
+          {error}
+        </p>
+      )}
+      {!compact && <div ref={legendRef} className="map-legend">
+        {routeSummary ? <strong>{target?.call} · {Math.round(routeSummary.distanceKm).toLocaleString()} km · SP {Math.round(routeSummary.shortBearing).toString().padStart(3, "0")}° · LP {Math.round(routeSummary.longBearing).toString().padStart(3, "0")}°</strong>
+          : !home && !fixture ? <span>Set your station grid to draw accurate DX paths.</span> : null}
+        <span>{fixture ? "Offline geography · fixture spots" : locationLabel}</span>
+        <div className="map-legend-items">
+          {overlayMode !== "DXCC" && (spotLegend?.length ? spotLegend.map(item => <span key={item.label}><i style={{ backgroundColor: item.color }} />{item.label}</span>)
+            : activeBands.map(band => <span key={band}><i style={{ backgroundColor: paletteColor(band, palette?.band, clusterBandColors) }} />{band}</span>))}
+          {overlayMode !== "Spots" && (["needed", "worked", "confirmed"] as DXCCStatus[]).map(status =>
+            <button key={status} type="button" aria-pressed={statusFilter.includes(status)} onClick={() => setStatusFilter(current =>
+              current.includes(status) ? current.filter(item => item !== status) : [...current, status])}>
+              <i style={{ backgroundColor: status === "needed" ? "#8fb3d9" : status === "worked" ? "#ff9d2e" : "#12d6a0" }} />{status[0].toUpperCase() + status.slice(1)}
+            </button>)}
+          {showSun && <span><i style={{ backgroundColor: "#ffd75a" }} />Sun</span>}
+          {showGrayline && <span><i style={{ backgroundColor: "#a9b6c8" }} />Greyline</span>}
+          {showGrid && <span><i className="map-grid-key" />Maidenhead grid</span>}
+        </div>
+      </div>}
+    </div>
+  );
+}

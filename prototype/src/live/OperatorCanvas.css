@@ -1,0 +1,57 @@
+.configurable-desk { display:flex; flex-direction:column; flex:1; gap:8px; min-width:0; min-height:0; }
+.canvas-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; min-width:0; }
+.canvas-toolbar label { display:inline-flex; align-items:center; gap:6px; font-size:11px; }
+.canvas-toolbar > span { flex:1 1 180px; min-width:0; min-height:17px; color:var(--secondary); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.live .canvas-toolbar button, .live .canvas-toolbar select { min-height:28px; font-size:11px; padding:3px 8px; }
+.canvas-toolbar select { max-width:220px; }
+.canvas-work-area { display:flex; flex-direction:column; gap:10px; flex:1; min-width:0; min-height:0; }
+.canvas-work-area.is-canvas { position:relative; min-height:360px; }
+.canvas-frame { position:absolute; display:flex; flex-direction:column; min-width:0; min-height:0; }
+.canvas-frame[hidden] { display:none; }
+.canvas-panel-content { container:operator-desk / inline-size; flex:1; min-width:0; min-height:0; overflow:auto; border-radius:10px; }
+.canvas-panel-content > .desk-panel { min-height:100%; box-sizing:border-box; }
+/* Compact information panels follow their contents, within the saved frame.
+   Larger content still scrolls; only an explicit Fit height saves new geometry. */
+.canvas-panel-content.is-content-sized > .desk-panel { min-height:0; height:auto; }
+.canvas-panel-content.is-content-sized > .desk-rotor { height:100%; min-height:240px; }
+.canvas-panel-content > .live-map, .canvas-panel-content .map-wrap, .canvas-panel-content > .band-maps { height:100%; min-height:0; }
+.canvas-panel-content .band-map-chart { flex:1; min-height:96px; }
+.canvas-frame-tools { display:flex; gap:4px; padding:2px 4px; background:var(--panel); border:1px solid var(--border); border-radius:6px 6px 0 0; }
+.live .canvas-frame-tools button { min-height:24px; padding:2px 4px; display:flex; align-items:center; gap:6px; font-size:11px; }
+.canvas-frame-tools button:first-child { flex:1; min-width:0; cursor:default; text-align:left; }
+.canvas-frame-tools button:first-child span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.canvas-frame.is-editing .canvas-frame-tools button:first-child { cursor:move; touch-action:none; }
+.live .canvas-frame-tools button:first-child:disabled { opacity:1; color:var(--secondary); }
+.canvas-frame.is-editing { outline:1px solid var(--cyan); outline-offset:1px; }
+.canvas-frame.is-editing .canvas-panel-content { border-radius:0 0 8px 8px; }
+.live .canvas-edge { position:absolute; z-index:2; min-width:0; min-height:0; padding:0; border:0; border-radius:0; background:transparent; touch-action:none; opacity:.65; }
+.live .canvas-edge:hover, .live .canvas-edge:focus-visible { opacity:1; background:var(--panel); outline:2px solid var(--cyan); outline-offset:1px; }
+.live .canvas-edge[aria-disabled="true"], .canvas-frame-tools button[aria-disabled="true"] { cursor:default; opacity:.5; }
+.live .canvas-edge-n, .live .canvas-edge-s { left:16px; right:16px; height:10px; cursor:ns-resize; border-top:2px solid var(--cyan); }
+.live .canvas-edge-n { top:-4px; }.live .canvas-edge-s { bottom:-6px; }
+.live .canvas-edge-e, .live .canvas-edge-w { top:16px; bottom:16px; width:10px; cursor:ew-resize; border-left:2px solid var(--cyan); }
+.live .canvas-edge-e { right:-6px; }.live .canvas-edge-w { left:-4px; }
+.live .canvas-edge-ne, .live .canvas-edge-se, .live .canvas-edge-sw, .live .canvas-edge-nw { width:16px; height:16px; border:2px solid var(--cyan); background:var(--panel); }
+.live .canvas-edge-ne { top:-5px; right:-5px; cursor:nesw-resize; }.live .canvas-edge-se { bottom:-5px; right:-5px; cursor:nwse-resize; }
+.live .canvas-edge-sw { bottom:-5px; left:-5px; cursor:nesw-resize; }.live .canvas-edge-nw { top:-5px; left:-5px; cursor:nwse-resize; }
+.canvas-handle-instructions { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+.canvas-frame.is-editing .band-maps-head > div:first-child { display:none; }
+.canvas-frame.is-editing .band-maps-head { padding:4px 8px; }
+.canvas-frame.is-editing .band-maps-head-controls { gap:4px; justify-content:flex-start; }
+.canvas-toolbar :focus-visible, .canvas-frame-tools :focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+.canvas-panel-picker { display:flex; flex-wrap:wrap; gap:8px 16px; border:1px solid var(--border); padding:8px 10px; margin:0; }
+.canvas-panel-picker legend { font-size:11px; color:var(--secondary); }
+.canvas-panel-picker label { display:flex; align-items:center; gap:5px; font-size:12px; }
+.canvas-recovery { display:flex; flex-wrap:wrap; gap:8px; align-items:center; color:#ffb4aa; background:#382029; border:1px solid #98514b; padding:8px; border-radius:6px; }
+.canvas-recovery > span { flex:1 1 260px; }
+.canvas-work-area.is-compact .canvas-frame { position:relative; flex:1; min-height:0; width:100%; height:100%; }
+.canvas-required-panel { flex:none; max-width:500px; }
+.canvas-empty { color:var(--secondary); margin:16px; }
+@container operator-desk (max-width: 460px) {
+  .canvas-panel-content .desk-matrices { grid-template-columns:1fr; }
+  .canvas-panel-content .desk-matrices > div + div { border-left:0; padding-left:0; }
+}
+@container operator-desk (max-width: 340px) {
+  .canvas-panel-content .desk-rotor-actions { gap:4px; }
+  .canvas-panel-content .desk-rotor-actions button { padding:2px 4px; }
+}

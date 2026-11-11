@@ -1,0 +1,513 @@
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if os(macOS)
+import XLogCore
+#else
+import XLogPortableCore
+#endif
+
+/// Integrated workspace reference cache. A native timer owns automatic checks;
+/// constructing this actor or reading status never starts network activity.
+actor LiveReferenceMethods {
+    static let shared = LiveReferenceMethods()
+
+    private let logbook: LiveLogbookMethods
+    private let session: URLSession
+    private(set) var refreshTask: Task<Void, Never>?
+    private var automaticTask: Task<Void, Never>?
+    private var nextAutomaticCheck: Date?
+    private var planning = false
+    private var automaticChecking = false
+    private var stopped = false
+    private var workspaceTransitions = 0
+    private var workspaceRevision = 0
+    private let scheduleOperation: (@Sendable () async throws -> Void)?
+    typealias CredentialLoader = @Sendable (String, WorkspaceCredentialStore.Account, Bool) throws -> String?
+    private let credentialLoader: CredentialLoader
+    private var validatedCache: (files: [String: FileIdentity], unavailable: Set<String>)?
+    private var lastResult = "Not refreshed in this session"
+    private struct FileIdentity: Equatable {
+        let size: Int64
+        let modified: TimeInterval
+        let fileNumber: UInt64
+    }
+    private var cachedDirectory: (path: String, files: [ActivationReferenceKind: FileIdentity], value: ActivationReferenceDirectory)?
+    #if os(macOS)
+    private let logReviewReferences = LogReviewReferences()
+    #endif
+
+    static var availableSources: [String] {
+        #if os(macOS)
+        ["clublog_lotw", "activations", "wavelog_catalog"]
+        #else
+        ["wavelog_catalog"]
+        #endif
+    }
+
+    private static var allowedScheduledSources: Set<String>? {
+        #if os(macOS)
+        nil
+        #else
+        ["wavelog-catalog.json"]
+        #endif
+    }
+
+    init(logbook: LiveLogbookMethods = .shared, session: URLSession = .shared,
+         scheduleOperation: (@Sendable () async throws -> Void)? = nil,
+         credentialLoader: CredentialLoader? = nil) {
+        self.logbook = logbook
+        self.session = session
+        self.scheduleOperation = scheduleOperation
+        self.credentialLoader = credentialLoader ?? { service, account, allowInteraction in
+            try WorkspaceCredentialStore(service: service).load(account, allowInteraction: allowInteraction)
+        }
+    }
+
+    func startAutomaticChecks() {
+        guard automaticTask == nil, !stopped else { return }
+        automaticTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if let owner = self { await owner.automaticTick() } else { return }
+                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+            }
+        }
+    }
+
+    func automaticTick(now: Date = Date()) async {
+        guard !stopped, workspaceTransitions == 0, !planning, !automaticChecking, refreshTask == nil,
+              (try? logbook.automaticReferenceChecks()) == true else { return }
+        guard nextAutomaticCheck == nil || now >= nextAutomaticCheck! else { return }
+        automaticChecking = true
+        defer { automaticChecking = false }
+        let revision = workspaceRevision
+        // The per-source deadlines decide whether HTTP is needed. A short
+        // native heartbeat avoids a second-hour delay after a slow download
+        // and catches up after sleep without relying on a visible webview.
+        nextAutomaticCheck = now.addingTimeInterval(60)
+        do {
+            if let scheduleOperation { try await scheduleOperation() }
+            else {
+                let result = try await handle(method: "reference_schedule", params: [:])
+                if revision == workspaceRevision, !stopped, workspaceTransitions == 0,
+                   result["running"] as? Bool == false,
+                   let deadline = result["next_check_at"] as? String,
+                   let date = ISO8601DateFormatter().date(from: deadline) {
+                    nextAutomaticCheck = date
+                }
+            }
+        } catch {
+            guard revision == workspaceRevision, !stopped, workspaceTransitions == 0 else { return }
+            nextAutomaticCheck = now.addingTimeInterval(ReferenceCheckPlan.failureBackoff)
+            lastResult = "Scheduled check could not start; it will retry automatically."
+        }
+    }
+
+    func resetAutomaticDeadline() {
+        workspaceRevision += 1
+        nextAutomaticCheck = nil
+    }
+
+    func suspendForWorkspaceChange() async {
+        workspaceTransitions += 1
+        workspaceRevision += 1
+        refreshTask?.cancel()
+        await refreshTask?.value
+        validatedCache = nil
+        cachedDirectory = nil
+    }
+
+    func finishWorkspaceChange() {
+        workspaceTransitions = max(0, workspaceTransitions - 1)
+        nextAutomaticCheck = nil
+    }
+
+    func terminate() async {
+        stopped = true
+        workspaceRevision += 1
+        automaticTask?.cancel(); automaticTask = nil
+        refreshTask?.cancel()
+        await refreshTask?.value
+    }
+
+    func handle(method: String, params: [String: Any]) async throws -> [String: Any] {
+        guard !stopped, workspaceTransitions == 0 else {
+            throw WorkerFailure("reference_unavailable", "Reference services are stopping or changing workspace.")
+        }
+        #if !os(macOS)
+        guard ["reference_status", "reference_configure", "reference_refresh", "reference_schedule", "reference_country_status",
+               "reference_country_import", "reference_country_download", "reference_country_rollback"].contains(method) else {
+            throw WorkerFailure("platform_pending", "This reference service is not available on this platform.")
+        }
+        #endif
+        let directory = try logbook.referenceDirectoryURL()
+        switch method {
+        case "reference_country_status":
+            guard params.isEmpty else { throw invalid() }
+            return try await countryStatus(directory: directory)
+        case "reference_country_import", "reference_country_download", "reference_country_rollback":
+            guard refreshTask == nil, !planning else { throw WorkerFailure("reference_busy", "A reference update is already running.") }
+            let updater = try ReferenceDataUpdater(directory: directory, session: session)
+            let lease = try ReferenceRefreshLease(directory: directory)
+            let previousRevision = try logbook.currentCTYResolver().snapshotIdentity
+            planning = true
+            defer { planning = false; lease.release() }
+            switch method {
+            case "reference_country_import":
+                guard Set(params.keys) == ["path"], let path = params["path"] as? String,
+                      LocalFilePath.isAbsoluteWithoutTraversal(path), path.utf8.count <= 4096 else { throw invalid() }
+                let url = URL(fileURLWithPath: path)
+                let attributes = try FileManager.default.attributesOfItem(atPath: path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular,
+                      ((attributes[.size] as? NSNumber)?.intValue ?? Int.max) <= 32_000_000 else { throw invalid() }
+                _ = try await updater.importCountryPack(Data(contentsOf: url))
+            case "reference_country_download":
+                guard Set(params.keys) == ["url"], let raw = params["url"] as? String, raw.utf8.count <= 2048,
+                      let url = URL(string: raw) else { throw invalid() }
+                _ = try await updater.refreshCountryPack(url)
+            default:
+                guard params.isEmpty else { throw invalid() }
+                _ = try await updater.rollbackCountryPack()
+            }
+            var result = try await countryStatus(directory: directory)
+            result["country_reference_changed"] = result["reference_revision"] as? String != previousRevision
+            lastResult = "Country snapshot activated; stored contacts unchanged"
+            return result
+        #if os(macOS)
+        case "reference_log_review":
+            return try logReviewReferences.review(params: params, directory: directory)
+        #endif
+        case "reference_configure":
+            guard Set(params.keys).isSubset(of: ["enabled", "only_if_unset"]),
+                  let enabled = params["enabled"] as? NSNumber, Self.isJSONBoolean(enabled),
+                  params["only_if_unset"] == nil || (params["only_if_unset"] as? NSNumber).map({ Self.isJSONBoolean($0) }) == true else { throw invalid() }
+            let saved = try logbook.configureReferenceChecks(enabled: enabled.boolValue,
+                onlyIfUnset: params["only_if_unset"] as? Bool ?? false)
+            resetAutomaticDeadline()
+            // The worker-owned loop will observe this choice; no network is
+            // awaited by the immediate preference-save acknowledgement.
+            return ["automatic_check": saved]
+        case "reference_status":
+            guard params.isEmpty else { throw invalid() }
+            _ = try logbook.openedDatabase()
+            let updater = try ReferenceDataUpdater(directory: directory, session: session)
+            let state = await updater.currentState()
+            return try status(state, directory: directory)
+        case "reference_resolve":
+            guard Set(params.keys) == ["comment", "special_tags"],
+                  let comment = params["comment"] as? String, comment.count <= 8_192,
+                  let tags = params["special_tags"] as? [String], tags.count <= 32,
+                  tags.allSatisfy({ $0.count <= 128 }) else { throw invalid() }
+            return try resolve(comment: comment, tags: tags, directory: directory)
+        case "reference_refresh":
+            guard Set(params.keys) == ["source"], let source = params["source"] as? String,
+                  ["clublog_lotw", "activations", "wavelog_catalog"].contains(source) else { throw invalid() }
+            guard Self.availableSources.contains(source) else {
+                throw WorkerFailure("platform_pending", "This reference source is not available on this platform.")
+            }
+            _ = try logbook.openedDatabase()
+            guard refreshTask == nil, !planning else { throw WorkerFailure("reference_busy", "A reference update is already running.") }
+            let settings = try logbook.currentSettings()
+            guard source != "wavelog_catalog" || settings.logbookMode == .wavelog else {
+                throw WorkerFailure("reference_configuration_required", "Choose Wavelog mode before refreshing its catalog.")
+            }
+            let updater = try ReferenceDataUpdater(directory: directory, session: session)
+            let service = try logbook.currentKeychainService()
+            let clubKey = source == "clublog_lotw" ? (try credentialLoader(service, .clubLogAPIKey, true) ?? "") : ""
+            let token = source == "wavelog_catalog" ? (try credentialLoader(service, .wavelogToken, true) ?? "") : ""
+            guard source != "wavelog_catalog" || !token.isEmpty else {
+                throw WorkerFailure("reference_configuration_required", "Save an integrated Wavelog token before refreshing its catalog.")
+            }
+            guard let clubURL = URL(string: settings.clubLogCTYURL),
+                  let lotwURL = URL(string: settings.lotwActivityURL),
+                  let wavelogURL = URL(string: settings.wavelogURL) else { throw invalid() }
+            let lease = try ReferenceRefreshLease(directory: directory)
+            lastResult = "Updating \(source)"
+            refreshTask = Task {
+                defer { lease.release() }
+                do {
+                    switch source {
+                    case "clublog_lotw":
+                        _ = try await updater.refresh(clubLogURL: clubURL, clubLogAPIKey: clubKey, lotwURL: lotwURL)
+                    case "activations":
+                        _ = try await updater.refreshActivationDirectories()
+                    default:
+                        _ = try await updater.refreshWavelogCatalog(baseURL: wavelogURL, token: token)
+                    }
+                    self.finish("Updated \(source)")
+                } catch {
+                    self.finish("Update failed; refresh the cache status before retrying. Earlier sources may have updated.")
+                }
+            }
+            return ["running": true, "status": lastResult, "source": source]
+        case "reference_schedule":
+            guard params.isEmpty else { throw invalid() }
+            guard try logbook.automaticReferenceChecks() == true else {
+                return ["running": refreshTask != nil, "scheduled": [String](), "automatic_check": false]
+            }
+            guard refreshTask == nil, !planning else {
+                return ["running": true, "scheduled": [String](), "automatic_check": true]
+            }
+            planning = true
+            let revision = workspaceRevision
+            defer { planning = false }
+            let lease = try ReferenceRefreshLease(directory: directory)
+            var leaseTransferred = false
+            defer { if !leaseTransferred { lease.release() } }
+            _ = try logbook.openedDatabase()
+            let settings = try logbook.currentSettings()
+            let service = try logbook.currentKeychainService()
+            let otherSourcesAvailable = Self.availableSources.contains("clublog_lotw")
+            // Scheduled checks must never open an authorization dialog or unlock
+            // a keyring. Only an explicit refresh above may request interaction.
+            let clubKey = otherSourcesAvailable ? (try credentialLoader(service, .clubLogAPIKey, false) ?? "") : ""
+            let token = settings.logbookMode == .wavelog ? (try credentialLoader(service, .wavelogToken, false) ?? "") : ""
+            let updater = try ReferenceDataUpdater(directory: directory, session: session)
+            let clubURL = URL(string: settings.clubLogCTYURL)
+            let lotwURL = URL(string: settings.lotwActivityURL)
+            let wavelogURL = URL(string: settings.wavelogURL)
+            var expectedIdentities: [String: String] = [:]
+            if let clubURL, !clubKey.isEmpty,
+               let requestURL = ReferenceDataUpdater.clubLogRequestURL(clubURL, apiKey: clubKey) {
+                expectedIdentities["cty.xml"] = ReferenceDataUpdater.sourceIdentity(for: requestURL)
+            }
+            if otherSourcesAvailable, let lotwURL {
+                expectedIdentities["lotw-user-activity.csv"] = ReferenceDataUpdater.sourceIdentity(for: lotwURL)
+            }
+            for kind in [ActivationReferenceKind.pota, .sota, .iota, .wwff] where Self.availableSources.contains("activations") {
+                if let url = ReferenceDataUpdater.activationSourceURLs[kind] {
+                    expectedIdentities[kind.fileName] = ReferenceDataUpdater.sourceIdentity(for: url)
+                }
+            }
+            if settings.logbookMode == .wavelog, let wavelogURL, !token.isEmpty,
+               let requestURL = ReferenceDataUpdater.wavelogCatalogURL(wavelogURL) {
+                expectedIdentities["wavelog-catalog.json"] = ReferenceDataUpdater.sourceIdentity(
+                    for: requestURL, credential: token)
+            }
+            let unavailable = try await unavailableCaches(updater: updater, directory: directory)
+            let plan = ReferenceCheckPlan.make(
+                state: await updater.currentState(), now: Date(),
+                clubLogConfigured: expectedIdentities["cty.xml"] != nil,
+                wavelogConfigured: expectedIdentities["wavelog-catalog.json"] != nil,
+                expectedIdentities: expectedIdentities, unavailableSources: unavailable,
+                allowedSources: Self.allowedScheduledSources
+            )
+            let due = plan.due
+            let next = plan.nextCheckAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull() as Any
+            guard !stopped, workspaceTransitions == 0, revision == workspaceRevision,
+                  try logbook.automaticReferenceChecks() == true,
+                  refreshTask == nil, !due.isEmpty else {
+                return ["running": refreshTask != nil, "scheduled": [String](),
+                        "due": due, "next_check_at": next]
+            }
+            lastResult = "Checking scheduled reference sources"
+            leaseTransferred = true
+            refreshTask = Task {
+                defer { lease.release() }
+                var failed = false
+                let hasCTY = due.contains("cty.xml")
+                let hasLoTW = due.contains("lotw-user-activity.csv")
+                if hasCTY, let clubURL, self.mayContinueScheduledChecks(revision: revision) {
+                    do { _ = try await updater.refreshClubLog(clubURL, apiKey: clubKey) }
+                    catch { failed = true }
+                } else if hasCTY { failed = true }
+                if hasLoTW, let lotwURL, self.mayContinueScheduledChecks(revision: revision) {
+                    do { _ = try await updater.refreshLoTW(lotwURL) }
+                    catch { failed = true }
+                } else if hasLoTW { failed = true }
+                for kind in [ActivationReferenceKind.pota, .sota, .iota, .wwff] where due.contains(kind.fileName) {
+                    guard self.mayContinueScheduledChecks(revision: revision) else { break }
+                    do { _ = try await updater.refreshActivationDirectory(kind) }
+                    catch { failed = true }
+                }
+                if due.contains("wavelog-catalog.json"), let wavelogURL, self.mayContinueScheduledChecks(revision: revision) {
+                    do { _ = try await updater.refreshWavelogCatalog(baseURL: wavelogURL, token: token) }
+                    catch { failed = true }
+                } else if due.contains("wavelog-catalog.json") { failed = true }
+                self.finish(!self.mayContinueScheduledChecks(revision: revision)
+                    ? "Scheduled checks stopped; remaining sources were not checked."
+                    : failed ? "Some scheduled checks failed; validated cache was retained."
+                             : "Scheduled reference checks completed")
+            }
+            return ["running": true, "scheduled": due, "due": due, "next_check_at": next]
+        default:
+            throw WorkerFailure("method_not_allowed", "Unknown reference-data operation.")
+        }
+    }
+
+    private func mayContinueScheduledChecks(revision: Int) -> Bool {
+        !stopped && workspaceTransitions == 0 && workspaceRevision == revision && !Task.isCancelled
+            && (try? logbook.automaticReferenceChecks()) == true
+    }
+
+    private func unavailableCaches(updater: ReferenceDataUpdater, directory: URL) async throws -> Set<String> {
+        #if !os(macOS)
+        // The only portable source is a small JSON catalogue. Do not parse or
+        // schedule unsupported CTY/activity/activation downloads as a side effect.
+        return await updater.unavailableCachedSources(sources: Self.allowedScheduledSources)
+        #else
+        var files: [String: FileIdentity] = [:]
+        for name in ["cty.xml", "lotw-user-activity.csv", "wavelog-catalog.json"]
+            + [ActivationReferenceKind.pota, .sota, .iota, .wwff].map(\.fileName) {
+            let path = directory.appendingPathComponent(name).path
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+               attributes[.type] as? FileAttributeType == .typeRegular {
+                files[name] = FileIdentity(size: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
+                    modified: (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0,
+                    fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
+            }
+        }
+        if let cached = validatedCache, cached.files == files { return cached.unavailable }
+        let unavailable = await updater.unavailableCachedSources()
+        validatedCache = (files, unavailable)
+        return unavailable
+        #endif
+    }
+
+    private func status(_ state: ReferenceDataState, directory: URL) throws -> [String: Any] {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let stateJSON = try JSONSerialization.jsonObject(with: encoder.encode(state))
+        #if os(macOS)
+        let downloaded = directory.appendingPathComponent("cty.xml")
+        let usingDownloadedCTY = FileManager.default.fileExists(atPath: downloaded.path)
+            && (try? CTYResolver(xmlURL: downloaded)) != nil
+        #else
+        let usingDownloadedCTY = false
+        #endif
+        return ["running": refreshTask != nil, "status": lastResult,
+                "available_sources": Self.availableSources,
+                "automatic_check": try logbook.automaticReferenceChecks() as Any? ?? NSNull(),
+                "cty_source": usingDownloadedCTY ? "workspace_download" : "bundled",
+                "state": stateJSON]
+    }
+
+    private func countryStatus(directory: URL) async throws -> [String: Any] {
+        let resolver = try logbook.currentCTYResolver()
+        let pack = resolver.countryPack
+        let updater = try ReferenceDataUpdater(directory: directory, session: session)
+        let state = await updater.currentState()
+        let version = pack?.sourceVersion ?? (pack == nil ? state.sourceMetadata["cty.xml"]?.sourceVersion : nil)
+        return ["reference_revision": resolver.snapshotIdentity, "content_digest": resolver.contentDigest,
+            "primary_reference_revision": resolver.primaryReferenceRevision,
+            "fallback_reference_revision": resolver.fallbackReferenceRevision as Any? ?? NSNull(),
+            "policy": CTYResolver.factsPolicy, "provider": pack?.provider ?? "Club Log XML + bundled country fallback",
+            "source_version": version as Any? ?? NSNull(), "source_revision": pack?.sourceRevision as Any? ?? NSNull(),
+            "source_url": pack?.sourceURL as Any? ?? NSNull(), "record_count": pack?.records.count as Any? ?? NSNull(),
+            "excluded_count": pack?.excluded.count as Any? ?? NSNull(), "coverage": pack?.coverage ?? ["configured Club Log XML", "bundled neutral fallback for unknown prefixes"],
+            "rollback_available": FileManager.default.fileExists(atPath: directory.appendingPathComponent("country-reference-pack.previous.json").path)
+                || FileManager.default.fileExists(atPath: directory.appendingPathComponent("country-reference-pack.previous.xml").path),
+            "read_only": true, "contacts_changed": false]
+    }
+
+    private func finish(_ result: String) {
+        lastResult = result
+        refreshTask = nil
+    }
+
+    private func resolve(comment: String, tags: [String], directory: URL) throws -> [String: Any] {
+        let parsed = AwardReferenceParser.extract(comment: comment, specialTags: tags)
+        let text = ([comment] + tags).joined(separator: " ").uppercased()
+        let castleRaw = [parsed.sigInfo].filter { !$0.isEmpty }
+            + matches(#"\b(?:WCA|COTA|CASTLE)[-:\s]+[A-Z0-9][A-Z0-9/-]{1,24}\b"#, in: text)
+        let castle = castleRaw.first.flatMap(castleReference)
+        let potaMatches = AwardReferenceParser.potaReferences(comment: comment, specialTags: tags)
+        let potaPrimary = potaMatches.first ?? ""
+        let directoryData = try activationDirectory(at: directory)
+        let fields: [String: String] = [
+            "potaReference": potaPrimary, "sotaReference": parsed.sota,
+            "iota": parsed.iota, "wwffReference": parsed.wwff,
+            "sig": castle?.programme ?? parsed.sig, "sigInfo": castle?.reference ?? parsed.sigInfo,
+        ]
+        var candidates: [(ActivationReferenceKind, String, String?)] = []
+        var seen = Set<String>()
+        func add(_ kind: ActivationReferenceKind, _ reference: String, _ original: String? = nil) {
+            guard !reference.isEmpty, seen.insert("\(kind.rawValue):\(reference)").inserted else { return }
+            candidates.append((kind, reference, original))
+        }
+        let patterns: [(ActivationReferenceKind, String, String)] = [
+            (.pota, potaPrimary, #"\b[A-Z0-9]{1,3}-\d{4,5}\b"#),
+            (.sota, parsed.sota, #"\b[A-Z0-9]{1,3}/[A-Z0-9]{1,3}-\d{3,4}\b"#),
+            (.iota, parsed.iota, #"\b(?:AF|AN|AS|EU|NA|OC|SA)-\d{3}\b"#),
+            (.wwff, parsed.wwff, #"\b[A-Z0-9]{1,4}FF-\d{3,5}\b"#),
+        ]
+        for (kind, primary, pattern) in patterns {
+            add(kind, primary)
+            if kind == .pota {
+                for value in potaMatches { add(kind, value) }
+            } else {
+                for value in matches(pattern, in: text) { add(kind, value) }
+            }
+        }
+        for raw in castleRaw {
+            if let value = castleReference(raw) { add(.castle, value.reference, raw) }
+        }
+        let references: [[String: String]] = candidates.compactMap { kind, reference, original in
+            let match = directoryData.exactMatch(reference, kind: kind)
+                ?? original.flatMap { directoryData.exactMatch($0, kind: kind) }
+            let status = !directoryData.hasData(for: kind) ? "not_installed" : match == nil ? "not_found" : "verified"
+            return ["kind": kind.rawValue, "reference": reference, "status": status,
+                    "name": match?.name ?? "", "detail": match?.detail ?? ""]
+        }
+        return ["fields": fields, "references": references]
+    }
+
+    private func castleReference(_ raw: String) -> (programme: String, reference: String)? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !value.isEmpty else { return nil }
+        for programme in ["WCA", "COTA", "CASTLE"] {
+            for separator in [" ", "-", ":", "/"] where value.hasPrefix(programme + separator) {
+                let stripped = String(value.dropFirst(programme.count + separator.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !stripped.isEmpty { return (programme, stripped) }
+            }
+        }
+        // An unfamiliar castle reference is never silently rewritten.
+        return ("CASTLE", value)
+    }
+
+    private func matches(_ pattern: String, in text: String) -> [String] {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+            Range(match.range, in: text).map { String(text[$0]) }
+        }
+    }
+
+    private func activationDirectory(at directory: URL) throws -> ActivationReferenceDirectory {
+        let manager = FileManager.default
+        var files: [ActivationReferenceKind: FileIdentity] = [:]
+        for kind in ActivationReferenceKind.allCases {
+            let file = directory.appendingPathComponent(kind.fileName)
+            guard manager.fileExists(atPath: file.path) else { continue }
+            let attributes = try manager.attributesOfItem(atPath: file.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw WorkerFailure("reference_data_invalid", "An installed reference directory is not a regular file.")
+            }
+            files[kind] = FileIdentity(
+                size: (attributes[.size] as? NSNumber)?.int64Value ?? -1,
+                modified: (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1,
+                fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+            )
+        }
+        if let cachedDirectory, cachedDirectory.path == directory.path, cachedDirectory.files == files {
+            return cachedDirectory.value
+        }
+        let loaded: ActivationReferenceDirectory
+        do { loaded = try ActivationReferenceDirectory(directory: directory) }
+        catch { throw WorkerFailure("reference_data_invalid", "An installed reference directory could not be parsed.") }
+        cachedDirectory = (directory.path, files, loaded)
+        return loaded
+    }
+
+    private static func isJSONBoolean(_ number: NSNumber) -> Bool {
+        // Match the existing portable service boundary: Windows Foundation has
+        // no CoreFoundation type IDs, but JSON retains Bool versus numeric 0/1.
+        guard let encoded = try? JSONSerialization.data(withJSONObject: [number]) else { return false }
+        return encoded == Data("[true]".utf8) || encoded == Data("[false]".utf8)
+    }
+
+    private func invalid() -> WorkerFailure {
+        WorkerFailure("invalid_params", "Invalid reference-data request.")
+    }
+}

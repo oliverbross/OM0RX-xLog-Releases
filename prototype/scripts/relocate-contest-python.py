@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Build-time CPython dependency closure, relocation and strict acceptance."""
+import argparse
+from collections import deque
+from datetime import datetime, UTC
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import ssl
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+MACHO = {bytes.fromhex(value) for value in ("feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca")}
+NON_RUNTIME_MACHO_SUFFIXES = {".a", ".o"}
+TEST_BOOTSTRAP_SCRIPT = "accept-contesting-worker-process.mjs"
+PACKAGING_SCRIPTS = {"package-macos.sh", "package-contesting-test-macos.sh"}
+CA_BUNDLE_RELATIVE = Path("Versions/3.12/etc/openssl/cert.pem")
+SYSTEM_CA_BUNDLE = Path("/etc/ssl/cert.pem")
+MIN_CA_BUNDLE_BYTES = 1_024
+MAX_CA_BUNDLE_BYTES = 5 * 1_024 * 1_024
+
+
+def run(*args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, text=True, capture_output=True, **kwargs).stdout
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def packaging_source_names(packaging_script, acceptance=False):
+    if acceptance:
+        require(packaging_script == TEST_BOOTSTRAP_SCRIPT, "Unexpected acceptance staging script")
+        return ("relocate-contest-python.py", TEST_BOOTSTRAP_SCRIPT)
+    require(packaging_script in PACKAGING_SCRIPTS, f"Unexpected packaging script: {packaging_script}")
+    return ("relocate-contest-python.py", "stage-contest-python-macos.sh", packaging_script)
+
+
+def is_macho(path):
+    # Fat static archives use the same universal header as loadable Mach-O
+    # images, but vtool/install_name_tool/codesign cannot treat them as runtime
+    # components. They are build-time material copied with the framework, not
+    # part of the executable dependency closure.
+    if path.is_symlink() or not path.is_file() or path.suffix.lower() in NON_RUNTIME_MACHO_SUFFIXES:
+        return False
+    with path.open("rb") as stream:
+        return stream.read(4) in MACHO
+
+
+def machos(root):
+    return sorted(path for path in root.rglob("*") if is_macho(path))
+
+
+def ca_bundle_details(path, framework=None):
+    try:
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError) as error:
+        raise RuntimeError(f"CA bundle is missing: {path}") from error
+    require(path.is_file() and not path.is_symlink(), f"CA bundle must be a regular file: {path}")
+    if framework is not None:
+        require(resolved.is_relative_to(framework.resolve()), f"CA bundle escapes framework: {path}")
+    size = path.stat().st_size
+    require(MIN_CA_BUNDLE_BYTES <= size <= MAX_CA_BUNDLE_BYTES, f"CA bundle size is invalid: {path}")
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cafile=str(path))
+    except (OSError, ssl.SSLError) as error:
+        raise RuntimeError(f"CA bundle is invalid: {path}") from error
+    certificate_count = context.cert_store_stats().get("x509_ca", 0)
+    require(certificate_count > 0, f"CA bundle has no certificate authorities: {path}")
+    return {"sha256": digest(path), "bytes": size, "certificateCount": certificate_count}
+
+
+def source_ca_bundle(source_runtime, source_python):
+    configured = json.loads(run(source_python, "-I", "-B", "-c",
+        "import json,ssl; print(json.dumps(ssl.get_default_verify_paths()._asdict()))"))
+    candidates = [source_runtime / "etc/openssl/cert.pem"]
+    for key in ("cafile", "openssl_cafile"):
+        value = configured.get(key)
+        if isinstance(value, str) and value:
+            candidates.append(Path(value))
+    candidates.append(SYSTEM_CA_BUNDLE)
+    failures = []
+    for candidate in dict.fromkeys(candidates):
+        try:
+            resolved = candidate.resolve(strict=True)
+            require(resolved.is_file(), f"CA source is not a file: {candidate}")
+            ca_bundle_details(resolved)
+            return resolved
+        except (OSError, RuntimeError) as error:
+            failures.append(str(error))
+    raise RuntimeError("No valid CA bundle is available for the embedded Python runtime: " + "; ".join(failures))
+
+
+def internalize_ca_bundle(framework, source):
+    source = source.resolve(strict=True)
+    source_details = ca_bundle_details(source)
+    destination = framework / CA_BUNDLE_RELATIVE
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    require(destination.parent.resolve().is_relative_to(framework.resolve()), "CA bundle destination escapes framework")
+    if destination.is_symlink() or destination.exists():
+        destination.unlink()
+    shutil.copy2(source, destination, follow_symlinks=True)
+    destination.chmod(0o644)
+    bundled = ca_bundle_details(destination, framework)
+    require(bundled["sha256"] == source_details["sha256"], "Bundled CA digest does not match its source")
+    return {"bundledPath": str(CA_BUNDLE_RELATIVE), "source": str(source),
+            "sourceSHA256": source_details["sha256"], **bundled}
+
+
+def validate_ca_bundle(framework, expected=None):
+    details = ca_bundle_details(framework / CA_BUNDLE_RELATIVE, framework)
+    current = {"bundledPath": str(CA_BUNDLE_RELATIVE), **details}
+    if expected is not None:
+        for key in ("bundledPath", "sha256", "bytes", "certificateCount"):
+            require(expected.get(key) == current[key], f"Bundled CA provenance changed: {key}")
+    return current
+
+
+def dependencies(path):
+    return re.findall(r"^\s+(.+?) \(compatibility version", run("/usr/bin/otool", "-L", path), re.M)
+
+
+def install_ids(path):
+    return [line.strip() for line in run("/usr/bin/otool", "-D", path).splitlines() if line and not line.endswith(":")]
+
+
+def rpaths(path):
+    return re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.+?) \(offset", run("/usr/bin/otool", "-l", path))
+
+
+def version_tuple(value):
+    return tuple(([int(part) for part in value.split(".")] + [0, 0, 0])[:3])
+
+
+def check_minimum(path, target):
+    output = run("/usr/bin/xcrun", "vtool", "-show-build", path)
+    versions = re.findall(r"\bminos\s+([\d.]+)", output)
+    versions += re.findall(r"cmd LC_VERSION_MIN_MACOSX\s+cmdsize \d+\s+version ([\d.]+)", output)
+    require(bool(versions), f"Cannot establish deployment target: {path}")
+    require(all(version_tuple(value) <= version_tuple(target) for value in versions),
+            f"{path.name} requires macOS {versions}; app promises {target}")
+    return versions
+
+
+def system_path(value):
+    return os.path.normpath(value).startswith(("/usr/lib/", "/System/Library/"))
+
+
+def expand(value, loader, executable):
+    if value.startswith("@loader_path/"):
+        return loader.parent / value[len("@loader_path/"):]
+    if value.startswith("@executable_path/"):
+        return executable.parent / value[len("@executable_path/"):]
+    return Path(value) if value.startswith("/") else None
+
+
+def source_dependency(value, source, executable):
+    direct = expand(value, source, executable)
+    if direct is not None and direct.is_file():
+        return direct.resolve()
+    if value.startswith("@rpath/"):
+        for rpath in rpaths(source):
+            base = expand(rpath, source, executable)
+            if base is not None:
+                candidate = base / value[len("@rpath/"):]
+                if candidate.is_file():
+                    return candidate.resolve()
+    raise RuntimeError(f"Unresolved source dependency {value} in {source}")
+
+
+def relocate(framework, source_runtime, target):
+    runtime = framework / "Versions/3.12"
+    source_executable = source_runtime / "bin/python3.12"
+    source_by_target = {path: source_runtime / path.relative_to(runtime) for path in machos(runtime)}
+    queue, processed, external = deque(source_by_target), set(), {}
+    while queue:
+        path = queue.popleft()
+        if path in processed:
+            continue
+        processed.add(path)
+        source = source_by_target[path]
+        check_minimum(source, target)
+        ids = install_ids(path)
+        for dependency in dependencies(path):
+            if dependency in ids or system_path(dependency):
+                continue
+            original = source_dependency(dependency, source, source_executable)
+            if original.is_relative_to(source_runtime):
+                destination = runtime / original.relative_to(source_runtime)
+                require(destination.is_file(), f"Framework dependency absent: {destination}")
+            else:
+                key = str(original)
+                if key not in external:
+                    filename = hashlib.sha256(key.encode()).hexdigest()[:12] + "-" + original.name
+                    destination = runtime / "lib/xlog-dylibs" / filename
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(original, destination)
+                    external[key] = {"source": key, "sourceSHA256": digest(original),
+                                     "bundledPath": str(destination.relative_to(framework))}
+                    source_by_target[destination] = original
+                    queue.append(destination)
+                destination = framework / external[key]["bundledPath"]
+            run("/usr/bin/install_name_tool", "-change", dependency,
+                "@loader_path/" + os.path.relpath(destination, path.parent), path)
+        if ids:
+            run("/usr/bin/install_name_tool", "-id", "@loader_path/" + path.name, path)
+        for rpath in set(rpaths(path)):
+            run("/usr/bin/install_name_tool", "-delete_rpath", rpath, path)
+        run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path)
+    return list(external.values())
+
+
+def validate(framework, target):
+    result, root = [], framework.resolve()
+    for path in machos(framework):
+        versions, ids = check_minimum(path, target), install_ids(path)
+        require(not any(value.startswith("/") for value in ids), f"Absolute install ID: {path}")
+        require(not rpaths(path), f"Unexpected runtime search path: {path}")
+        for dependency in dependencies(path):
+            if dependency in ids or system_path(dependency):
+                continue
+            require(dependency.startswith("@loader_path/"), f"External/ambiguous linkage {dependency}: {path}")
+            resolved = (path.parent / dependency[len("@loader_path/"):]).resolve()
+            require(resolved.is_relative_to(root) and resolved.is_file(), f"Dependency escapes bundle: {dependency}: {path}")
+        result.append({"path": str(path.relative_to(framework)), "sha256": digest(path), "minimumOS": versions,
+                       "architectures": run("/usr/bin/lipo", "-archs", path).strip()})
+    require(bool(result), "No Python Mach-O files were staged")
+    for path in framework.rglob("*"):
+        if path.is_symlink():
+            require(path.resolve().is_relative_to(root) and path.resolve().exists(), f"External/broken framework symlink: {path}")
+    return result
+
+
+def self_test(framework, host_root):
+    with tempfile.TemporaryDirectory(prefix="om0rx-python-relocation-", dir="/private/tmp") as temporary:
+        fixture = Path(temporary) / "Relocated Contest.app/Contents"
+        relocated, host = fixture / "Frameworks/Python.framework", fixture / "Resources/Not1MM/python"
+        shutil.copytree(framework, relocated, symlinks=True)
+        shutil.copytree(host_root, host, symlinks=True)
+        executable = relocated / "Versions/3.12/bin/python3.12"
+        certificate = relocated / CA_BUNDLE_RELATIVE
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8", "DYLD_PRINT_LIBRARIES": "1",
+               "SSL_CERT_FILE": str(certificate)}
+        program = "\n".join([
+            "import sqlite3, ssl, lzma, decimal, hashlib, json, os, sys, pathlib",
+            "db=sqlite3.connect(':memory:')",
+            "db.execute('create table proof(value integer)')",
+            "db.execute('insert into proof values(42)'); db.commit()",
+            "assert db.execute('select value from proof').fetchone()==(42,)",
+            "assert lzma.decompress(lzma.compress(b'xlog'))==b'xlog'",
+            "assert decimal.Decimal('0.1')+decimal.Decimal('0.2')==decimal.Decimal('0.3')",
+            "assert pathlib.Path(sys.base_prefix).resolve()==pathlib.Path(sys.executable).resolve().parents[1]",
+            "certificate=pathlib.Path(os.environ['SSL_CERT_FILE'])",
+            "assert certificate.resolve()==pathlib.Path(sys.base_prefix).resolve()/'etc/openssl/cert.pem'",
+            "assert ssl.get_default_verify_paths().cafile==str(certificate)",
+            "context=ssl.create_default_context()",
+            "assert context.verify_mode==ssl.CERT_REQUIRED and context.check_hostname",
+            "assert context.cert_store_stats()['x509_ca']>0",
+            "print(json.dumps({'python':sys.version.split()[0], 'sqlite':sqlite3.sqlite_version, 'ssl':ssl.OPENSSL_VERSION, 'decimal':decimal.__libmpdec_version__, 'caSHA256':hashlib.sha256(certificate.read_bytes()).hexdigest(), 'caCount':context.cert_store_stats()['x509_ca']}))",
+        ])
+        checked = subprocess.run([str(executable), "-I", "-B", "-c", program], env=env, capture_output=True, text=True, check=True)
+        require(not re.search(r"/(?:opt/(?:local|homebrew)|usr/local)/", checked.stderr), "Relocated Python loaded a package-manager library")
+        request = json.dumps({"id": "package-test", "method": "contest_catalog", "params": {}}) + "\n"
+        child = subprocess.run([str(executable), "-I", "-B", str(host / "contest_host/launcher.py"), "--data-root", str(Path(temporary) / "data")],
+                               input=request, env=env, capture_output=True, text=True, check=True)
+        require(not re.search(r"/(?:opt/(?:local|homebrew)|usr/local)/", child.stderr), "Contest host loaded a package-manager library")
+        reply = json.loads(child.stdout)
+        require(reply.get("ok") is True and reply["result"]["plugins"][0]["engine"] == "not1mm-python", "Relocated catalog failed")
+        return {"relocated": True, "modules": json.loads(checked.stdout), "catalog": "cq_ww_cw", "externalLibrariesLoaded": False}
+
+
+def validated_bundle_target(bundle, acceptance_root=None):
+    """Keep production output bounds; allow only an explicitly isolated test fixture."""
+    bundle = bundle.absolute()
+    if acceptance_root is None:
+        parent = ROOT / "prototype/src-tauri/target/release/bundle/macos"
+        require(bundle.parent == parent and bundle.suffix == ".app" and not bundle.is_symlink(), "Unexpected candidate bundle")
+        require(bundle.resolve().parent == parent.resolve(), "Candidate escapes build output")
+    else:
+        root = acceptance_root.absolute()
+        require(root == root.resolve() and root.is_dir(), "Acceptance root must be an existing canonical directory")
+        disposable_roots = (Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve(), (ROOT / ".build").resolve())
+        require(any(root.is_relative_to(parent) for parent in disposable_roots),
+                "Acceptance root is outside disposable storage")
+        expected = root / "bootstrap/OM0RX-xLog Contesting Worker Bootstrap.app"
+        require(bundle == expected and bundle.resolve() == expected and not bundle.is_symlink(),
+                "Unexpected acceptance bootstrap bundle")
+    with (bundle / "Contents/Info.plist").open("rb") as stream:
+        info = plistlib.load(stream)
+    if acceptance_root is not None:
+        require(info.get("CFBundleIdentifier") == "com.oliverbross.xlog.contesting-test" and
+                info.get("CFBundleExecutable") == "xlog-prototype-worker", "Acceptance bootstrap identity is invalid")
+        require(not (bundle / "Contents/Frameworks/Python.framework").exists() and
+                not (bundle / "Contents/Resources/Not1MM").exists(), "Acceptance runtime destination must be new")
+    target = info.get("LSMinimumSystemVersion")
+    require(isinstance(target, str), "App deployment target is missing")
+    return bundle, target
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--source-framework", type=Path)
+    parser.add_argument("--finalize-provenance", action="store_true")
+    parser.add_argument("--packaging-script", default="package-macos.sh")
+    parser.add_argument("--acceptance-root", type=Path)
+    args = parser.parse_args()
+    require((args.acceptance_root is not None) == (args.packaging_script == TEST_BOOTSTRAP_SCRIPT),
+            "Acceptance staging requires its explicit root and script identity")
+    require(args.acceptance_root is None or not args.finalize_provenance,
+            "Acceptance staging cannot finalize a production signature")
+    packaging_sources = packaging_source_names(args.packaging_script, acceptance=args.acceptance_root is not None)
+    bundle, target = validated_bundle_target(args.bundle, args.acceptance_root)
+    framework = bundle / "Contents/Frameworks/Python.framework"
+    host_root = bundle / "Contents/Resources/Not1MM/python"
+    manifest = bundle / "Contents/Resources/Not1MM/python-runtime.json"
+    if args.finalize_provenance:
+        data = json.loads(manifest.read_text())
+        require(set(data.get("packagingSources", {})) == set(packaging_sources),
+                "Packaging provenance does not match the finalizing script")
+        require(isinstance(data.get("caBundle"), dict), "Bundled CA provenance is missing")
+        data["packagedMachO"] = validate(framework, target)
+        validate_ca_bundle(framework, data.get("caBundle"))
+        data["hashPhase"] = "final-component-signatures-before-outer-app-signature"
+    else:
+        require(args.source_framework is not None, "Source framework required")
+        source_runtime = (args.source_framework / "Versions/3.12").resolve()
+        source_python = source_runtime / "bin/python3.12"
+        version = run(source_python, "-I", "-c", "import platform; print(platform.python_version())").strip()
+        require(version.startswith("3.12."), f"Expected Python 3.12; found {version}")
+        check_minimum(source_python, target)
+        check_minimum(source_runtime / "Python", target)
+        for destination in (framework, host_root):
+            require(not destination.is_symlink(), "Refusing a linked runtime destination")
+            if destination.exists():
+                shutil.rmtree(destination)
+        runtime = framework / "Versions/3.12"
+        shutil.copytree(source_runtime, runtime, symlinks=True, ignore=shutil.ignore_patterns("site-packages", "__pycache__", "*.pyc"))
+        ca_bundle = internalize_ca_bundle(framework, source_ca_bundle(source_runtime, source_python))
+        (framework / "Versions/Current").symlink_to("3.12")
+        (framework / "Python").symlink_to("Versions/Current/Python")
+        (framework / "Resources").symlink_to("Versions/Current/Resources")
+        # The public application receives only tracked host/vendor runtime files.
+        # Developer tests, fixtures and untracked local files are never eligible.
+        run(source_python, "-I", "-B", ROOT / "prototype/scripts/stage-contest-runtime.py",
+            "--host-only", "--destination", bundle / "Contents/Resources")
+        require(not list(framework.rglob("site-packages")), "site-packages survived runtime staging")
+        closure = relocate(framework, source_runtime, target)
+        data = {"schema": 1, "pythonVersion": version, "sourceFramework": str(source_runtime.parent.parent),
+                "sourceExecutableSHA256": digest(source_python), "sourceFrameworkSHA256": digest(source_runtime / "Python"),
+                "minimumSystemVersion": target, "sourceCommit": run("git", "-C", ROOT, "rev-parse", "HEAD").strip(),
+                "sourceChanges": run("git", "-C", ROOT, "status", "--porcelain").splitlines(),
+                "createdUTC": datetime.now(UTC).isoformat(), "dependencies": closure, "caBundle": ca_bundle,
+                "packagedMachO": validate(framework, target),
+                "acceptance": self_test(framework, host_root), "hashPhase": "staged-ad-hoc-signatures"}
+        data["packagingSources"] = {name: digest(ROOT / "prototype/scripts" / name) for name in packaging_sources}
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"Verified bundled Python {data['pythonVersion']}: {len(data['packagedMachO'])} Mach-O files; minimum macOS {target}; {manifest}")
+
+
+if __name__ == "__main__":
+    main()

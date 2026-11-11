@@ -1,0 +1,1637 @@
+//! Bounded Not1MM-compatible WAV profile loading for contest phone output.
+//! Audio is decoded by the in-process webview; this module admits only canonical
+//! PCM WAV files beneath the operator-selected profile directory.
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
+};
+
+const MAX_PAYLOAD_BYTES: usize = 4_096;
+const MAX_PROFILE_PATH_BYTES: usize = 2_048;
+const MAX_SEGMENTS: usize = 128;
+const MAX_WAV_BYTES: usize = 8 * 1_024 * 1_024;
+const MAX_BATCH_SEGMENTS: usize = 256;
+const MAX_BATCH_WAV_BYTES: usize = 32 * 1_024 * 1_024;
+const MAX_BATCH_BASE64_BYTES: usize = 44 * 1_024 * 1_024;
+const MAX_SEGMENT_DURATION_MS: u64 = 60_000;
+const MAX_TOTAL_DURATION_MS: u64 = 120_000;
+const PTT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
+const PTT_CONFIRM_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileRequest { profile_path: String }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileSlotRequest { profile_path: String, slot: String }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileWriteRequest { profile_path: String, slot: String, wav_base64: String, overwrite: bool }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSlot {
+    slot: String, present: bool, duration_ms: Option<u64>, decoded_bytes: Option<usize>,
+    sha256: Option<String>, error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileManifest { slots: Vec<ProfileSlot> }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePreview {
+    slot: String, wav_base64: String, duration_ms: u64, decoded_bytes: usize, sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrepareRequest {
+    schema_version: u8,
+    #[serde(rename="sessionID",alias="sessionId")]
+    session_id: String,
+    workspace_generation: String,
+    #[serde(rename="draftID",alias="draftId")]
+    draft_id: String,
+    #[serde(rename="actionID",alias="actionId")]
+    action_id: String,
+    payload: String,
+    #[serde(rename="payloadSHA256",alias="payloadSha256")]
+    payload_sha256: String,
+    profile_path: String,
+    #[serde(default)]
+    bound_target: Option<BoundVoiceTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrepareBatchRequest {
+    requests: Vec<PrepareRequest>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedSegment {
+    name: String,
+    wav_base64: String,
+    duration_ms: u64,
+    sha256: String,
+    decoded_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedVoice {
+    #[serde(rename="sessionID")]
+    session_id: String,
+    workspace_generation: String,
+    #[serde(rename="draftID")]
+    draft_id: String,
+    #[serde(rename="actionID")]
+    action_id: String,
+    #[serde(rename="payloadSHA256")]
+    payload_sha256: String,
+    #[serde(rename="manifestSHA256")]
+    manifest_sha256: String,
+    segments: Vec<PreparedSegment>,
+    total_duration_ms: u64,
+    total_decoded_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound_target: Option<BoundVoiceTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BoundVoiceTarget {
+    schema_version: u8,
+    target: crate::ptt_session::Target,
+    output_intent: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceAdmission {
+    #[serde(rename="sessionID",alias="sessionId")]
+    session_id: String,
+    workspace_generation: String,
+    #[serde(rename="draftID",alias="draftId")]
+    draft_id: String,
+    #[serde(rename="actionID",alias="actionId")]
+    action_id: String,
+    #[serde(rename="payloadSHA256",alias="payloadSha256")]
+    payload_sha256: String,
+    #[serde(rename="manifestSHA256",alias="manifestSha256")]
+    manifest_sha256: String,
+    #[serde(default)]
+    bound_target: Option<BoundVoiceTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PTTRequest {
+    action: String,
+    #[serde(default)]
+    admissions: Vec<VoiceAdmission>,
+}
+
+impl PTTRequest {
+    pub fn acquiring(&self) -> bool {
+        self.action == "acquire"
+    }
+
+    pub fn execute(self, app: &tauri::AppHandle) -> Result<Value, String> {
+        match self.action.as_str() {
+            "acquire" => acquire_ptt(app, self.admissions),
+            "release" if self.admissions.is_empty() => release_ptt(app),
+            _ => Err("Invalid contest voice PTT request.".into()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct VoiceRuntime {
+    shutting_down: bool,
+    active_ptt: bool,
+    ptt_owner_id: Option<String>,
+    ptt_release_operation: Option<(String,String)>,
+    pending_acquisitions: usize,
+    scope: Option<(String, String)>,
+    prepared: HashMap<AdmissionKey, VoiceAdmission>,
+    prepared_audio: HashMap<AdmissionKey, Vec<PreparedSegment>>,
+    prepared_generation: u64,
+    consumed: HashSet<AdmissionKey>,
+}
+
+type AdmissionKey = (String, String, String);
+
+fn admission_key(admission: &VoiceAdmission) -> AdmissionKey {
+    (admission.session_id.clone(), admission.workspace_generation.clone(), admission.action_id.clone())
+}
+
+fn request_key(request: &PrepareRequest) -> AdmissionKey {
+    (request.session_id.clone(), request.workspace_generation.clone(), request.action_id.clone())
+}
+
+fn enter_scope(state: &mut VoiceRuntime, session_id: &str, workspace_generation: &str) {
+    let scope = (session_id.to_owned(), workspace_generation.to_owned());
+    if state.scope.as_ref() != Some(&scope) {
+        state.scope = Some(scope);
+        state.prepared.clear();
+        state.prepared_audio.clear();
+        state.consumed.clear();
+    }
+}
+
+fn ensure_action_keys_available(state: &VoiceRuntime, keys: &[AdmissionKey]) -> Result<(), String> {
+    if keys
+        .iter()
+        .any(|key| state.prepared.contains_key(key) || state.consumed.contains(key))
+    {
+        return Err(
+            "The contest voice action is already prepared or consumed; replay denied.".into(),
+        );
+    }
+    Ok(())
+}
+
+pub struct QueuedAcquisition;
+
+impl Drop for QueuedAcquisition {
+    fn drop(&mut self) {
+        if let Ok(mut state) = runtime().lock() {
+            state.pending_acquisitions = state.pending_acquisitions.saturating_sub(1);
+        }
+    }
+}
+
+pub fn queue_acquisition() -> Result<QueuedAcquisition, String> {
+    let mut state = runtime().lock().map_err(|_| "Contest voice runtime unavailable")?;
+    if state.shutting_down {
+        return Err("Contest voice output is shutting down.".into());
+    }
+    state.pending_acquisitions = state.pending_acquisitions.checked_add(1)
+        .ok_or("Contest voice acquisition count overflow")?;
+    Ok(QueuedAcquisition)
+}
+
+static VOICE_RUNTIME: OnceLock<Mutex<VoiceRuntime>> = OnceLock::new();
+static VOICE_LANE: OnceLock<Mutex<()>> = OnceLock::new();
+static WINDOW_CLOSE_BARRIER: AtomicBool = AtomicBool::new(false);
+
+fn runtime() -> &'static Mutex<VoiceRuntime> {
+    VOICE_RUNTIME.get_or_init(|| Mutex::new(VoiceRuntime::default()))
+}
+
+fn lane() -> &'static Mutex<()> {
+    VOICE_LANE.get_or_init(|| Mutex::new(()))
+}
+
+pub fn validate_invoker(
+    label: &str,
+    isolated: bool,
+    exiting: bool,
+    contesting_test: bool,
+) -> Result<(), String> {
+    if contesting_test {
+        return Err(
+            "Contest phone audio and PTT are disabled in the Contesting Test profile.".into(),
+        );
+    }
+    if isolated || exiting || label != "main" {
+        return Err(
+            "Contest phone output is available only from the active production contest owner."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn prepare(
+    request: PrepareRequest,
+    active_session: &str,
+    active_workspace: &str,
+) -> Result<PreparedVoice, String> {
+    prepare_one(request, active_session, active_workspace, &mut BatchBudget::default())
+}
+
+#[derive(Default)]
+struct BatchBudget {
+    segments: usize,
+    decoded_bytes: usize,
+    base64_bytes: usize,
+    duration_ms: u64,
+}
+
+pub fn prepare_batch(
+    request: PrepareBatchRequest,
+    active_session: &str,
+    active_workspace: &str,
+) -> Result<Vec<PreparedVoice>, String> {
+    let generation = native::native_generation();
+    prepare_batch_at_generation(request, active_session, active_workspace, generation)
+}
+
+fn prepare_batch_at_generation(
+    request: PrepareBatchRequest,
+    active_session: &str,
+    active_workspace: &str,
+    generation: u64,
+) -> Result<Vec<PreparedVoice>, String> {
+    if request.requests.is_empty() || request.requests.len() > 12 {
+        return Err("Invalid contest voice action batch.".into());
+    }
+    let mut action_ids = HashSet::new();
+    let mut keys = Vec::with_capacity(request.requests.len());
+    for item in &request.requests {
+        validate_request(item, active_session, active_workspace)?;
+        let key = request_key(item);
+        if !action_ids.insert(key.clone()) {
+            return Err("Duplicate contest voice action identity.".into());
+        }
+        keys.push(key);
+    }
+    {
+        let mut state = runtime().lock().map_err(|_| "Contest voice runtime unavailable")?;
+        if state.shutting_down {
+            return Err("Contest voice output is shutting down.".into());
+        }
+        enter_scope(&mut state, active_session, active_workspace);
+        ensure_action_keys_available(&state, &keys)?;
+    }
+    let mut prepared = Vec::with_capacity(request.requests.len());
+    let mut budget = BatchBudget::default();
+    for item in request.requests {
+        prepared.push(prepare_one(item, active_session, active_workspace, &mut budget)?);
+    }
+    let mut state = runtime()
+        .lock()
+        .map_err(|_| "Contest voice runtime unavailable")?;
+    publish_prepared_batch(&mut state, &prepared, &budget, active_session, active_workspace,
+        generation, native::native_generation())?;
+    Ok(prepared)
+}
+
+fn publish_prepared_batch(
+    state: &mut VoiceRuntime,
+    prepared: &[PreparedVoice],
+    budget: &BatchBudget,
+    active_session: &str,
+    active_workspace: &str,
+    generation: u64,
+    current_generation: u64,
+) -> Result<(), String> {
+    // Stop advances the epoch before taking this same runtime lock. A delayed
+    // file read must not reinstall the preparations Stop just retired.
+    if generation != current_generation {
+        return Err("Voice preparation was retired by Stop; no audio was admitted.".into());
+    }
+    if state.prepared_generation != generation {
+        state.prepared.clear();
+        state.prepared_audio.clear();
+        state.prepared_generation = generation;
+    }
+    if state.shutting_down {
+        return Err("Contest voice output is shutting down.".into());
+    }
+    if state.scope.as_ref() != Some(&(active_session.to_owned(), active_workspace.to_owned())) {
+        return Err("The contest voice context changed while audio was being prepared.".into());
+    }
+    let retained_bytes:usize=state.prepared_audio.values().flatten().map(|s|s.decoded_bytes).sum();
+    if retained_bytes.saturating_add(budget.decoded_bytes)>MAX_BATCH_WAV_BYTES {
+        return Err("The native prepared voice journal exceeds its 32 MiB limit; Stop clears old preparations.".into());
+    }
+    if state.prepared.len().saturating_add(prepared.len()) > 256 {
+        return Err("Contest voice preparation journal is full; Stop clears existing preparations before a new request.".into());
+    }
+    // Validate the complete batch before publishing any row. A concurrent
+    // preparation can have claimed a later key while PCM was decoded.
+    let mut incoming = HashSet::new();
+    for value in prepared {
+        let key = (value.session_id.clone(), value.workspace_generation.clone(), value.action_id.clone());
+        if !incoming.insert(key.clone()) || state.prepared.contains_key(&key) || state.consumed.contains(&key) {
+            return Err("The contest voice action was concurrently prepared or consumed; replay denied.".into());
+        }
+    }
+    for value in prepared {
+        let admission = VoiceAdmission {
+            session_id: value.session_id.clone(),
+            workspace_generation: value.workspace_generation.clone(),
+            draft_id: value.draft_id.clone(),
+            action_id: value.action_id.clone(),
+            payload_sha256: value.payload_sha256.clone(),
+            manifest_sha256: value.manifest_sha256.clone(),
+            bound_target: value.bound_target.clone(),
+        };
+        let key = admission_key(&admission);
+        state.prepared_audio.insert(key.clone(), value.segments.clone());
+        state.prepared.insert(key, admission);
+    }
+    Ok(())
+}
+
+fn validate_bound_target(bound: &BoundVoiceTarget) -> Result<(), String> {
+    if bound.schema_version != 1 || uuid::Uuid::parse_str(&bound.output_intent).is_err() {
+        return Err("Invalid captured contest voice output target.".into());
+    }
+    bound.target.validate()
+}
+
+fn same_bound_identity(
+    original: &crate::ptt_session::Target,
+    current: &crate::ptt_session::Target,
+) -> Result<(), String> {
+    if original.provider != current.provider
+        || original.selection_id != current.selection_id
+        || original.selection_generation != current.selection_generation
+        || original.worker_generation != current.worker_generation
+        || original.connection_generation != current.connection_generation
+        || original.control_revision != current.control_revision
+        || original.radio_id != current.radio_id
+        || original.tci != current.tci
+    {
+        return Err("The captured contest voice radio selection or provider generation changed; no replacement target may be keyed.".into());
+    }
+    Ok(())
+}
+
+fn current_bound_target(app: &tauri::AppHandle, bound: &BoundVoiceTarget) -> Result<crate::ptt_session::Target, String> {
+    validate_bound_target(bound)?;
+    crate::carrier_tune::require_output_intent(&bound.output_intent)?;
+    let current = serde_json::from_value::<crate::ptt_session::Target>(crate::ptt_session::context(app)?["target"].clone())
+        .map_err(|_| "Exact native contest voice PTT target is unavailable")?;
+    same_bound_identity(&bound.target, &current)?;
+    // Refresh only telemetry freshness after proving the immutable target is unchanged.
+    crate::ptt_session::preflight(app, &current, true, &bound.output_intent)?;
+    Ok(current)
+}
+
+pub fn capture_target(app: &tauri::AppHandle) -> Result<BoundVoiceTarget, String> {
+    let target = serde_json::from_value::<crate::ptt_session::Target>(crate::ptt_session::context(app)?["target"].clone())
+        .map_err(|_| "Exact native contest voice PTT target is unavailable")?;
+    let bound = BoundVoiceTarget { schema_version: 1, target, output_intent: crate::carrier_tune::output_intent()? };
+    current_bound_target(app, &bound)?;
+    Ok(bound)
+}
+
+pub fn prepare_batch_bound(
+    app: &tauri::AppHandle,
+    request: PrepareBatchRequest,
+    active_session: &str,
+    active_workspace: &str,
+) -> Result<Vec<PreparedVoice>, String> {
+    let generation = native::native_generation();
+    let profile = native::contest_profile(active_session)?;
+    for item in &request.requests {
+        if canonical_profile(&item.profile_path)? != profile {
+            return Err("Voice audio folder differs from the canonical contest library; no audio or PTT was admitted.".into());
+        }
+    }
+    let bound = request
+        .requests
+        .first()
+        .and_then(|item| item.bound_target.clone());
+    if request
+        .requests
+        .iter()
+        .any(|item| item.bound_target != bound)
+    {
+        return Err("All voice actions must retain the same captured native target.".into());
+    }
+    if let Some(target) = &bound {
+        current_bound_target(app, target)?;
+    }
+    let prepared = prepare_batch_at_generation(request, active_session, active_workspace, generation)?;
+    if let Some(target) = &bound {
+        current_bound_target(app, target)?;
+    }
+    Ok(prepared)
+}
+
+fn prepare_one(
+    request: PrepareRequest,
+    active_session: &str,
+    active_workspace: &str,
+    budget: &mut BatchBudget,
+) -> Result<PreparedVoice, String> {
+    validate_request(&request, active_session, active_workspace)?;
+    let profile = canonical_profile(&request.profile_path)?;
+    let names = wav_names(&request.payload)?;
+    let mut total_duration_ms = 0_u64;
+    let mut total_decoded_bytes = 0_usize;
+    let mut segments = Vec::with_capacity(names.len());
+    for name in names {
+        let path = admitted_wav_path(&profile, &name)?;
+        let decoded_bytes = usize::try_from(path.metadata()
+            .map_err(|_| format!("Voice WAV {name}.wav metadata is unavailable."))?.len())
+            .map_err(|_| format!("Voice WAV {name}.wav size is invalid."))?;
+        if decoded_bytes > MAX_WAV_BYTES {
+            return Err(format!("Voice WAV {name}.wav exceeds the 8 MiB safety limit."));
+        }
+        let encoded_bytes = decoded_bytes.checked_add(2).ok_or("Voice WAV encoding size overflow")?
+            .checked_div(3).and_then(|value| value.checked_mul(4)).ok_or("Voice WAV encoding size overflow")?;
+        let next_segments = budget.segments.checked_add(1).ok_or("Voice WAV segment count overflow")?;
+        let next_decoded = budget.decoded_bytes.checked_add(decoded_bytes).ok_or("Voice WAV byte count overflow")?;
+        let next_base64 = budget.base64_bytes.checked_add(encoded_bytes).ok_or("Voice WAV encoding size overflow")?;
+        if next_segments > MAX_BATCH_SEGMENTS || next_decoded > MAX_BATCH_WAV_BYTES || next_base64 > MAX_BATCH_BASE64_BYTES {
+            return Err("The contest voice batch exceeds its aggregate segment or byte safety limit before audio is read.".into());
+        }
+        budget.segments = next_segments; budget.decoded_bytes = next_decoded; budget.base64_bytes = next_base64;
+        let bytes =
+            fs::read(&path).map_err(|_| format!("Voice WAV {name}.wav could not be read."))?;
+        if bytes.len() != decoded_bytes {
+            return Err(format!("Voice WAV {name}.wav changed while it was being prepared."));
+        }
+        let duration_ms = pcm_wav_duration_ms(&bytes)?;
+        if duration_ms > MAX_SEGMENT_DURATION_MS {
+            return Err(format!(
+                "Voice WAV {name}.wav exceeds the 60 second safety limit."
+            ));
+        }
+        total_duration_ms = total_duration_ms
+            .checked_add(duration_ms)
+            .ok_or("Voice WAV duration overflow")?;
+        if total_duration_ms > MAX_TOTAL_DURATION_MS {
+            return Err("The resolved voice message exceeds the two minute safety limit.".into());
+        }
+        budget.duration_ms = budget.duration_ms.checked_add(duration_ms).ok_or("Voice WAV duration overflow")?;
+        if budget.duration_ms > MAX_TOTAL_DURATION_MS {
+            return Err("The contest voice batch exceeds its aggregate duration safety limit.".into());
+        }
+        total_decoded_bytes = total_decoded_bytes
+            .checked_add(decoded_bytes)
+            .ok_or("Voice WAV byte count overflow")?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        segments.push(PreparedSegment {
+            name,
+            wav_base64: STANDARD.encode(bytes),
+            duration_ms,
+            sha256,
+            decoded_bytes,
+        });
+    }
+    let manifest_sha256 = manifest_sha256(&segments);
+    Ok(PreparedVoice {
+        session_id: request.session_id,
+        workspace_generation: request.workspace_generation,
+        draft_id: request.draft_id,
+        action_id: request.action_id,
+        payload_sha256: request.payload_sha256,
+        manifest_sha256,
+        segments,
+        total_duration_ms,
+        total_decoded_bytes,
+        bound_target: request.bound_target,
+    })
+}
+
+fn manifest_sha256(segments: &[PreparedSegment]) -> String {
+    let mut digest = Sha256::new();
+    digest.update((segments.len() as u32).to_le_bytes());
+    for segment in segments {
+        digest.update((segment.name.len() as u32).to_le_bytes());
+        digest.update(segment.name.as_bytes());
+        digest.update((segment.decoded_bytes as u64).to_le_bytes());
+        digest.update(segment.duration_ms.to_le_bytes());
+        digest.update(segment.sha256.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn validate_request(
+    request: &PrepareRequest,
+    active_session: &str,
+    active_workspace: &str,
+) -> Result<(), String> {
+    if let Some(bound) = &request.bound_target { validate_bound_target(bound)?; }
+    if request.schema_version != 1
+        || uuid::Uuid::parse_str(&request.session_id).is_err()
+        || uuid::Uuid::parse_str(&request.workspace_generation).is_err()
+        || uuid::Uuid::parse_str(&request.draft_id).is_err()
+        || request.session_id != active_session
+        || request.workspace_generation != active_workspace
+    {
+        return Err(
+            "The contest voice request belongs to a stale or invalid contest context.".into(),
+        );
+    }
+    let (operation, index) = request
+        .action_id
+        .rsplit_once(':')
+        .ok_or("Invalid contest voice action identity")?;
+    if uuid::Uuid::parse_str(operation).is_err()
+        || index.parse::<usize>().ok().is_none_or(|value| value >= 12)
+    {
+        return Err("Invalid contest voice action identity".into());
+    }
+    if request.payload.as_bytes().len() > MAX_PAYLOAD_BYTES
+        || request.payload_sha256.len() != 64
+        || !request
+            .payload_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Invalid contest voice payload".into());
+    }
+    let actual = format!("{:x}", Sha256::digest(request.payload.as_bytes()));
+    if actual != request.payload_sha256 {
+        return Err("The contest voice payload digest does not match the claimed output.".into());
+    }
+    Ok(())
+}
+
+fn canonical_profile(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.as_bytes().len() > MAX_PROFILE_PATH_BYTES {
+        return Err("Choose a bounded voice WAV profile folder in Contest Sound settings.".into());
+    }
+    let path = fs::canonicalize(value)
+        .map_err(|_| "The voice WAV profile folder is unavailable.".to_string())?;
+    if !path.is_dir() {
+        return Err("The selected voice WAV profile is not a folder.".into());
+    }
+    Ok(path)
+}
+
+fn admitted_wav_path(profile: &Path, name: &str) -> Result<PathBuf, String> {
+    let candidate = profile.join(format!("{name}.wav"));
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|_| format!("Voice WAV {name}.wav is missing from the selected profile."))?;
+    if canonical.parent() != Some(profile) || !canonical.is_file() {
+        return Err(format!(
+            "Voice WAV {name}.wav escapes the selected profile."
+        ));
+    }
+    Ok(canonical)
+}
+
+fn read_bounded_wav(path: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let decoded_bytes = usize::try_from(path.metadata()
+        .map_err(|_| format!("Voice WAV {name}.wav metadata is unavailable."))?.len())
+        .map_err(|_| format!("Voice WAV {name}.wav size is invalid."))?;
+    if decoded_bytes > MAX_WAV_BYTES {
+        return Err(format!("Voice WAV {name}.wav exceeds the 8 MiB safety limit."));
+    }
+    let mut bytes = Vec::with_capacity(decoded_bytes);
+    fs::File::open(path)
+        .map_err(|_| format!("Voice WAV {name}.wav could not be read."))?
+        .take((MAX_WAV_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("Voice WAV {name}.wav could not be read."))?;
+    if bytes.len() != decoded_bytes {
+        return Err(format!("Voice WAV {name}.wav changed while it was being read."));
+    }
+    Ok(bytes)
+}
+
+fn profile_slot(value: &str) -> Result<String, String> {
+    let normalized = value.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "f1" | "f2" | "f3" | "f4" | "f5" | "f6" |
+        "f7" | "f8" | "f9" | "f10" | "f11" | "f12") {
+        Ok(normalized)
+    } else {
+        Err("Voice recording slots are limited to F1 through F12.".into())
+    }
+}
+
+fn profile_slot_value(profile: &Path, slot: &str) -> Result<ProfilePreview, String> {
+    let path = admitted_wav_path(profile, slot)?;
+    let bytes = read_bounded_wav(&path, slot)?;
+    let duration_ms = pcm_wav_duration_ms(&bytes)?;
+    if duration_ms > MAX_SEGMENT_DURATION_MS { return Err(format!("Voice WAV {slot}.wav exceeds the 60 second safety limit.")); }
+    Ok(ProfilePreview { slot: slot.into(), wav_base64: STANDARD.encode(&bytes), duration_ms,
+        decoded_bytes: bytes.len(), sha256: format!("{:x}", Sha256::digest(&bytes)) })
+}
+
+pub fn profile_manifest(request: ProfileRequest) -> Result<ProfileManifest, String> {
+    let profile = canonical_profile(&request.profile_path)?;
+    let slots = (1..=12).map(|index| {
+        let slot = format!("f{index}");
+        if !profile.join(format!("{slot}.wav")).exists() {
+            return ProfileSlot { slot, present: false, duration_ms: None, decoded_bytes: None, sha256: None, error: None };
+        }
+        match profile_slot_value(&profile, &slot) {
+            Ok(value) => ProfileSlot { slot, present: true, duration_ms: Some(value.duration_ms),
+                decoded_bytes: Some(value.decoded_bytes), sha256: Some(value.sha256), error: None },
+            Err(error) => ProfileSlot { slot, present: true, duration_ms: None, decoded_bytes: None, sha256: None, error: Some(error) },
+        }
+    }).collect();
+    Ok(ProfileManifest { slots })
+}
+
+pub fn profile_preview(request: ProfileSlotRequest) -> Result<ProfilePreview, String> {
+    let profile = canonical_profile(&request.profile_path)?;
+    let slot = profile_slot(&request.slot)?;
+    profile_slot_value(&profile, &slot)
+}
+
+pub fn profile_write(request: ProfileWriteRequest) -> Result<ProfilePreview, String> {
+    let profile = canonical_profile(&request.profile_path)?;
+    let slot = profile_slot(&request.slot)?;
+    if request.wav_base64.len() > MAX_BATCH_BASE64_BYTES { return Err("Recorded voice WAV exceeds its encoded safety limit.".into()); }
+    let bytes = STANDARD.decode(request.wav_base64.as_bytes())
+        .map_err(|_| "Recorded voice WAV data is invalid.".to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_WAV_BYTES { return Err("Recorded voice WAV must be between 1 byte and 8 MiB.".into()); }
+    let duration_ms = pcm_wav_duration_ms(&bytes)?;
+    if duration_ms > MAX_SEGMENT_DURATION_MS { return Err("Recorded voice WAV exceeds the 60 second safety limit.".into()); }
+    let path = profile.join(format!("{slot}.wav"));
+    if path.exists() && !request.overwrite {
+        return Err(format!("Voice slot {} already exists; explicitly confirm replacement.", slot.to_ascii_uppercase()));
+    }
+    if path.symlink_metadata().is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("A voice slot cannot replace a symbolic link.".into());
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(&profile)
+        .map_err(|_| "Recorded voice WAV temporary file could not be created.".to_string())?;
+    use std::io::Write as _;
+    temporary.write_all(&bytes).map_err(|_| "Recorded voice WAV could not be written.".to_string())?;
+    let mode = if request.overwrite { crate::durable_file::PublishMode::Replace }
+        else { crate::durable_file::PublishMode::NoClobber };
+    crate::durable_file::publish_temp(temporary, &path, mode)
+        .map_err(|error| if !request.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+            "Voice slot appeared while recording; no file was replaced.".to_string()
+        } else { "Recorded voice WAV publication could not be synchronized.".to_string() })?;
+    profile_slot_value(&profile, &slot)
+}
+
+fn wav_names(payload: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let lowercase = payload.to_lowercase();
+    let mut chars = lowercase.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '[' {
+            let mut name = String::new();
+            loop {
+                match chars.next() {
+                    Some(']') => break,
+                    Some(value) if value.is_ascii_lowercase() || value.is_ascii_digit() || matches!(value, '_' | '-') => {
+                        name.push(value);
+                        if name.len() > 64 { return Err("A bracketed voice WAV name is too long.".into()); }
+                    }
+                    _ => return Err("Bracketed voice WAV names may contain only lowercase letters, digits, dash and underscore.".into()),
+                }
+            }
+            if name.is_empty() {
+                return Err("A bracketed voice WAV name cannot be empty.".into());
+            }
+            names.push(name);
+        } else if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            names.push(character.to_string());
+        } else if character == ' ' {
+            names.push("space".into());
+        } else if character == '/' {
+            names.push("slash".into());
+        } else {
+            return Err(format!(
+                "Unsupported voice message character U+{:04X}; use a bracketed WAV name instead.",
+                character as u32
+            ));
+        }
+        if names.len() > MAX_SEGMENTS {
+            return Err("The resolved voice message has too many WAV segments.".into());
+        }
+    }
+    if names.is_empty() {
+        return Err("The voice message did not resolve to any recorded WAV segments.".into());
+    }
+    Ok(names)
+}
+
+fn validate_prepared_admissions(
+    state: &mut VoiceRuntime,
+    admissions: &[VoiceAdmission],
+) -> Result<(), String> {
+    if state.prepared_generation != native::native_generation() {
+        return Err("Voice preparation was retired by Stop; no audio was admitted.".into());
+    }
+    if admissions.is_empty() || admissions.len() > 12 {
+        return Err("Invalid contest voice admission batch.".into());
+    }
+    let mut seen = HashSet::new();
+    for admission in admissions {
+        let key = admission_key(admission);
+        if !seen.insert(key.clone())
+            || state.consumed.contains(&key)
+            || state.prepared.get(&key) != Some(admission)
+        {
+            return Err(
+                "The contest voice manifest is stale, replayed, or does not match native preparation."
+                    .into(),
+            );
+        }
+    }
+    for admission in admissions {
+        let key = admission_key(admission);
+        state.prepared.remove(&key);
+        state.prepared_audio.remove(&key);
+        state.consumed.insert(key);
+    }
+    Ok(())
+}
+
+fn ptt_receipt_status(app: &tauri::AppHandle, operation_id: &str) -> Result<String, String> {
+    let owner = crate::ptt_session::owner(app)?;
+    owner.reconcile(&crate::station_telemetry::owner(app)?.snapshot()?)?;
+    owner.receipt(operation_id)?["status"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Contest voice PTT receipt is unavailable.".into())
+}
+
+fn wait_for_ptt_confirmation(
+    app: &tauri::AppHandle,
+    operation_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + PTT_CONFIRM_TIMEOUT;
+    loop {
+        match ptt_receipt_status(app, operation_id)?.as_str() {
+            "confirmed" => return Ok(()),
+            "pending" | "unknown" | "acknowledged" | "reviewed" => {}
+            status => {
+                return Err(format!(
+                    "Contest voice PTT {} ended with non-confirming status {status}.",
+                    if enabled { "on" } else { "off" }
+                ))
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Contest voice PTT {} lacks fresh authoritative {} confirmation after {} seconds.",
+                if enabled { "on" } else { "off" },
+                if enabled { "TX" } else { "RX" },
+                PTT_CONFIRM_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(PTT_CONFIRM_POLL);
+    }
+}
+
+fn ptt_release_required(app: &tauri::AppHandle) -> Result<bool, String> {
+    let owner = crate::ptt_session::owner(app)?;
+    owner.reconcile(&crate::station_telemetry::owner(app)?.snapshot()?)?;
+    Ok(!owner.snapshot()?["release_required"].is_null())
+}
+
+fn apply_ptt(
+    app: &tauri::AppHandle,
+    enabled: bool,
+    bound: Option<&BoundVoiceTarget>,
+) -> Result<String, String> {
+    let owner = crate::ptt_session::owner(app)?;
+    owner.reconcile(&crate::station_telemetry::owner(app)?.snapshot()?)?;
+    let snapshot = owner.snapshot()?;
+    if enabled && !snapshot["release_required"].is_null() {
+        return Err("Resolve the retained GUI PTT release before contest phone output.".into());
+    }
+    if !enabled && snapshot["release_required"].is_null() {
+        return Err("No retained contest voice PTT owner is available to release.".into());
+    }
+    if !enabled {
+        crate::carrier_tune::revoke_output_intent()?;
+    }
+    let (target, intent) = if !enabled {
+        (
+            owner
+                .retained_target()?
+                .ok_or("No original voice PTT target is retained")?,
+            crate::carrier_tune::output_intent()?,
+        )
+    } else if bound.is_some() {
+        let bound = bound.unwrap();
+        (
+            current_bound_target(app, bound)?,
+            bound.output_intent.clone(),
+        )
+    } else {
+        (
+            serde_json::from_value::<crate::ptt_session::Target>(
+                crate::ptt_session::context(app)?["target"].clone(),
+            )
+            .map_err(|_| "Exact native contest voice PTT target is unavailable")?,
+            crate::carrier_tune::output_intent()?,
+        )
+    };
+    let operation_id = if enabled {uuid::Uuid::new_v4().to_string()} else {
+        let retained=snapshot["release_required"]["owner_id"].as_str().ok_or("Original voice PTT owner unavailable")?;
+        let mut state=runtime().lock().map_err(|_|"Voice runtime unavailable")?;
+        release_operation(&mut state,retained)
+    };
+    if enabled {
+        let mut state=runtime().lock().map_err(|_| "Voice runtime unavailable")?;
+        state.ptt_owner_id = Some(operation_id.clone());state.ptt_release_operation=None;
+    }
+    owner.apply_admitted(
+        &operation_id,
+        enabled,
+        target.clone(),
+        &intent,
+        |candidate| crate::ptt_session::preflight(app, candidate, enabled, &intent),
+        |request, candidate| crate::ptt_session::execute(app, request, candidate, &intent),
+    )?;
+    Ok(operation_id)
+}
+fn release_operation(state:&mut VoiceRuntime,owner:&str)->String{
+    if let Some((retained,id))=&state.ptt_release_operation {if retained==owner{return id.clone();}}
+    let id=uuid::Uuid::new_v4().to_string();state.ptt_release_operation=Some((owner.to_owned(),id.clone()));id
+}
+
+fn release_locked(app: &tauri::AppHandle) -> Result<(), String> {
+    if !ptt_release_required(app)? {
+        let mut state = runtime()
+            .lock()
+            .map_err(|_| "Contest voice runtime unavailable")?;
+        state.active_ptt = false;
+        state.ptt_owner_id = None;
+        return Ok(());
+    }
+    let expected = runtime()
+        .lock()
+        .map_err(|_| "Voice runtime unavailable")?
+        .ptt_owner_id
+        .clone();
+    let current = crate::ptt_session::owner(app)?.snapshot()?;
+    require_voice_release_owner(expected.as_deref(), &current)?;
+    let operation_id = apply_ptt(app, false, None)?;
+    let result = wait_for_ptt_confirmation(app, &operation_id, false);
+    let still_required = voice_release_required(app).unwrap_or(true);
+    let mut state = runtime()
+        .lock()
+        .map_err(|_| "Contest voice runtime unavailable")?;
+    state.active_ptt = still_required;
+    if !still_required {
+        state.ptt_owner_id = None;
+    }
+    result
+}
+fn require_voice_release_owner(expected: Option<&str>, snapshot: &Value) -> Result<(), String> {
+    if expected.is_none() || snapshot["release_required"]["owner_id"].as_str() != expected {
+        return Err("The retained PTT obligation belongs to another output owner; voice Stop cannot release it.".into());
+    }
+    Ok(())
+}
+fn voice_release_required(app: &tauri::AppHandle) -> Result<bool, String> {
+    let expected = runtime()
+        .lock()
+        .map_err(|_| "Voice runtime unavailable")?
+        .ptt_owner_id
+        .clone();
+    let owner = crate::ptt_session::owner(app)?;
+    owner.reconcile(&crate::station_telemetry::owner(app)?.snapshot()?)?;
+    let snapshot = owner.snapshot()?;
+    Ok(expected
+        .as_ref()
+        .is_some_and(|id| snapshot["release_required"]["owner_id"] == *id))
+}
+
+pub fn acquire_ptt(
+    app: &tauri::AppHandle,
+    admissions: Vec<VoiceAdmission>,
+) -> Result<Value, String> {
+    let bound=admissions.first().and_then(|item|item.bound_target.clone());
+    if admissions.iter().any(|item|item.bound_target!=bound){return Err("Voice PTT admissions changed the captured native target.".into());}
+    let _lane = lane()
+        .lock()
+        .map_err(|_| "Contest voice PTT lane unavailable")?;
+    let context = crate::contest_window_context::active()?;
+    if admissions.iter().any(|item| {
+        item.session_id != context.session_id
+            || item.workspace_generation != context.workspace_generation
+    }) {
+        return Err("The contest voice PTT admission belongs to a stale contest context.".into());
+    }
+    {
+        let mut state = runtime()
+            .lock()
+            .map_err(|_| "Contest voice runtime unavailable")?;
+        if state.shutting_down {
+            return Err("Contest voice output is shutting down.".into());
+        }
+        if state.active_ptt {
+            return Err("Contest voice PTT is already active.".into());
+        }
+        enter_scope(&mut state, &context.session_id, &context.workspace_generation);
+        validate_prepared_admissions(&mut state, &admissions)?;
+    }
+    native::claim_contest(crate::worker::generation(),&context.session_id,&admissions)?;
+    let operation_id = match apply_ptt(app, true, bound.as_ref()) {
+        Ok(id) => id,
+        Err(error) => {
+            let retained = voice_release_required(app).unwrap_or(true);
+            runtime()
+                .lock()
+                .map_err(|_| "Contest voice runtime unavailable")?
+                .active_ptt = retained;
+            if retained {
+                let _ = release_locked(app);
+            }
+            return Err(error);
+        }
+    };
+    runtime()
+        .lock()
+        .map_err(|_| "Contest voice runtime unavailable")?
+        .active_ptt = true;
+    if let Err(error) = wait_for_ptt_confirmation(app, &operation_id, true) {
+        let release = release_locked(app);
+        return Err(match release {
+            Ok(()) => error,
+            Err(release_error) => {
+                format!("{error} PTT release also remains uncertain: {release_error}")
+            }
+        });
+    }
+    Ok(json!({"accepted":true,"confirmed":true,"operationID":operation_id}))
+}
+
+pub fn release_ptt(app: &tauri::AppHandle) -> Result<Value, String> {
+    let _lane = lane()
+        .lock()
+        .map_err(|_| "Contest voice PTT lane unavailable")?;
+    runtime().lock().map_err(|_|"Voice runtime unavailable")?.ptt_release_operation=None;
+    release_locked(app)?;
+    Ok(json!({"accepted":true,"confirmed":true}))
+}
+
+fn shutdown_barrier(
+    operation_lane: &Mutex<()>,
+    state_lock: &Mutex<VoiceRuntime>,
+    release: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let _lane = operation_lane
+        .lock()
+        .map_err(|_| "Contest voice PTT lane unavailable")?;
+    let active = {
+        let mut state = state_lock
+            .lock()
+            .map_err(|_| "Contest voice runtime unavailable")?;
+        state.shutting_down = true;
+        state.prepared.clear();
+        state.prepared_audio.clear();
+        state.active_ptt
+    };
+    if active {
+        release()
+    } else {
+        Ok(())
+    }
+}
+
+pub fn shutdown(app: &tauri::AppHandle) -> Result<(), String> {
+    native::cancel(false);
+    shutdown_barrier(lane(), runtime(), || release_locked(app))
+}
+
+pub fn needs_shutdown_barrier() -> bool {
+    if native::active() { return true; }
+    if WINDOW_CLOSE_BARRIER.load(Ordering::Acquire) {
+        return true;
+    }
+    let active = runtime()
+        .lock()
+        .map(|state| state.active_ptt || state.pending_acquisitions > 0)
+        .unwrap_or(true);
+    active || lane().try_lock().is_err()
+}
+
+pub fn begin_window_close_barrier() -> bool {
+    !WINDOW_CLOSE_BARRIER.swap(true, Ordering::AcqRel)
+}
+
+pub(crate) fn pcm_wav_duration_ms(bytes: &[u8]) -> Result<u64, String> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("Voice profile files must be RIFF/WAVE audio.".into());
+    }
+    let riff_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if riff_size.checked_add(8) != Some(bytes.len()) {
+        return Err("Voice WAV RIFF extent does not match the file size.".into());
+    }
+    let mut offset = 12_usize;
+    let mut format: Option<(u16, u16, u32, u32, u16, u16)> = None;
+    let mut data_bytes: Option<usize> = None;
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let id = &bytes[offset..offset + 4];
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(size).ok_or("Invalid WAV chunk size")?;
+        if end > bytes.len() {
+            return Err("Voice WAV contains a truncated chunk.".into());
+        }
+        if id == b"fmt " {
+            if format.is_some() {
+                return Err("Voice WAV contains duplicate format chunks.".into());
+            }
+            if size < 16 {
+                return Err("Voice WAV has an invalid format chunk.".into());
+            }
+            format = Some((
+                u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap()),
+                u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap()),
+                u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap()),
+                u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap()),
+                u16::from_le_bytes(bytes[start + 12..start + 14].try_into().unwrap()),
+                u16::from_le_bytes(bytes[start + 14..start + 16].try_into().unwrap()),
+            ));
+        } else if id == b"data" {
+            if data_bytes.is_some() {
+                return Err("Voice WAV contains duplicate audio data chunks.".into());
+            }
+            data_bytes = Some(size);
+        }
+        offset = end.checked_add(size & 1).ok_or("Invalid WAV chunk padding")?;
+        if offset > bytes.len() {
+            return Err("Voice WAV contains truncated chunk padding.".into());
+        }
+    }
+    if offset != bytes.len() {
+        return Err("Voice WAV contains an incomplete chunk header.".into());
+    }
+    let (encoding, channels, sample_rate, byte_rate, block_align, bits) =
+        format.ok_or("Voice WAV is missing its format chunk.")?;
+    let data_bytes = data_bytes
+        .filter(|value| *value > 0)
+        .ok_or("Voice WAV has no audio data.")?;
+    let expected_align = u32::from(channels) * u32::from(bits) / 8;
+    let expected_rate = u64::from(sample_rate) * u64::from(expected_align);
+    if encoding != 1
+        || !(1..=2).contains(&channels)
+        || !(8_000..=192_000).contains(&sample_rate)
+        || !matches!(bits, 8 | 16 | 24 | 32)
+        || u32::from(block_align) != expected_align
+        || u64::from(byte_rate) != expected_rate
+    {
+        return Err(
+            "Voice WAV must be frame-aligned mono/stereo PCM at 8–192 kHz with valid byte and block rates.".into(),
+        );
+    }
+    if data_bytes % usize::from(block_align) != 0 {
+        return Err("Voice WAV audio data does not contain complete PCM frames.".into());
+    }
+    Ok(((data_bytes as u64) * 1_000).div_ceil(u64::from(byte_rate)))
+}
+
+#[path = "native_voice.rs"]
+mod native;
+pub use native::{native_generation, native_request, NativeRequest};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const SESSION: &str = "10000000-0000-4000-8000-000000000001";
+    const WORKSPACE: &str = "20000000-0000-4000-8000-000000000002";
+    const DRAFT: &str = "30000000-0000-4000-8000-000000000003";
+    const OPERATION: &str = "40000000-0000-4000-8000-000000000004";
+    fn journal_entry(operation: u128) -> PreparedVoice {
+        PreparedVoice {
+            session_id: SESSION.into(), workspace_generation: WORKSPACE.into(), draft_id: DRAFT.into(),
+            action_id: format!("{}:0", uuid::Uuid::from_u128(operation)), payload_sha256: "0".repeat(64),
+            manifest_sha256: "1".repeat(64), segments: vec![PreparedSegment {
+                name: "f1".into(), wav_base64: "AA==".into(), duration_ms: 1, sha256: "2".repeat(64), decoded_bytes: 1 }],
+            total_duration_ms: 1, total_decoded_bytes: 1, bound_target: None,
+        }
+    }
+    #[test]
+    fn publication_collision_preserves_the_complete_previous_journal() {
+        let mut state = VoiceRuntime::default(); enter_scope(&mut state, SESSION, WORKSPACE);
+        let generation = native::native_generation();
+        let budget = |n| BatchBudget { segments: n, decoded_bytes: n, base64_bytes: n * 4, duration_ms: n as u64 };
+        let existing = journal_entry(2);
+        publish_prepared_batch(&mut state, std::slice::from_ref(&existing), &budget(1), SESSION, WORKSPACE, generation, generation).unwrap();
+        let before = state.prepared.clone();
+        // Both keys were free at read admission; another request published the
+        // second key while this batch's PCM was decoded outside the lock.
+        assert!(publish_prepared_batch(&mut state, &[journal_entry(1), existing], &budget(2), SESSION, WORKSPACE, generation, generation).is_err());
+        assert_eq!(state.prepared, before);
+        assert_eq!(state.prepared_audio.len(), 1);
+    }
+    #[test]
+    fn publication_capacity_failure_retains_other_prepared_actions() {
+        let mut state = VoiceRuntime::default(); enter_scope(&mut state, SESSION, WORKSPACE);
+        let generation = native::native_generation();
+        let one = BatchBudget { segments: 1, decoded_bytes: 1, base64_bytes: 4, duration_ms: 1 };
+        for operation in 1..=255 {
+            publish_prepared_batch(&mut state, &[journal_entry(operation)], &one, SESSION, WORKSPACE, generation, generation).unwrap();
+        }
+        let before = state.prepared.clone();
+        let two = BatchBudget { segments: 2, decoded_bytes: 2, base64_bytes: 8, duration_ms: 2 };
+        assert!(publish_prepared_batch(&mut state, &[journal_entry(256), journal_entry(257)], &two, SESSION, WORKSPACE, generation, generation).is_err());
+        assert_eq!(state.prepared, before);
+        assert_eq!(state.prepared_audio.len(), 255);
+    }
+    #[test]
+    fn stop_during_preparation_cannot_republish_old_audio_or_admissions() {
+        let mut state = VoiceRuntime::default();
+        enter_scope(&mut state, SESSION, WORKSPACE);
+        let prepared = vec![PreparedVoice {
+            session_id: SESSION.into(), workspace_generation: WORKSPACE.into(), draft_id: DRAFT.into(),
+            action_id: format!("{OPERATION}:0"), payload_sha256: "0".repeat(64),
+            manifest_sha256: "1".repeat(64),
+            segments: vec![PreparedSegment {name:"f1".into(),wav_base64:"AA==".into(),duration_ms:1,sha256:"2".repeat(64),decoded_bytes:1}],
+            total_duration_ms:1,total_decoded_bytes:1,bound_target:None,
+        }];
+        let budget = BatchBudget {segments:1,decoded_bytes:1,base64_bytes:4,duration_ms:1};
+        let current = native::native_generation();
+        // The read began before Stop advanced the native preparation epoch.
+        assert!(publish_prepared_batch(&mut state,&prepared,&budget,SESSION,WORKSPACE,current-1,current).is_err());
+        assert!(state.prepared.is_empty());
+        assert!(state.prepared_audio.is_empty());
+        assert!(state.consumed.is_empty());
+        // A deliberate new request after Stop can prepare once in the new epoch.
+        publish_prepared_batch(&mut state,&prepared,&budget,SESSION,WORKSPACE,current,current).unwrap();
+        let admissions:Vec<_> = state.prepared.values().cloned().collect();
+        assert_eq!(admissions.len(),1);
+        assert_eq!(state.prepared_audio.len(),1);
+        // Also cover a Stop winning immediately after publication but before
+        // admission: the cached epoch cannot be adopted by the new request.
+        state.prepared_generation = current - 1;
+        assert!(validate_prepared_admissions(&mut state,&admissions).is_err());
+        assert!(state.consumed.is_empty());
+        state.prepared_generation = current;
+        validate_prepared_admissions(&mut state,&admissions).unwrap();
+        assert!(validate_prepared_admissions(&mut state,&admissions).is_err());
+    }
+    #[test]
+    fn priority_stop_and_supervisor_share_one_release_receipt_on_the_original_owner(){
+        let mut state=VoiceRuntime::default();let stop=release_operation(&mut state,OPERATION);
+        assert_eq!(release_operation(&mut state,OPERATION),stop);
+        assert_ne!(release_operation(&mut state,SESSION),stop);
+    }
+    #[test]
+    fn voice_release_requires_its_original_operation_and_never_releases_another_ptt_owner() {
+        let retained = json!({"release_required":{"owner_id":OPERATION}});
+        assert!(require_voice_release_owner(Some(OPERATION), &retained).is_ok());
+        assert!(require_voice_release_owner(Some(SESSION), &retained).is_err());
+        assert!(require_voice_release_owner(None, &retained).is_err());
+    }
+    #[test]
+    fn production_voice_json_uses_the_same_identity_names_as_the_renderer() {
+        let value = json!({"schemaVersion":1,"sessionID":SESSION,"workspaceGeneration":WORKSPACE,"draftID":DRAFT,
+            "actionID":format!("{OPERATION}:0"),"payload":"[f1]","payloadSHA256":"0".repeat(64),"profilePath":"/operator/voice"});
+        let decoded: PrepareRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.session_id, SESSION);
+        let prepared = PreparedVoice {
+            session_id: SESSION.into(),
+            workspace_generation: WORKSPACE.into(),
+            draft_id: DRAFT.into(),
+            action_id: format!("{OPERATION}:0"),
+            payload_sha256: "0".repeat(64),
+            manifest_sha256: "1".repeat(64),
+            segments: vec![],
+            total_duration_ms: 1,
+            total_decoded_bytes: 1,
+            bound_target: None,
+        };
+        let value = serde_json::to_value(prepared).unwrap();
+        assert_eq!(value["sessionID"], SESSION);
+        assert!(value.get("sessionId").is_none());
+        assert!(value["manifestSHA256"].is_string());
+    }
+    fn bound_target() -> BoundVoiceTarget {
+        BoundVoiceTarget {schema_version:1,output_intent:OPERATION.into(),target:crate::ptt_session::Target {
+            provider:"direct_agent".into(),selection_id:OPERATION.into(),selection_generation:1,worker_generation:2,
+            connection_generation:3,control_revision:4,observation_revision:5,received_at_ms:6,radio_id:None,tci:None}}
+    }
+    #[test]
+    fn captured_voice_target_rejects_switches_across_delayed_host_or_audio_work_without_dispatch() {
+        let original=bound_target();validate_bound_target(&original).unwrap();
+        let mut telemetry=original.target.clone();telemetry.observation_revision+=1;telemetry.received_at_ms+=100;
+        assert!(same_bound_identity(&original.target,&telemetry).is_ok());
+        for field in ["provider","selection_id","selection_generation","worker_generation","connection_generation","control_revision"] {
+            let mut changed=serde_json::to_value(&original.target).unwrap();
+            changed[field]=match field {"provider"=>json!("direct_flex_lan"),"selection_id"=>json!(SESSION),_=>json!(99)};
+            let current:crate::ptt_session::Target=serde_json::from_value(changed).unwrap();
+            let mut dispatched=false;
+            let result=same_bound_identity(&original.target,&current).map(|_|{dispatched=true;});
+            assert!(result.is_err(),"{field}");assert!(!dispatched,"{field}");
+        }
+    }
+    #[test]
+    fn prepared_voice_admission_cannot_substitute_a_fresh_replacement_target() {
+        let bound=bound_target();
+        let admission=VoiceAdmission {session_id:SESSION.into(),workspace_generation:WORKSPACE.into(),draft_id:DRAFT.into(),
+            action_id:format!("{OPERATION}:0"),payload_sha256:"0".repeat(64),manifest_sha256:"1".repeat(64),bound_target:Some(bound)};
+        let mut state=VoiceRuntime::default();state.prepared_generation=native::native_generation();state.prepared.insert(admission_key(&admission),admission.clone());
+        let mut replaced=admission.clone();replaced.bound_target.as_mut().unwrap().target.connection_generation+=1;
+        assert!(validate_prepared_admissions(&mut state,&[replaced]).is_err());
+        assert!(!state.consumed.contains(&admission_key(&admission)));
+        validate_prepared_admissions(&mut state,&[admission]).unwrap();
+    }
+
+    fn wav(milliseconds: u32) -> Vec<u8> {
+        let byte_rate = 8_000_u32 * 2;
+        let data_len = byte_rate * milliseconds / 1_000;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(bytes.len() + data_len as usize, 0);
+        bytes
+    }
+
+    fn request(profile: &Path, payload: &str) -> PrepareRequest {
+        PrepareRequest {
+            schema_version: 1,
+            session_id: SESSION.into(),
+            workspace_generation: WORKSPACE.into(),
+            draft_id: DRAFT.into(),
+            action_id: format!("{OPERATION}:0"),
+            payload: payload.into(),
+            payload_sha256: format!("{:x}", Sha256::digest(payload.as_bytes())),
+            profile_path: profile.to_string_lossy().into_owned(),
+            bound_target: None,
+        }
+    }
+
+    #[test]
+    fn resolves_not1mm_character_and_bracket_wavs_in_order() {
+        let profile = tempfile::tempdir().unwrap();
+        for name in ["c", "q", "space", "again"] {
+            fs::File::create(profile.path().join(format!("{name}.wav")))
+                .unwrap()
+                .write_all(&wav(100))
+                .unwrap();
+        }
+        let prepared = prepare(request(profile.path(), "CQ [again]"), SESSION, WORKSPACE).unwrap();
+        assert_eq!(
+            prepared
+                .segments
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "q", "space", "again"]
+        );
+        assert_eq!(prepared.total_duration_ms, 400);
+    }
+
+    #[test]
+    fn stale_context_digest_missing_or_malformed_audio_fail_closed() {
+        let profile = tempfile::tempdir().unwrap();
+        fs::write(profile.path().join("c.wav"), wav(100)).unwrap();
+        assert!(prepare(
+            request(profile.path(), "c"),
+            "50000000-0000-4000-8000-000000000005",
+            WORKSPACE
+        )
+        .unwrap_err()
+        .contains("stale"));
+        let mut bad_digest = request(profile.path(), "c");
+        bad_digest.payload_sha256 = "0".repeat(64);
+        assert!(prepare(bad_digest, SESSION, WORKSPACE)
+            .unwrap_err()
+            .contains("digest"));
+        assert!(prepare(request(profile.path(), "cq"), SESSION, WORKSPACE)
+            .unwrap_err()
+            .contains("q.wav is missing"));
+        fs::write(profile.path().join("q.wav"), b"not wave").unwrap();
+        assert!(prepare(request(profile.path(), "cq"), SESSION, WORKSPACE)
+            .unwrap_err()
+            .contains("RIFF/WAVE"));
+    }
+
+    #[test]
+    fn maps_slash_explicitly_and_rejects_every_unsupported_character() {
+        let profile = tempfile::tempdir().unwrap();
+        for name in ["o", "m", "0", "r", "x", "slash", "p"] {
+            fs::write(profile.path().join(format!("{name}.wav")), wav(10)).unwrap();
+        }
+        let prepared = prepare(request(profile.path(), "OM0RX/P"), SESSION, WORKSPACE).unwrap();
+        assert_eq!(
+            prepared
+                .segments
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["o", "m", "0", "r", "x", "slash", "p"]
+        );
+        assert!(prepare(request(profile.path(), "CQ?"), SESSION, WORKSPACE)
+            .unwrap_err()
+            .contains("U+003F"));
+    }
+
+    #[test]
+    fn batch_caps_aggregate_segments_and_binds_the_exact_manifest() {
+        let profile = tempfile::tempdir().unwrap();
+        fs::write(profile.path().join("c.wav"), wav(10)).unwrap();
+        let requests = (0..3)
+            .map(|index| {
+                let mut item = request(profile.path(), &"c".repeat(100));
+                item.action_id = format!("{OPERATION}:{index}");
+                item
+            })
+            .collect();
+        assert!(
+            prepare_batch(PrepareBatchRequest { requests }, SESSION, WORKSPACE)
+                .unwrap_err()
+                .contains("aggregate")
+        );
+
+        let admission = VoiceAdmission {
+            session_id: SESSION.into(),
+            workspace_generation: WORKSPACE.into(),
+            draft_id: DRAFT.into(),
+            action_id: format!("{OPERATION}:0"),
+            payload_sha256: "0".repeat(64),
+            manifest_sha256: "1".repeat(64),
+            bound_target: None,
+        };
+        let mut state = VoiceRuntime::default();
+        state.prepared_generation = native::native_generation();
+        state
+            .prepared
+            .insert(admission_key(&admission), admission.clone());
+        let mut wrong = admission.clone();
+        wrong.manifest_sha256 = "2".repeat(64);
+        assert!(validate_prepared_admissions(&mut state, &[wrong]).is_err());
+        validate_prepared_admissions(&mut state, std::slice::from_ref(&admission)).unwrap();
+        assert!(validate_prepared_admissions(&mut state, &[admission]).is_err());
+    }
+
+    #[test]
+    fn prepare_acquire_release_prepare_replay_is_tombstoned_in_scope() {
+        let profile = tempfile::tempdir().unwrap();
+        fs::write(profile.path().join("c.wav"), wav(10)).unwrap();
+        let action_id = format!("{}:0", uuid::Uuid::new_v4());
+        let mut first = request(profile.path(), "c");
+        first.action_id = action_id.clone();
+        let mut replay = request(profile.path(), "c");
+        replay.action_id = action_id;
+        let prepared = prepare_batch(
+            PrepareBatchRequest {
+                requests: vec![first],
+            },
+            SESSION,
+            WORKSPACE,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let admission = VoiceAdmission {
+            session_id: prepared.session_id,
+            workspace_generation: prepared.workspace_generation,
+            draft_id: prepared.draft_id,
+            action_id: prepared.action_id,
+            payload_sha256: prepared.payload_sha256,
+            manifest_sha256: prepared.manifest_sha256,
+            bound_target: prepared.bound_target,
+        };
+        validate_prepared_admissions(&mut runtime().lock().unwrap(), &[admission]).unwrap();
+        assert!(prepare_batch(
+            PrepareBatchRequest {
+                requests: vec![replay],
+            },
+            SESSION,
+            WORKSPACE,
+        )
+        .unwrap_err()
+        .contains("replay denied"));
+    }
+
+    #[test]
+    fn consumed_tombstones_survive_more_than_256_actions_until_scope_changes() {
+        let mut state = VoiceRuntime::default();
+        state.prepared_generation = native::native_generation();
+        enter_scope(&mut state, SESSION, WORKSPACE);
+        let mut oldest = None;
+        for _ in 0..300 {
+            let admission = VoiceAdmission {
+                session_id: SESSION.into(),
+                workspace_generation: WORKSPACE.into(),
+                draft_id: DRAFT.into(),
+                action_id: format!("{}:0", uuid::Uuid::new_v4()),
+                payload_sha256: "0".repeat(64),
+                manifest_sha256: "1".repeat(64),
+                bound_target: None,
+            };
+            let key = admission_key(&admission);
+            oldest.get_or_insert_with(|| key.clone());
+            state.prepared.insert(key, admission.clone());
+            validate_prepared_admissions(&mut state, &[admission]).unwrap();
+        }
+        let oldest = oldest.unwrap();
+        assert_eq!(state.consumed.len(), 300);
+        assert!(ensure_action_keys_available(&state, std::slice::from_ref(&oldest)).is_err());
+        enter_scope(
+            &mut state,
+            SESSION,
+            "50000000-0000-4000-8000-000000000005",
+        );
+        assert!(state.consumed.is_empty());
+        assert!(ensure_action_keys_available(&state, &[oldest]).is_ok());
+    }
+
+    #[test]
+    fn queued_acquisition_is_retained_by_the_shutdown_barrier() {
+        let operation_lane = Mutex::new(());
+        let state = Mutex::new(VoiceRuntime {
+            pending_acquisitions: 1,
+            ..VoiceRuntime::default()
+        });
+        shutdown_barrier(&operation_lane, &state, || Ok(())).unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.shutting_down);
+        assert_eq!(state.pending_acquisitions, 1);
+    }
+
+    #[test]
+    fn shutdown_waits_for_late_acquisition_then_releases_owned_ptt() {
+        use std::sync::{mpsc, Arc};
+        let operation_lane = Arc::new(Mutex::new(()));
+        let state = Arc::new(Mutex::new(VoiceRuntime::default()));
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let lane_for_acquire = operation_lane.clone();
+        let state_for_acquire = state.clone();
+        let acquisition = std::thread::spawn(move || {
+            let _guard = lane_for_acquire.lock().unwrap();
+            acquired_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            state_for_acquire.lock().unwrap().active_ptt = true;
+        });
+        acquired_rx.recv().unwrap();
+        let lane_for_shutdown = operation_lane.clone();
+        let state_for_shutdown = state.clone();
+        let (released_tx, released_rx) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            shutdown_barrier(&lane_for_shutdown, &state_for_shutdown, || {
+                released_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+        assert!(released_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        finish_tx.send(()).unwrap();
+        acquisition.join().unwrap();
+        shutdown.join().unwrap().unwrap();
+        released_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(state.lock().unwrap().shutting_down);
+    }
+
+    #[test]
+    fn test_profile_and_non_owner_never_admit_io() {
+        assert!(validate_invoker("main", false, false, true)
+            .unwrap_err()
+            .contains("disabled"));
+        assert!(validate_invoker("contest--active-qso", false, false, false).is_err());
+        assert!(validate_invoker("main", true, false, false).is_err());
+        assert!(validate_invoker("main", false, true, false).is_err());
+        assert!(validate_invoker("main", false, false, false).is_ok());
+    }
+
+    #[test]
+    fn managed_profile_writes_inspects_and_previews_only_bounded_slots() {
+        let profile = tempfile::tempdir().unwrap();
+        let path = profile.path().to_string_lossy().into_owned();
+        let encoded = STANDARD.encode(wav(250));
+        let saved = profile_write(ProfileWriteRequest { profile_path: path.clone(), slot: "F12".into(),
+            wav_base64: encoded.clone(), overwrite: false }).unwrap();
+        assert_eq!(saved.slot, "f12");
+        assert_eq!(saved.duration_ms, 250);
+        let manifest = profile_manifest(ProfileRequest { profile_path: path.clone() }).unwrap();
+        assert_eq!(manifest.slots.len(), 12);
+        assert!(manifest.slots[11].present);
+        assert_eq!(profile_preview(ProfileSlotRequest { profile_path: path.clone(), slot: "f12".into() }).unwrap().sha256,
+            saved.sha256);
+        assert!(profile_write(ProfileWriteRequest { profile_path: path.clone(), slot: "f12".into(),
+            wav_base64: encoded.clone(), overwrite: false }).unwrap_err().contains("confirm replacement"));
+        assert_eq!(fs::read(profile.path().join("f12.wav")).unwrap(), wav(250));
+        assert!(profile_write(ProfileWriteRequest { profile_path: path.clone(), slot: "cq".into(),
+            wav_base64: encoded, overwrite: true }).unwrap_err().contains("F1 through F12"));
+        profile_write(ProfileWriteRequest { profile_path: path, slot: "f12".into(),
+            wav_base64: STANDARD.encode(wav(100)), overwrite: true }).unwrap();
+        assert_eq!(fs::metadata(profile.path().join("f12.wav")).unwrap().len(), wav(100).len() as u64);
+        assert_eq!(fs::read(profile.path().join("f12.wav")).unwrap(), wav(100));
+        assert_eq!(fs::read_dir(profile.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn managed_profile_never_recreates_a_missing_profile_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("missing-profile");
+        assert!(profile_write(ProfileWriteRequest { profile_path: profile.to_string_lossy().into_owned(),
+            slot: "f1".into(), wav_base64: STANDARD.encode(wav(100)), overwrite: true }).is_err());
+        assert!(!profile.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn managed_profile_rejects_malformed_audio_and_symbolic_link_slots() {
+        let profile = tempfile::tempdir().unwrap();
+        let path = profile.path().to_string_lossy().into_owned();
+        assert!(profile_write(ProfileWriteRequest { profile_path: path.clone(), slot: "f1".into(),
+            wav_base64: STANDARD.encode(b"not wave"), overwrite: false }).unwrap_err().contains("RIFF/WAVE"));
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(profile.path().join("elsewhere.wav"), profile.path().join("f1.wav")).unwrap();
+            assert!(profile_write(ProfileWriteRequest { profile_path: path, slot: "f1".into(),
+                wav_base64: STANDARD.encode(wav(100)), overwrite: true }).unwrap_err().contains("symbolic link"));
+        }
+    }
+
+    #[test]
+    fn managed_profile_rejects_oversized_slot_before_reading_it() {
+        let profile = tempfile::tempdir().unwrap();
+        fs::File::create(profile.path().join("f1.wav")).unwrap()
+            .set_len((MAX_WAV_BYTES + 1) as u64).unwrap();
+        let path = profile.path().to_string_lossy().into_owned();
+        assert!(profile_preview(ProfileSlotRequest { profile_path: path.clone(), slot: "f1".into() })
+            .unwrap_err().contains("8 MiB"));
+        let manifest = profile_manifest(ProfileRequest { profile_path: path }).unwrap();
+        assert!(manifest.slots[0].error.as_deref().is_some_and(|error| error.contains("8 MiB")));
+    }
+
+    #[test]
+    fn managed_profile_rejects_inconsistent_pcm_headers() {
+        let profile = tempfile::tempdir().unwrap();
+        let path = profile.path().to_string_lossy().into_owned();
+        let write = |bytes: Vec<u8>| profile_write(ProfileWriteRequest { profile_path: path.clone(),
+            slot: "f1".into(), wav_base64: STANDARD.encode(bytes), overwrite: true }).unwrap_err();
+
+        let mut wrong_extent = wav(100);
+        wrong_extent[4..8].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(write(wrong_extent).contains("RIFF extent"));
+
+        let mut wrong_alignment = wav(100);
+        wrong_alignment[32..34].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(write(wrong_alignment).contains("frame-aligned"));
+
+        let mut partial_frame = wav(100);
+        let data_size = u32::from_le_bytes(partial_frame[40..44].try_into().unwrap()) - 1;
+        partial_frame[40..44].copy_from_slice(&data_size.to_le_bytes());
+        assert!(write(partial_frame).contains("complete PCM frames"));
+
+        let mut duplicate_format = wav(100);
+        duplicate_format.extend_from_slice(&wav(1)[12..36]);
+        let riff_size = (duplicate_format.len() - 8) as u32;
+        duplicate_format[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(write(duplicate_format).contains("duplicate format"));
+
+        let mut duplicate_data = wav(100);
+        duplicate_data.extend_from_slice(b"data");
+        duplicate_data.extend_from_slice(&0_u32.to_le_bytes());
+        let riff_size = (duplicate_data.len() - 8) as u32;
+        duplicate_data[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(write(duplicate_data).contains("duplicate audio data"));
+    }
+}

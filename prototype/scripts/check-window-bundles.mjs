@@ -1,0 +1,107 @@
+// Production graph gate: detached data windows must not pull in the main radio/map UI.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { gzipSync } from "node:zlib";
+import assert from "node:assert/strict";
+const dist = fileURLToPath(new URL("../dist/", import.meta.url));
+const manifest = JSON.parse(readFileSync(resolve(dist, ".vite/manifest.json"), "utf8"));
+function closure(key, found = new Set()) {
+  if (found.has(key)) return found;
+  assert(manifest[key], `Missing build entry ${key}`);
+  found.add(key);
+  for (const dependency of manifest[key].imports ?? []) closure(dependency, found);
+  return found;
+}
+const main = "src/LiveApp.tsx";
+assert(manifest[main], "Main workspace bundle is missing");
+const aboutGraph = closure("src/live/AboutSurface.tsx", closure("index.html"));
+assert(!aboutGraph.has(main) && !aboutGraph.has("src/worker.ts"), "About imports station or worker state");
+const aboutBytes = [...aboutGraph].reduce((total, key) => total + readFileSync(resolve(dist, manifest[key].file)).length, 0);
+assert(aboutBytes <= 300_000, `About startup JavaScript exceeds its 300 kB budget: ${aboutBytes}`);
+const eagerGraph = closure("index.html");
+const eagerCss = new Set([...eagerGraph].flatMap(key => manifest[key].css ?? []));
+const setupDialogEntry = "src/contesting/DetachedContestSetupDialog.tsx";
+assert(manifest[setupDialogEntry], "Detached setup dialogs are missing");
+const setupDialogGraph = closure(setupDialogEntry, closure("index.html"));
+assert(!setupDialogGraph.has(main), "Setup dialogs import the main station workspace");
+assert(!setupDialogGraph.has("src/contesting/DetachedContestSetupSurface.tsx"), "Setup dialogs import the session mutation owner");
+// Maps are explicit child entries too. World Map legitimately owns MapLibre;
+// Band Maps must not pay for it or import the main station controller.
+for (const name of ["WorldMap", "DXpeditionMap", "BandMaps", "Monitor"]) {
+  const entry = `src/live/Detached${name}Surface.tsx`;
+  const graph = closure(entry, closure("index.html"));
+  assert(!graph.has(main), `${name} imports the main station workspace`);
+  if (name === "BandMaps") assert(!graph.has("src/Map.tsx"), "Band Maps imports World Map");
+  const lateCss = [...graph].flatMap(key => manifest[key].css ?? []).filter(file => !eagerCss.has(file));
+  assert.equal(lateCss.length, 0, `${name} loads late CSS after shared overrides: ${lateCss.join(", ")}`);
+  const files = [...new Set([...graph].map(key => manifest[key].file))];
+  const data = files.map(file => readFileSync(resolve(dist, file)));
+  const bytes = data.reduce((sum, item) => sum + item.length, 0);
+  assert(bytes <= (name === "BandMaps" ? 400_000 : 1_600_000), `${name} startup JavaScript budget exceeded: ${bytes}`);
+  console.log(JSON.stringify({ window: name, bytes, gzip: data.reduce((sum, item) => sum + gzipSync(item).length, 0), files }));
+}
+for (const name of ["Awards", "Logbook", "Cluster", "QSO", "SpotHistory", "CallsignIntelligence", "PreviousQSOs", "OperatingGoals", "Settings", "Opportunities", "HFPropagationLive", "StationControl", "CW", "Rotor", "StationStatus", "Propagation", "StationIdentity", "Alerts", "Antenna"]) {
+  const entry = `src/live/Detached${name}Surface.tsx`;
+  const graph = closure(entry, closure("index.html"));
+  assert(!graph.has(main), `${name} imports the main station workspace`);
+  assert(!graph.has("src/Map.tsx"), `${name} imports the map UI`);
+  if (name === "Logbook") {
+    for (const panel of ["CTYCorrectionPreview", "OnlineLogFollowUp", "LogbookContactMenu"]) {
+      const optionalEntry = `src/live/${panel}.tsx`;
+      assert(manifest[optionalEntry], `${panel} lazy entry is missing`);
+      assert(!graph.has(optionalEntry), `Logbook loads ${panel} before it is opened`);
+    }
+  }
+  assert(!graph.has("src/live/DetachedDXpeditionMapSurface.tsx"), `${name} imports the DXpedition Map UI`);
+  const lateCss = [...graph].flatMap(key => manifest[key].css ?? []).filter(file => !eagerCss.has(file));
+  assert.equal(lateCss.length, 0, `${name} loads late CSS after shared overrides: ${lateCss.join(", ")}`);
+  const files = [...new Set([...graph].map(key => manifest[key].file))];
+  const data = files.map(file => readFileSync(resolve(dist, file)));
+  const bytes = data.reduce((sum, item) => sum + item.length, 0);
+  const gzip = data.reduce((sum, item) => sum + gzipSync(item).length, 0);
+  // QSO and Settings share validated cross-window field visibility; QSO also
+  // applies the mode-aware 59/599 defaults in every editor. Settings owns the
+  // persisted propagation cadence. The heavier canvas editor remains outside
+  // both detached surfaces.
+  // Contest Setup adds one lazy route to the shared surface loader without
+  // pulling its contest workspace into ordinary detached-window startup.
+  // Three additional lazy setup-dialog routes add preload metadata to the shared
+  // bootstrap. Their setup UI and session owner remain outside this startup
+  // graph. Keep the adjustment local to the affected budget.
+  // CQ WW log DUPE metadata and bounded detached-contest projection fields add
+  // less than 0.03% to the shared Logbook graph. Node 22 and Node 24 currently
+  // differ by 20 emitted bytes, so retain a bounded 150-byte allowance above
+  // the larger verified graph instead of making the gate toolchain-dependent.
+  // Analytics and DXpedition Map add lazy routes and preload descriptors.
+  // The measured Logbook graph is 402,807 bytes; their UI stays outside startup.
+  // Keep the route allowance bounded and local to the tight Logbook budget.
+  // Recorder adds a lazy route descriptor and the global listening-only Escape hook.
+  // Measured Logbook graph: 403,015 bytes; keep its route allowance bounded.
+  // Mode handoff shares the 1,341-byte editor-preparation helper with Logbook.
+  // Measured startup: 404,998 bytes (130,274 gzip); allow 202 bytes of headroom
+  // only here. Main and map UI exclusion checks above remain unchanged.
+  const budget = name === "Settings" ? 408_000 : name === "QSO" ? 407_000 : name === "Logbook" ? 405_200 : 401_000;
+  console.log(JSON.stringify({ window: name, bytes, gzip, files }));
+  assert(bytes <= budget, `${name} startup JavaScript exceeds the ${budget / 1_000} kB budget: ${bytes}`);
+}
+const recorderEntry = "src/contesting/ContestRecorderWindow.tsx";
+assert(manifest[recorderEntry], "Contest Recorder lazy entry is missing");
+assert(!eagerGraph.has(recorderEntry), "Recorder UI is loaded by ordinary window startup");
+assert(!closure(recorderEntry).has(main), "Recorder imports the live station controller");
+const analyticsEntry = "src/contesting/ContestAnalyticsWindow.tsx";
+assert(manifest[analyticsEntry], "Contest Analytics lazy entry is missing");
+assert(!eagerGraph.has(analyticsEntry), "Contest Analytics is loaded by ordinary window startup");
+const analyticsGraph = closure(analyticsEntry);
+assert(!analyticsGraph.has(main), "Analytics imports the live station controller");
+assert(!analyticsGraph.has("src/Map.tsx"), "Analytics imports the map renderer");
+const hmEntry = "hm-control/index.html", hmDashboard = "hm-control/dashboard.js";
+assert(manifest[hmEntry] && manifest[hmDashboard], "HM Control local dashboard is missing");
+assert(!eagerGraph.has(hmEntry) && !eagerGraph.has(hmDashboard), "Ordinary xLog startup loads HM Control");
+const hmGraph = closure(hmDashboard, closure(hmEntry));
+assert(!hmGraph.has(main) && !hmGraph.has("src/Map.tsx"), "HM Control imports the main controller or MapLibre UI");
+const hmFiles = [...new Set([...hmGraph].map(key => manifest[key].file))];
+assert(!hmFiles.some(file => /\/react-/.test(file)), "HM Control unnecessarily loads React");
+const hmBytes = hmFiles.reduce((sum, file) => sum + readFileSync(resolve(dist, file)).length, 0);
+assert(hmBytes < 2_000_000, `HM Control JavaScript budget exceeded: ${hmBytes}`);
+console.log(JSON.stringify({ window: "HM Control", bytes: hmBytes, files: hmFiles }));
