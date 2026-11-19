@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type ToastTone = "success" | "error";
@@ -24,9 +25,9 @@ export function useSettingsSaveToast() {
 
   return {
     show,
-    toast: notice === null ? null : <div key={notice.id} className={`settings-save-toast settings-save-toast-${notice.tone}`}
+    toast: notice === null ? null : <ErrorNotice key={notice.id}><div key={notice.id} className={`settings-save-toast settings-save-toast-${notice.tone}`}
       role={notice.tone === "error" ? "alert" : "status"} aria-live={notice.tone === "error" ? "assertive" : "polite"} aria-atomic="true">
       {notice.message}
-    </div>,
+    </div></ErrorNotice>,
   };
 }

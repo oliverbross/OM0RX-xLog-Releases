@@ -1007,7 +1007,19 @@ fn bind_group_socket(interface:Ipv4Addr,port:u16)->Result<UdpSocket,String>{
     }
     Ok(socket)
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn bind_group_socket(interface: Ipv4Addr, port: u16) -> Result<UdpSocket, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| e.to_string())?;
+    socket.set_reuse_address(true).map_err(|e| e.to_string())?;
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()).map_err(|e| e.to_string())?;
+    if !interface.is_unspecified() {
+        socket.set_multicast_if_v4(&interface).map_err(|e| e.to_string())?;
+    }
+    Ok(socket.into())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn bind_group_socket(interface:Ipv4Addr,port:u16)->Result<UdpSocket,String>{
     if !interface.is_unspecified(){return Err("Explicit outgoing multicast interfaces remain unqualified on this platform.".into());}
     UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED,port)).map_err(|e|e.to_string())
@@ -1568,7 +1580,7 @@ mod tests {
         assert!(crate::worker::validate_surface("contest--group-chat",&serde_json::json!({"id":"pending-read","method":"contest_network_pending","params":{}})).is_err());
     }
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn two_local_group_sockets_use_the_explicit_loopback_interface() {
         use std::time::Duration;
         let interface=std::net::Ipv4Addr::LOCALHOST;

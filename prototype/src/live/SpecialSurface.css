@@ -1,0 +1,17 @@
+.app.live.special-app { height: 100dvh; min-height: 0; overflow: hidden; }
+.special-app > main { display: flex; flex-direction: column; gap: 8px; height: 100%; min-height: 0; box-sizing: border-box; padding: 12px; overflow: hidden; }
+.special-app main > header { display: flex; justify-content: space-between; align-items: center; flex: none; gap: 12px; }
+.special-app h1 { margin: 0; color: var(--cyan); font-size: 22px; }
+.special-app header > div { display: flex; align-items: center; gap: 6px; }
+.special-app header button { display: inline-flex; align-items: center; padding: 5px 8px; font-size: 12px; }
+.special-summary { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--secondary); }
+.special-table { display: flex; flex-direction: column; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+.special-options { display: flex; flex-direction: column; gap: 16px; }
+.special-options fieldset { border: 0; margin: 0; padding: 0; }
+.special-options legend { margin-bottom: 8px; color: #afc4d4; font-size: 12px; }
+.special-options fieldset > div { display: flex; flex-wrap: wrap; gap: 6px; }
+.special-options > label { display: flex; align-items: center; gap: 12px; }
+.special-options p { margin: 0; color: #afc4d4; font-size: 12px; }
+.special-column-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; }
+.xlog-dialog .special-column-options label { display: flex; align-items: center; gap: 8px; }
+.xlog-dialog .special-column-options input { width: 14px; height: 14px; padding: 0; }

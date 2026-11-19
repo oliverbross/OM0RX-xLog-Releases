@@ -1,3 +1,5 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { formatRadioFrequency } from "./radioFrequency";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Activity, AlertTriangle, Antenna, LockKeyhole, Radio, RefreshCw, RotateCcw, ShieldAlert } from "lucide-react";
 import "./StationPanel.css";
@@ -39,6 +41,7 @@ type RotorState = { connected?: boolean; name?: string; azimuth?: number; target
   target_label?: string; status?: string; moving?: boolean; motion_direction?: string };
 type StationSnapshot = {
   source?: "xcat_loopback" | "direct_agent"; available?: boolean; transport_state?: string;
+  measured_tx_power?: { watts: number; measurement_point: string } | null;
   generated_at?: number; allow_transmit?: boolean; radio?: RadioState | null;
   station?: StationState | null; rotor?: RotorState | null;
   cat_servers?: { cat_port?: number | null; rigctl_port?: number | null; allow_transmit?: boolean };
@@ -49,7 +52,7 @@ const modes = ["CW", "SSB", "USB", "LSB", "AM", "FM", "FT8", "FT4", "FT2", "RTTY
 const rotorBands = ["160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "70cm", "Other"];
 
 function unwrap(raw: any): any { return raw && typeof raw === "object" && "result" in raw ? raw.result : raw; }
-function frequency(hz?: number | null): string { return typeof hz === "number" && Number.isFinite(hz) ? (hz / 1_000_000).toFixed(6) : "—"; }
+function frequency(hz?: number | null): string { return typeof hz === "number" && Number.isFinite(hz) ? formatRadioFrequency(hz) : "—"; }
 function value<T>(item: T | null | undefined, unit = ""): string { return item == null || item === "" ? "—" : `${item}${unit}`; }
 function timestamp(epoch?: number | null): string { return typeof epoch === "number" && Number.isFinite(epoch) ? new Date(epoch * 1000).toLocaleTimeString() : "—"; }
 function errorText(cause: unknown): string { return cause instanceof Error ? cause.message : "Station request failed."; }
@@ -231,8 +234,8 @@ export default function StationPanel({ radioId, snapshot, onRequest, onSnapshot,
         <button type="button" onClick={() => void refresh()}><RefreshCw size={13} /> Refresh</button></div>
     </header>
     <p className="live-station-helper">xCat is embedded in xLog. Connect to your remote station here; the standalone xCat application is not required.</p>
-    {error && <p className="live-station-error" role="alert"><AlertTriangle size={14} />{error}</p>}
-    {notice && <p className="live-station-notice" role="status">{notice}</p>}{saveToast.toast}
+    {error && <ErrorNotice><p className="live-station-error" role="alert"><AlertTriangle size={14} />{error}</p></ErrorNotice>}
+    {notice && <ErrorNotice><p className="live-station-notice" role="status">{notice}</p></ErrorNotice>}{saveToast.toast}
     <div className="live-station-grid">
       <div className="live-station-main">
         <div className="live-station-readback">
@@ -249,8 +252,8 @@ export default function StationPanel({ radioId, snapshot, onRequest, onSnapshot,
             <span><b>Coordinator</b>{value(station?.coordinator_state)}</span><span><b>Interlock</b>{value(station?.interlock_state)}</span>
             <span><b>Route</b>{value(station?.route_alignment)}</span><span><b>Band</b>{value(station?.band)}</span>
             <span><b>Amplifier</b>{station?.kpa_operate == null ? "—" : station.kpa_operate ? "Operate" : "Standby"}</span>
-            <span><b>Forward power</b>{station?.swr_is_live ? value(station.tx_power_watts, " W") : "—"}</span>
-            <span><b>SWR</b>{station?.swr_is_live ? value(station.swr) : "—"}</span><span><b>RF drive</b>{value(station?.rf_drive_watts, " W")}</span></div>
+            <span><b>Forward power</b>{value(station?.tx_power_watts, " W")}</span>
+            <span><b>Measured TX output</b>{live?.measured_tx_power ? value(live.measured_tx_power.watts," W") + (live.measured_tx_power.measurement_point === "amplifier_output" ? " · amplifier" : " · radio") : "—"}</span><span><b>SWR</b>{station?.swr_is_live ? value(station.swr) : "—"}</span><span><b>RF drive</b>{value(station?.rf_drive_watts, " W")}</span></div>
           {(station?.inhibitors?.length ?? 0) > 0 && <div className="live-station-inhibitors"><ShieldAlert size={15} />{station?.inhibitors?.join(" · ")}</div>}
           {station?.alarm_summary && <p className="live-station-alarm">{station.alarm_summary}</p>}
           {[station?.kpa_detail_primary, station?.kpa_detail_secondary, station?.kat_detail_primary, station?.kat_detail_secondary, station?.route_detail].filter(Boolean).map((detail, index) => <p className="live-station-detail" key={index}>{detail}</p>)}

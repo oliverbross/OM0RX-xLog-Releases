@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { workerRequest } from "../worker";
 import OpportunitiesPanel from "./OpportunitiesPanel";
@@ -27,7 +28,7 @@ export function DetachedOpportunitiesSurface() {
   }, setError), [reads]);
   const activation = useSpotActivation("activate_opportunity");
   return <div className="app live monitor-app detached-opportunities-app"><main className="live-feedback-host" aria-label="Detached Chaser & DX">
-    <StableFeedbackLayer>{error && <p className="live-error" role="alert">{error}</p>}
+    <StableFeedbackLayer>{error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
       <SpotActivationStatus status={activation.status} error={activation.error} checking={activation.requesting} reconcile={() => void activation.reconcile()} /></StableFeedbackLayer>
     <OpportunitiesPanel taskOnly request={reads.request} refresh={refresh} onSelect={item => {
       setError(""); void activation.activate(item).catch(cause => setError(cause instanceof Error ? cause.message : "Opportunity selection could not be verified."));

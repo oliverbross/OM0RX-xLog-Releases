@@ -1,5 +1,7 @@
+#if os(macOS) || os(Windows)
 #if os(macOS)
 import Darwin
+#endif
 import Foundation
 import XCatIntegrationCore
 
@@ -64,6 +66,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
     typealias EventHandler = @Sendable (_ service: String, _ event: String) -> Void
 
     private let radio: any RadioControlling
+    private let clientRadio: (@Sendable (UUID) -> any RadioControlling)?
     private let configuration: Configuration
     private let allowEphemeralPorts: Bool
     private let onEvent: EventHandler
@@ -81,6 +84,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
         radio: any RadioControlling,
         configuration: Configuration,
         observedSnapshot: SnapshotProvider? = nil,
+        clientRadio: (@Sendable (UUID) -> any RadioControlling)? = nil,
         authorizeMutation: @escaping MutationAuthorization,
         didCompleteMutation: @escaping MutationCompletion = { _ in },
         stationStateProvider: RigCtlCommandProcessor.StationStateProvider? = nil,
@@ -89,6 +93,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
         allowEphemeralPorts: Bool = false
     ) {
         self.radio = radio
+        self.clientRadio = clientRadio
         self.configuration = configuration
         // Internal fixture opt-in only; user configuration still rejects zero.
         // Let the OS atomically allocate and retain test ports, with no
@@ -121,9 +126,11 @@ final class EmbeddedCATServers: @unchecked Sendable {
         }
         // The copied listener enables local endpoint reuse. A non-reuse bind
         // catches a pre-existing service before we hand the port to Network.
+        #if os(macOS)
         for port in [configuration.catPort, configuration.rigCtlPort].compactMap({ $0 }) where port != 0 {
             guard Self.loopbackPortIsFree(port) else { throw StartError.portUnavailable(port) }
         }
+        #endif
 
         let catProcessor = CATCommandProcessor(radio: guardedRadio, allowTransmit: configuration.allowTransmit)
         let authorizedAction: RigCtlCommandProcessor.StationActionHandler?
@@ -150,6 +157,25 @@ final class EmbeddedCATServers: @unchecked Sendable {
             try? await guardedRadio.setTransmit(false)
         }
 
+        // Each direct FLEX client has an identity even when its last write
+        // lost its acknowledgement. Only the owning radio adapter can release it.
+        func clients(rigctl: Bool) -> TCPCommandServer.ClientFactory? {
+            guard let clientRadio else { return nil }
+            let allowTransmit = configuration.allowTransmit
+            return { id in
+                let radio = clientRadio(id)
+                let command: TCPCommandServer.Handler
+                if rigctl {
+                    let processor = RigCtlCommandProcessor(radio: radio, allowTransmit: allowTransmit)
+                    command = { await processor.handle($0) }
+                } else {
+                    let processor = CATCommandProcessor(radio: radio, allowTransmit: allowTransmit)
+                    command = { await processor.handle($0) }
+                }
+                return (command, { _ in try? await radio.setTransmit(false) })
+            }
+        }
+
         if let port = configuration.catPort {
             let server = TCPCommandServer(
                 label: "com.om0rx.xlog.embedded-cat",
@@ -159,6 +185,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
                     TCPCommandServer.catTransmitIntent(command: command, response: response)
                 },
                 onDisconnect: disconnect,
+                clientFactory: clients(rigctl: false),
                 onEvent: { [onEvent] event in onEvent("CAT", event) }
             )
             do { try server.start(port: port) }
@@ -175,6 +202,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
                     TCPCommandServer.rigCtlTransmitIntent(command: command, response: response)
                 },
                 onDisconnect: disconnect,
+                clientFactory: clients(rigctl: true),
                 onEvent: { [onEvent] event in onEvent("RigCtlD", event) }
             )
             do { try server.start(port: port) }
@@ -212,6 +240,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
         return servers
     }
 
+    #if os(macOS)
     private static func loopbackPortIsFree(_ port: UInt16) -> Bool {
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return false }
@@ -227,6 +256,7 @@ final class EmbeddedCATServers: @unchecked Sendable {
             }
         }
     }
+    #endif
 }
 
 /// All processor writes pass through this actor, so an owning session can
@@ -267,11 +297,13 @@ private actor GuardedRadio: RadioControlling {
         guard !retired || isRelease(mutation) else { throw XCatError.unsupported }
         guard await authorize(mutation) else { throw XCatError.unsupported }
         guard !retired || isRelease(mutation) else { throw XCatError.unsupported }
+        #if !os(Windows)
         switch mutation {
         case .transmit(true), .transmitMode, .sendCW, .stationAction(.tune):
             await TCPCommandServer.recordAuthorizedTransmitAttempt()
         default: break
         }
+        #endif
         guard !retired || isRelease(mutation) else { throw XCatError.unsupported }
         try await body()
         await completed(mutation)
@@ -351,11 +383,13 @@ private actor GuardedRadio: RadioControlling {
         _ action: String,
         using handler: RigCtlCommandProcessor.StationActionHandler
     ) async -> Bool {
-        let mutation = Mutation.namedStationAction(action)
+        let mutation = RemoteStationAction(rawValue: action).map(Mutation.stationAction) ?? .namedStationAction(action)
         guard !retired || action == "cancel" || action == "standby" else { return false }
         guard await authorize(mutation) else { return false }
         guard !retired || action == "cancel" || action == "standby" else { return false }
+        #if !os(Windows)
         if action == "tune" { await TCPCommandServer.recordAuthorizedTransmitAttempt() }
+        #endif
         guard await handler(action) else { return false }
         await completed(mutation)
         return true

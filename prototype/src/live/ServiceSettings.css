@@ -1,27 +1,57 @@
-.service-settings { display:grid; grid-template-columns:180px minmax(0,1fr); align-items:start; gap:24px; min-width:0; }
+/* Settings tokens: derived from the app palette (dark today); a light set follows :root[data-theme="light"]. */
+.service-settings { --settings-text:#e6edf6; --settings-muted:var(--secondary); --settings-divider:var(--border); --settings-accent:var(--cyan);
+  --settings-item-hover:rgba(166,182,202,.08); --settings-item-selected:rgba(53,200,245,.12); --settings-hint-bg:rgba(53,200,245,.06);
+  --settings-bar-bg:rgba(7,17,31,.94); --settings-dirty:var(--amber); --settings-saved:var(--teal); --settings-error:var(--error);
+  display:grid; grid-template-columns:200px minmax(0,1fr); align-items:start; gap:28px; min-width:0; color:var(--settings-text); }
+:root[data-theme="light"] .service-settings { color-scheme:light; --canvas:#f4f6f9; --panel:#ffffff; --control:#ffffff; --border:#d3dae4; --secondary:#4b5b6e;
+  --cyan:#0b6fa4; --teal:#0b7d61; --amber:#9a5f00; --error:#b42318; --settings-text:#17212d;
+  --settings-item-hover:rgba(23,33,45,.05); --settings-item-selected:rgba(11,111,164,.10); --settings-hint-bg:rgba(11,111,164,.06); --settings-bar-bg:rgba(244,246,249,.95); }
+:root[data-theme="light"] .service-settings button:not(.primary):hover { background:#eef2f7; border-color:#b6c2d0; }
+:root[data-theme="light"] .service-settings .primary { color:#ffffff; }
 .app.live.detached-settings-app { display:flex; flex-direction:column; width:100%; height:100dvh; min-height:0; padding:0; }
-.detached-settings-app > main { flex:1; min-width:0; min-height:0; width:100%; padding:12px; overflow:auto; }
+.detached-settings-app > main { flex:1; min-width:0; min-height:0; width:100%; padding:16px 20px 0; overflow:auto; }
 .detached-settings-app .service-settings .service-fields,
 .detached-settings-app .service-settings .service-credential,
 .detached-settings-app .service-settings .service-account-row,
 .detached-settings-app .service-settings .service-online-log { max-width:none; }
 .detached-settings-app .service-settings .service-account-row label { flex:1; }
 .service-settings [hidden] { display:none!important; }
-.service-tabs { position:sticky; top:0; min-width:0; padding-right:16px; border-right:1px solid var(--border); }
-.service-tabs [role="tablist"] { display:grid; gap:14px; }
-.service-tab-group { display:grid; gap:3px; }
-.service-tab-group > span { padding:0 8px 4px; color:var(--secondary); font-size:10px; font-weight:700; }
-.service-tabs button { width:100%; padding:7px 9px; border-color:transparent; background:transparent; text-align:left; font-weight:600; }
-.service-tabs button:hover { background:var(--raised); }
-.service-tabs button[aria-selected="true"] { border-color:var(--border); background:#123247; color:var(--cyan); }
-.service-tabs button:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
-.service-settings-content { min-width:0; }
-.service-settings [role="tabpanel"] { min-width:0; }
-.service-settings .service-security-note { margin-top:14px; font-size:11px; }
+/* Section menu */
+.service-tabs { position:sticky; top:0; min-width:0; padding:2px 16px 16px 0; border-right:1px solid var(--settings-divider); }
+.service-tabs [role="tablist"] { display:grid; gap:18px; }
+.service-tab-group { display:grid; gap:2px; }
+.service-tab-group > span { padding:0 10px 6px; color:var(--settings-muted); font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; opacity:.8; }
+.service-tabs button { position:relative; justify-content:flex-start; width:100%; min-height:30px; padding:6px 10px; border-color:transparent; border-radius:6px; background:transparent; color:var(--settings-text); text-align:left; font-weight:500; }
+.service-tabs button:hover { border-color:transparent; background:var(--settings-item-hover); }
+.service-tabs button[aria-selected="true"] { border-color:transparent; background:var(--settings-item-selected); color:var(--settings-accent); font-weight:650; }
+.service-tabs button[aria-selected="true"]::before { content:""; position:absolute; left:0; top:6px; bottom:6px; width:3px; border-radius:2px; background:var(--settings-accent); }
+.service-tabs button:focus-visible { outline:2px solid var(--settings-accent); outline-offset:1px; }
+/* Page */
+.service-settings-content { min-width:0; max-width:1040px; }
+.detached-settings-app .service-settings-content { max-width:none; }
+.service-settings [role="tabpanel"] { min-width:0; padding-bottom:16px; }
+.service-settings .service-page-header { padding:0 0 14px; margin-bottom:4px; border-bottom:1px solid var(--settings-divider); }
+.service-settings .service-page-header .service-page-title { margin:0 0 4px; color:var(--settings-text); font-size:18px; font-weight:650; line-height:1.25; }
+.service-settings .service-page-header p { margin:0; }
+.service-settings .service-settings-hint { margin:14px 0 0; padding:8px 12px; border-left:3px solid var(--settings-accent); border-radius:0 6px 6px 0; background:var(--settings-hint-bg); }
+.service-settings .service-security-note { margin-top:18px; padding-top:12px; border-top:1px solid var(--settings-divider); font-size:11px; }
 .service-settings fieldset { min-width:0; border:0; margin:0; padding:0; }
-.service-settings section { padding:16px 0; border-bottom:1px solid var(--border); }
-.service-settings section h2 { margin:0 0 8px; }
-.service-settings p { max-width:85ch; margin:0 0 10px; color:var(--secondary); }
+.service-settings section { padding:18px 0; border-bottom:1px solid var(--settings-divider); }
+.service-settings section h2 { margin:0 0 8px; color:var(--settings-text); font-size:14px; font-weight:650; }
+.service-settings p { max-width:85ch; margin:0 0 10px; color:var(--settings-muted); line-height:1.45; }
+/* Save bar: one place, at the end of the fields it saves, kept in view while scrolling. */
+.service-settings .service-save-bar { position:sticky; bottom:0; z-index:5; display:flex; align-items:center; justify-content:flex-end; gap:12px; margin-top:8px; padding:12px 0; border-top:1px solid var(--settings-divider); background:var(--settings-bar-bg); backdrop-filter:blur(6px); }
+.service-settings .service-save-bar .primary { min-width:150px; min-height:30px; }
+.service-settings .service-save-state { margin-right:auto; color:var(--settings-muted); font-size:12px; }
+.service-settings .service-save-state::before { content:""; display:inline-block; width:7px; height:7px; margin-right:7px; border-radius:50%; background:currentColor; vertical-align:1px; opacity:.85; }
+.service-settings .service-save-state[data-tone="idle"]::before { display:none; }
+.service-settings .service-save-state[data-tone="dirty"] { color:var(--settings-dirty); }
+.service-settings .service-save-state[data-tone="saved"] { color:var(--settings-saved); }
+.service-settings .service-save-state[data-tone="error"] { color:var(--settings-error); }
+/* Save feedback appears just above the save bar instead of at the top of the window. */
+.service-settings .settings-save-toast { top:auto; bottom:64px; }
+.service-settings .service-settings-recovery { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:14px 0 0; padding:12px; border:1px solid var(--settings-dirty); border-radius:8px; }
+.service-settings .service-settings-recovery p { flex-basis:100%; margin:0; }
 .service-settings .service-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; max-width:950px; }
 .service-settings .service-station-identity-fields { text-align:center; }
 .service-settings .service-station-identity-fields input:not([type="checkbox"]) { text-align:center; }
@@ -44,17 +74,18 @@
 .service-settings .service-account-row label:first-child { flex-basis:280px; }
 .service-settings .service-account-row button { flex:none; max-width:100%; }
 .service-settings .service-credential .service-credential-state { color:var(--secondary); }
-.service-settings .service-online-log { max-width:950px; margin-top:14px; padding:14px; border:1px solid var(--border); border-radius:10px; background:var(--raised); }
+.service-settings .service-online-log { max-width:950px; margin-top:14px; padding:14px; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
 .service-settings .service-online-log .service-settings-recovery { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:12px 0; padding:12px; border:1px solid var(--amber); border-radius:8px; }
 .service-settings .service-online-log .service-settings-recovery p { flex-basis:100%; }
 .service-settings .service-online-log .service-settings-recovery label { flex:1 1 100%; flex-direction:row; align-items:center; }
-.service-settings input:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+.service-settings input:focus-visible, .service-settings select:focus-visible { outline:2px solid var(--settings-accent); outline-offset:2px; }
 .service-radio-spot-colors { display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); gap:8px 14px; max-width:850px; margin:8px 0 16px; }
 .service-settings .service-radio-spot-colors label { flex-direction:row; align-items:center; justify-content:space-between; }
 .service-settings .service-radio-spot-colors input[type="color"] { width:52px; min-width:52px; height:32px; padding:2px; cursor:pointer; }
 @media(max-width:800px) {
   .service-settings { grid-template-columns:1fr; gap:12px; }
-  .service-tabs { position:static; overflow-x:auto; padding:0 0 10px; border-right:0; border-bottom:1px solid var(--border); }
+  .service-tabs { position:static; overflow-x:auto; padding:0 0 10px; border-right:0; border-bottom:1px solid var(--settings-divider); }
+  .service-tabs button[aria-selected="true"]::before { left:10px; right:10px; top:auto; bottom:0; width:auto; height:2px; }
   .service-tabs [role="tablist"] { display:flex; gap:5px; min-width:max-content; }
   .service-tab-group { display:flex; gap:4px; }
   .service-tab-group > span { display:none; }

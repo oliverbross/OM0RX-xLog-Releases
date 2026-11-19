@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import "./countryReferenceControl.css";
 
@@ -47,6 +48,6 @@ export default function CountryReferenceControl({ request, visible }: { request:
     <button type="button" disabled={busy || !url.trim()} onClick={() => void run("reference_country_download", { url: url.trim() })}>Check and download country pack</button>
     <button type="button" disabled={busy || !snapshot?.rollback_available} onClick={() => void run("reference_country_rollback")}>Restore previous country snapshot</button>
     <p>Imports and downloads use the same validator as the bundle. Invalid or incomplete packs retain the last usable snapshot. Snapshot rollback does not undo contact edits.</p>
-    {message && <p role="status">{message}</p>}
+    {message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}
   </section>;
 }

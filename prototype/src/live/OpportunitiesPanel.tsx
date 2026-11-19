@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { MapSpot } from "../MapSpots";
 import { useDocumentVisible } from "./useDocumentVisible";
@@ -276,7 +277,7 @@ export function OpportunitiesPanel({ request, onSelect, onDock, refresh = 0, hom
       </div>)}
       {!snapshot && <p>Loading live feeds…</p>}
     </div>
-    {error && <p className="opportunities-error" role="alert">{error}</p>}
+    {error && <ErrorNotice><p className="opportunities-error" role="alert">{error}</p></ErrorNotice>}
     <div className="opportunities-tabs" role="tablist" aria-label="Programme">{kinds.map((value, index) => <button type="button" key={value} role="tab" aria-selected={kind === value} tabIndex={kind === value ? 0 : -1}
       onClick={() => setPrefs(current => ({ ...current, kind: value }))} onKeyDown={event => {
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -290,7 +291,7 @@ export function OpportunitiesPanel({ request, onSelect, onDock, refresh = 0, hom
       <label>Mode<select value={mode} onChange={event => setPrefs(current => ({ ...current, mode: event.target.value }))}><option value="all">All modes</option>{modes.map(value => <option key={value}>{value}</option>)}</select></label>
       <label>Sort<select value={sort} onChange={event => setPrefs(current => ({ ...current, sort: event.target.value }))}><option value="newest">Newest</option><option value="callsign">Callsign</option><option value="reference">Reference</option><option value="frequency">Frequency</option><option value="unworked">Unworked first</option></select></label>
       <span aria-live="polite">{rows.length} matching · {snapshot.total_available} available</span></div>
-      {snapshot.history_state !== "ready" && <p className="opportunities-warning">Logbook history is unavailable; worked and confirmed labels are withheld.</p>}
+      {snapshot.history_state !== "ready" && <ErrorNotice when={true} title="Please check" noticeKey="live/OpportunitiesPanel.tsx:294"><p className="opportunities-warning">Logbook history is unavailable; worked and confirmed labels are withheld.</p></ErrorNotice>}
       <div className="opportunities-table-wrap" ref={tableRef}><table><colgroup>{visibleColumns.map(([id]) =>
         <col key={id} style={{ width: `${columnWidths[id] / totalColumnWidth * 100}%` }} />)}</colgroup><thead><tr>
         {visibleColumns.map(([id, label]) => <OpportunityColumnHeader key={id} column={id} label={label}

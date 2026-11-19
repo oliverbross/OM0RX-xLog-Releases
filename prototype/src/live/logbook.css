@@ -1,4 +1,14 @@
 .live-logbook { display: flex; flex: 1; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; height: 100%; container-type: inline-size; container-name: logbook-responsive; }
+.live-logbook:is(.is-table-only, .is-classic) { container-name: logbook-table-only; }
+.live-logbook.is-classic .live-logbook-table-wrap { background: #090d10; }
+.live-logbook.is-classic .live-logbook-table { border-collapse: collapse; font: 11px/1.15 ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.live-logbook.is-classic .live-logbook-table :is(th, td) { padding: 3px 5px; line-height: 16px; border-bottom: 1px solid #182027; }
+.live-logbook.is-classic .live-logbook-table th { color: #8e9aa4; background: #11171c; font-size: 9px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.live-logbook.is-classic .live-logbook-table tbody tr { height: 22px; color: #c5ced5; background: #090d10; }
+.live-logbook.is-classic .live-logbook-table tbody tr:hover { background: #17232d; box-shadow: inset 2px 0 #58b8e8; }
+.live-logbook.is-classic .live-logbook-table tbody tr[aria-selected="true"] { background: #183247; box-shadow: inset 2px 0 var(--cyan); }
+.live-logbook.is-classic .live-logbook-category { min-width: 0; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; font: inherit; }
+.live-logbook.is-classic .live-logbook-call { color: #dbe5ec; }
 .app.live.detached-logbook-app { display: flex; flex-direction: column; height: 100dvh; min-height: 0; padding: 0; }
 .detached-logbook-app > main { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; padding: 8px; overflow: auto; }
 .detached-logbook-app .live-logbook { height:auto; }

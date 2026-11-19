@@ -2,7 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import Foundation
+#if canImport(FoundationXML)
+import FoundationXML
+#endif
+#if os(Windows)
+private typealias RotorConnection = WindowsTCPConnection
+#else
 import Network
+private typealias RotorConnection = NWConnection
+#endif
 
 public struct GeoCoordinate: Codable, Equatable, Sendable {
     public var latitude: Double
@@ -427,7 +435,8 @@ public final class DCU1RotatorClient: @unchecked Sendable {
     private let onState: StateHandler
     private let onAzimuth: AzimuthHandler
     private let queue = DispatchQueue(label: "com.oliverbross.OM0RXXCat.rotator")
-    private var connection: NWConnection?
+    private var connection: RotorConnection?
+    private var ready = false
     private var pollTimer: DispatchSourceTimer?
     private var desiredRunning = false
     private var reconnectAttempt = 0
@@ -472,6 +481,7 @@ public final class DCU1RotatorClient: @unchecked Sendable {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        ready = false
         receiveBuffer = ""
         onState(.stopped, "Disconnected")
     }
@@ -491,7 +501,7 @@ public final class DCU1RotatorClient: @unchecked Sendable {
     private func sendCommand(_ command: String) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [weak self] in
-                guard let self, let connection = self.connection, case .ready = connection.state else {
+                guard let self, let connection = self.connection, self.ready else {
                     continuation.resume(throwing: XCatError.server("Rotator is not connected."))
                     return
                 }
@@ -506,29 +516,41 @@ public final class DCU1RotatorClient: @unchecked Sendable {
     private func connect(reconnecting: Bool) {
         guard desiredRunning, connection == nil,
               !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let nwPort = NWEndpoint.Port(rawValue: port) else {
+              port > 0 else {
             if desiredRunning { onState(.failed, "Enter the rotator TCP host and port") }
             return
         }
         onState(reconnecting ? .reconnecting : .connecting, reconnecting ? "Reconnecting to \(host):\(port)" : "Connecting to \(host):\(port)")
+        #if os(Windows)
+        let newConnection = RotorConnection(host: host, port: port, queue: queue)
+        #else
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let newConnection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        #endif
         connection = newConnection
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard let self, let newConnection, self.connection === newConnection else { return }
             switch state {
             case .ready:
+                self.ready = true
                 self.reconnectAttempt = 0
                 self.onState(.connected, "Connected to \(self.host):\(self.port)")
                 self.startPolling()
                 self.receive(on: newConnection)
             case let .failed(error):
                 self.handleDisconnect("Connection failed: \(error.localizedDescription)")
+            #if !os(Windows)
             case .cancelled:
                 if self.desiredRunning { self.handleDisconnect("Connection closed") }
             default: break
+            #endif
             }
         }
+        #if os(Windows)
+        newConnection.start()
+        #else
         newConnection.start(queue: queue)
+        #endif
     }
 
     private func handleDisconnect(_ message: String) {
@@ -537,6 +559,7 @@ public final class DCU1RotatorClient: @unchecked Sendable {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        ready = false
         guard desiredRunning else { return }
         reconnectAttempt += 1
         let delay = min(pow(2.0, Double(min(reconnectAttempt, 4))), 15.0)
@@ -549,7 +572,11 @@ public final class DCU1RotatorClient: @unchecked Sendable {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(pollMilliseconds), leeway: .milliseconds(20))
         timer.setEventHandler { [weak self] in
-            self?.connection?.send(content: Data(DCU1Protocol.pollCommand.utf8), completion: .idempotent)
+            guard let self, let active = self.connection else { return }
+            active.send(content: Data(DCU1Protocol.pollCommand.utf8), completion: .contentProcessed { [weak self, weak active] error in
+                guard let self, let active, self.connection === active, let error else { return }
+                self.handleDisconnect(error.localizedDescription)
+            })
         }
         pollTimer = timer
         timer.resume()
@@ -561,7 +588,7 @@ public final class DCU1RotatorClient: @unchecked Sendable {
         pollTimer = nil
     }
 
-    private func receive(on activeConnection: NWConnection) {
+    private func receive(on activeConnection: RotorConnection) {
         activeConnection.receive(minimumIncompleteLength: 1, maximumLength: 2_048) { [weak self, weak activeConnection] data, _, complete, error in
             guard let self, let activeConnection, self.connection === activeConnection else { return }
             if let data, !data.isEmpty { self.consume(data) }

@@ -15,6 +15,7 @@ public enum WorkspacePanelID: String, Codable, CaseIterable, Sendable {
     case stationIdentity = "station-identity", cw, alerts, propagation
     case settings, sync, awards, chaser = "chaser-dx"
     case spotHistory = "spot-history", monitor
+    case previousQSOs = "previous-qsos", kpa500, kat500
 
     fileprivate static let version1Cases: [Self] = [.activeQSO, .logQSO, .logbook, .intelligence, .rotor, .antenna,
         .worldMap, .bandMaps, .cluster, .stationControl, .stationStatus, .stationIdentity, .cw, .alerts,
@@ -24,6 +25,8 @@ public enum WorkspacePanelID: String, Codable, CaseIterable, Sendable {
         switch self {
         case .activeQSO: return (520, 240)
         case .intelligence: return (360, 240)
+        case .previousQSOs: return (280, 160)
+        case .kpa500, .kat500: return (200, 120)
         case .rotor, .antenna: return (240, 240)
         case .worldMap, .bandMaps, .cluster: return (280, 200)
         case .stationStatus, .stationIdentity, .propagation, .cw, .alerts: return (240, 80)
@@ -81,7 +84,7 @@ public struct WorkspaceLayoutPreset: Codable, Equatable, Sendable {
     }
 }
 public struct WorkspaceLayoutDocument: Codable, Equatable, Sendable {
-    public static let currentVersion = 2
+    public static let currentVersion = 3
     public var version: Int
     public var activePresetID: String
     public var presets: [WorkspaceLayoutPreset]
@@ -101,18 +104,19 @@ public struct WorkspaceLayoutDocument: Codable, Equatable, Sendable {
     }
 
     /// Schema upgrades preserve operator revisions and every existing placement.
-    /// Old backups remain readable; the next committed edit encodes version 2.
+    /// Old backups remain readable; the next committed edit encodes version 3.
     public func migratedToCurrentVersion() throws -> Self {
         if version == Self.currentVersion { try validate(); return self }
-        guard version == 1 else { throw WorkspaceLayoutError.invalid }
-        try validate(panelIDs: WorkspacePanelID.version1Cases)
+        guard version == 1 || version == 2 else { throw WorkspaceLayoutError.invalid }
+        let oldIDs = version == 1 ? WorkspacePanelID.version1Cases : WorkspacePanelID.version1Cases + [.spotHistory, .monitor]
+        try validate(panelIDs: oldIDs)
         var result = self
         result.version = Self.currentVersion
         for index in result.presets.indices {
-            for (offset, id) in [WorkspacePanelID.spotHistory, .monitor].enumerated() {
+            for (offset, id) in WorkspacePanelID.allCases.dropFirst(oldIDs.count).enumerated() {
                 result.presets[index].panels.append(WorkspacePanelLayout(id: id, placement: .hidden,
                     rect: WorkspaceRect(x: 0, y: 0, width: 640, height: 480),
-                    z: WorkspacePanelID.version1Cases.count + offset))
+                    z: oldIDs.count + offset))
             }
         }
         try result.validate()

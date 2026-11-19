@@ -9,6 +9,8 @@ import Crypto
 #endif
 #if os(macOS)
 import zlib
+#elseif os(Windows)
+import CZlibReference
 #endif
 
 public struct ReferenceDataValidator: Codable, Equatable, Sendable {
@@ -142,6 +144,8 @@ public actor ReferenceDataUpdater {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
+    public static let countryFilesURL = URL(string: "https://www.country-files.com/cty/cty.dat")!
+
     public static let activationSourceURLs: [ActivationReferenceKind: URL] = [
         .pota: URL(string: "https://pota.app/all_parks_ext.csv")!,
         .sota: URL(string: "https://www.sotadata.org.uk/summitslist.csv")!,
@@ -209,7 +213,7 @@ public actor ReferenceDataUpdater {
     /// removed or damaged since their last successful check.
     public func unavailableCachedSources(sources: Set<String>? = nil) -> Set<String> {
         var unavailable = Set<String>()
-        for (name, minimumBytes) in [("cty.xml", 10_000), ("lotw-user-activity.csv", 1_000)]
+        for (name, minimumBytes) in [("cty.dat", 10_000), ("cty.xml", 10_000), ("lotw-user-activity.csv", 1_000)]
             where sources?.contains(name) ?? true {
             if validatedCache(name: name, minimumBytes: minimumBytes) == nil { unavailable.insert(name) }
         }
@@ -298,6 +302,23 @@ public actor ReferenceDataUpdater {
         return state
     }
 
+    public func refreshCountryFiles() async throws -> ReferenceDataState {
+        let name = "cty.dat", url = Self.countryFilesURL
+        var state = currentState()
+        markAttempt(name, in: &state); try persist(state)
+        do {
+            let result = try await download(url, minimumBytes: 10_000, name: name,
+                validator: matchingValidator(state.validators[name], for: url))
+            state = currentState()
+            state.validators[name] = identified(result.validator, for: url)
+            state.activationBytes["cty"] = result.bytes
+            markSuccess(name, downloaded: result.downloaded, sourceVersion: result.sourceVersion, in: &state)
+            try persist(state); return state
+        } catch {
+            state = currentState(); markFailure(name, in: &state); try persist(state); throw error
+        }
+    }
+
     public func refreshLoTW(_ url: URL) async throws -> ReferenceDataState {
         var state = currentState()
         markAttempt("lotw-user-activity.csv", in: &state)
@@ -360,10 +381,11 @@ public actor ReferenceDataUpdater {
                 guard 200..<300 ~= http.statusCode,
                       (try? JSONSerialization.jsonObject(with: data)) != nil else { throw URLError(.cannotParseResponse) }
                 try Task.checkCancellation()
-                try data.write(to: destination, options: .atomic)
+                let changed = cached?.data != data || !(cached.map { cacheUnchanged($0, at: destination) } ?? false)
+                if changed { try data.write(to: destination, options: .atomic) }
                 result = DownloadResult(bytes: data.count,
                                         validator: mergedValidator(from: http, fallback: priorValidator),
-                                        downloaded: true,
+                                        downloaded: changed,
                                         sourceVersion: sourceVersion(from: http, payload: data, name: "wavelog-catalog.json"))
             }
         } catch {
@@ -546,6 +568,10 @@ public actor ReferenceDataUpdater {
             throw URLError(.cannotParseResponse)
         }
         let payload = decompressGzip && data.starts(with: [0x1f, 0x8b]) ? try gunzip(data) : data
+        if let cached, cached.data == payload, cacheUnchanged(cached, at: destination) {
+            return DownloadResult(bytes: payload.count, validator: mergedValidator(from: http, fallback: nil),
+                                  downloaded: false, sourceVersion: sourceVersion(from: http, payload: payload, name: name))
+        }
         let temporary = directory.appendingPathComponent(".\(name).download")
         try payload.write(to: temporary, options: .atomic)
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -555,14 +581,10 @@ public actor ReferenceDataUpdater {
             _ = try importCountryPack(payload)
         } else if name == "cty.xml" {
             try CountryReferencePack.withPublicationLock {
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
-                } else { try FileManager.default.moveItem(at: temporary, to: destination) }
+                try LocalFilePermissions.publishCache(at: temporary, to: destination)
             }
-        } else if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
         } else {
-            try FileManager.default.moveItem(at: temporary, to: destination)
+            try LocalFilePermissions.publishCache(at: temporary, to: destination)
         }
         return DownloadResult(bytes: payload.count,
                               validator: mergedValidator(from: http, fallback: effectiveValidator),
@@ -602,6 +624,8 @@ public actor ReferenceDataUpdater {
     private func validateReference(_ data: Data, name: String, xmlURL: URL) throws {
         if name == "country-reference-pack.json" {
             _ = try CTYResolver(countryPack: data)
+        } else if name == "cty.dat" {
+            _ = try CTYResolver(countryFiles: data)
         } else if name == "cty.xml" {
             // XML well-formedness alone is not enough: the resolver accepts an
             // empty document. Demand usable rules from three independent DXCC
@@ -666,22 +690,19 @@ public actor ReferenceDataUpdater {
         }
         try Task.checkCancellation()
 
-        if http.statusCode != 304 {
+        let changed = http.statusCode != 304 && (cached?.data != payload || !(cached.map { cacheUnchanged($0, at: destination) } ?? false))
+        if changed {
             let temporary = directory.appendingPathComponent(".\(kind.fileName).download")
             try payload.write(to: temporary, options: .atomic)
             defer { try? FileManager.default.removeItem(at: temporary) }
             try Task.checkCancellation()
-            if FileManager.default.fileExists(atPath: destination.path) {
-                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: destination)
-            }
+            try LocalFilePermissions.publishCache(at: temporary, to: destination)
         }
         return ActivationDownloadResult(
             bytes: payload.count,
             count: count,
             validator: mergedValidator(from: http, fallback: effectiveValidator),
-            downloaded: http.statusCode != 304,
+            downloaded: changed,
             sourceVersion: sourceVersion(from: http, payload: http.statusCode == 304 ? nil : payload,
                                          name: kind.fileName)
         )
@@ -780,6 +801,7 @@ public actor ReferenceDataUpdater {
             if let value = sanitizedSourceVersion(response.value(forHTTPHeaderField: header)) { return value }
         }
         guard let payload else { return nil }
+        if name == "cty.dat" { return (try? CTYResolver(countryFiles: payload))?.countryFilesVersion }
         if name.hasSuffix(".json"),
            let object = try? JSONSerialization.jsonObject(with: payload),
            let dictionary = object as? [String: Any] {
@@ -812,7 +834,7 @@ public actor ReferenceDataUpdater {
     }
 
     private func gunzip(_ data: Data) throws -> Data {
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         var stream = z_stream()
         guard inflateInit2_(&stream, 15 + 32, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
             throw URLError(.cannotDecodeContentData)
@@ -832,14 +854,13 @@ public actor ReferenceDataUpdater {
                     status = inflate(&stream, Z_NO_FLUSH)
                     return target.count - Int(stream.avail_out)
                 }
+                guard output.count <= 128 * 1024 * 1024 - produced else { throw URLError(.dataLengthExceedsMaximum) }
                 output.append(contentsOf: buffer.prefix(produced))
             } while status == Z_OK
             guard status == Z_STREAM_END else { throw URLError(.cannotDecodeContentData) }
             return output
         }
         #else
-        // The portable worker advertises only Wavelog catalogue refresh. Its
-        // JSON transport needs no gzip/CTY provider or extra native dependency.
         throw URLError(.cannotDecodeContentData)
         #endif
     }

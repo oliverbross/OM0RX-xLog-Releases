@@ -1,14 +1,15 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { compileCWMessage, compositionBoundary, describeCWPlan, type CompositionMode } from "./cwMessagePlan";
 import type { CWContext } from "./cwMacros";
 import type { CWComposeRequest, SharedCWState } from "./sharedCWSession";
 import "./CW.css";
 
-type Props = {context: CWContext; state: Partial<SharedCWState>; mode?: CompositionMode; disabled?: boolean;
+type Props = {context: CWContext; state: Partial<SharedCWState>; mode?: CompositionMode; disabled?: boolean; expanded?: boolean;
   compose: (request: CWComposeRequest) => Promise<boolean>; stop: () => Promise<void>};
 
 /** Deliberate local input only. Reopening, paste, IME and changed context never call drain. */
-export default function CWComposition({context, state, mode: initialMode = "word", disabled = false, compose, stop}: Props) {
+export default function CWComposition({context, state, mode: initialMode = "word", disabled = false, expanded, compose, stop}: Props) {
   const [mode, setMode] = useState<CompositionMode>(initialMode), [enabled, setEnabled] = useState(false);
   const [text, setText] = useState(""), [pendingText, setPendingText] = useState(""), [error, setError] = useState("");
   const [busy, setBusy] = useState(false), [uncertain, setUncertain] = useState("");
@@ -64,7 +65,7 @@ export default function CWComposition({context, state, mode: initialMode = "word
     await stop(); if(c.alive)resetJob();
   };
   const changeMode = (value:CompositionMode) => {setMode(value);control.current.enabled=false;setEnabled(false);control.current.staged=!!control.current.text;};
-  return <details className="cw-composition"><summary>CW workbench</summary>
+  return <details className="cw-composition" open={expanded}><summary hidden={expanded}>CW workbench</summary>
     <div className="cw-compose-options">
       <label>Typing mode<select value={mode} disabled={busy || control.current.append>0} onChange={e=>changeMode(e.target.value as CompositionMode)}>
         <option value="character">Character</option><option value="word">Word</option><option value="hybrid">First word live, then words</option>
@@ -89,13 +90,13 @@ export default function CWComposition({context, state, mode: initialMode = "word
       <button type="button" className="cw-stop" onClick={()=>void halt()}>Stop CW</button>
       <button type="button" disabled={busy} onClick={()=>{update("");control.current.staged=false;setError("");}}>Clear compose</button></div>
     {text && <div className="cw-compose-preview"><span>Preview</span><output>{preview}</output></div>}
-    {pendingText && <p role="status">Awaiting backend: <samp>{pendingText}</samp></p>}
+    {pendingText && <ErrorNotice><p role="status">Awaiting backend: <samp>{pendingText}</samp></p></ErrorNotice>}
     {state.composition?.accepted && <p>Backend accepted: <samp>{state.composition.accepted}</samp></p>}
     {state.composition && Number.isSafeInteger(state.composition.reportedCharacters) && state.composition.reportedCharacters! >= 0 && state.composition.reportedCharacters! <= state.composition.accepted.length &&
-      <p role="status">Radio reported: <samp>{state.composition.accepted.slice(0,state.composition.reportedCharacters!)}</samp> · {state.composition.reportedCharacters}/{state.composition.accepted.length} characters · RF not verified</p>}
+      <ErrorNotice><p role="status">Radio reported: <samp>{state.composition.accepted.slice(0,state.composition.reportedCharacters!)}</samp> · {state.composition.reportedCharacters}/{state.composition.accepted.length} characters · RF not verified</p></ErrorNotice>}
     {!state.capabilities?.composition && state.capabilities?.compositionReason && <p>{state.capabilities.compositionReason}</p>}
-    {uncertain && <p className="cw-error">Uncertain append: <samp>{uncertain}</samp></p>}
-    {error && <p className="cw-error" role="alert">{error}</p>}
+    {uncertain && <ErrorNotice><p className="cw-error">Uncertain append: <samp>{uncertain}</samp></p></ErrorNotice>}
+    {error && <ErrorNotice><p className="cw-error" role="alert">{error}</p></ErrorNotice>}
     <small>{state.capabilities?.composition ? "Only new committed typing streams. Paste, IME and tokens stay staged for Send. Hybrid resets for each new job." : "This output supports staged Send. Live typing needs a qualified append adapter."} Backend acceptance and keyer echo do not prove RF.</small>
   </details>;
 }

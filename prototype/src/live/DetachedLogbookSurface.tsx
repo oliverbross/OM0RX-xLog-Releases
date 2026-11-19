@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { workerRequest } from "../worker";
 import { LogbookPanel } from "./LogbookPanel";
@@ -70,11 +71,11 @@ export function DetachedLogbookSurface() {
   }, [edit.draft?.call, refresh]);
   return <div className="app live monitor-app detached-logbook-app">
     <main aria-label="Detached Logbook">
-      {error && <p className="live-error" role="alert">{error}</p>}
+      {error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
       <SpotActivationStatus status={spotEditor.status} error={spotEditor.error} reconcile={() => void spotEditor.reconcile()} />
       <ContactEditStatus state={edit} session={contacts} run={run} />
       <LogbookMutationStatus state={mutation} session={mutations} run={run} />
-      {edit.draft ? <Suspense fallback={<p role="status">Opening contact editor…</p>}><QSOEditor draft={edit.draft} setDraft={next => {
+      {edit.draft ? <Suspense fallback={<ErrorNotice><p role="status">Opening contact editor…</p></ErrorNotice>}><QSOEditor draft={edit.draft} setDraft={next => {
         if (!acceptsInput() || edit.locked || edit.workspaceChanged || deletionPending) return;
         const current = contacts.getSnapshot().draft;
         const value = changedCallDraft(current, typeof next === "function" ? next(current) : next);

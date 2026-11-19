@@ -24,3 +24,16 @@
 .voice-replace input { width: auto; }
 .voice-import input { max-width: 240px; }
 .voice-desk :is(button,input,select,summary):focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.voice-desk.macro-strip { display: flex; align-items: center; gap: 6px; height: 32px; margin: 0; padding: 0; border: 0; }
+.voice-desk.macro-strip .voice-controls { flex: 0 1 auto; min-width: 0; flex-wrap: nowrap; margin: 0; gap: 6px; }
+/* Override the QSO form's stacked labels only inside the compact voice row. */
+.voice-desk.macro-strip .voice-controls > label:first-child { display: flex; flex-direction: row; flex: 0 0 auto; min-width: 0; align-items: center; gap: 6px; white-space: nowrap; }
+.voice-desk.macro-strip .voice-controls > label:first-child select { flex: 0 0 160px; width: 160px; }
+.voice-desk.macro-strip :is(button, select) { box-sizing: border-box; height: 31px; min-height: 31px; }
+.voice-desk.macro-strip button { white-space: nowrap; font-size: 11px; padding: 4px 7px; }
+@container active-qso (max-width: 690px) {
+  .voice-desk.macro-strip { height: auto; min-height: 32px; }
+  .voice-desk.macro-strip .voice-controls { flex-wrap: wrap; flex: 1; }
+  .voice-desk.macro-strip .voice-controls > label:first-child { max-width: 100%; flex-shrink: 1; }
+  .voice-desk.macro-strip .voice-controls > label:first-child select { flex-shrink: 1; }
+}

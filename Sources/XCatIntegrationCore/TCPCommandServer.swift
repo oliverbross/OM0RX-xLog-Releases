@@ -1,4 +1,9 @@
+#if os(Windows)
+private typealias NWConnection = WindowsTCPConnection
+private typealias NWListener = WindowsTCPListener
+#else
 @preconcurrency import Network
+#endif
 import Foundation
 
 public final class TCPCommandServer: @unchecked Sendable {
@@ -52,12 +57,17 @@ public final class TCPCommandServer: @unchecked Sendable {
     // Scoped to the connection handling this command. The radio adapter calls
     // this only after authorization and before attempting a transmit write, so
     // denied/read-only commands cannot acquire another client's release duty.
+    #if !os(Windows)
     @TaskLocal fileprivate static var transmitAttemptObserver: (@Sendable () async -> Void)?
 
     public static func recordAuthorizedTransmitAttempt() async {
         await transmitAttemptObserver?()
     }
+    #endif
 
+    public typealias ClientHandlers = (command: Handler, disconnect: DisconnectHandler)
+    public typealias ClientFactory = @Sendable (UUID) -> ClientHandlers
+    private let clientFactory: ClientFactory?
     private let queue: DispatchQueue
     private let framing: Framing
     private let handler: Handler
@@ -69,7 +79,12 @@ public final class TCPCommandServer: @unchecked Sendable {
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var sessions: [ObjectIdentifier: ConnectionSession] = [:]
 
+    #if os(Windows)
+    public var boundPort: UInt16? { lock.withLock { listener?.port } }
+    #else
     public var boundPort: UInt16? { lock.withLock { listener?.port?.rawValue } }
+
+    #endif
 
     public init(
         label: String,
@@ -77,8 +92,10 @@ public final class TCPCommandServer: @unchecked Sendable {
         handler: @escaping Handler,
         transmitIntentResolver: @escaping TransmitIntentResolver = { _, _ in .none },
         onDisconnect: @escaping DisconnectHandler = { _ in },
+        clientFactory: ClientFactory? = nil,
         onEvent: @escaping EventHandler = { _ in }
     ) {
+        self.clientFactory = clientFactory
         queue = DispatchQueue(label: label)
         self.framing = framing
         self.handler = handler
@@ -88,6 +105,12 @@ public final class TCPCommandServer: @unchecked Sendable {
     }
 
     public func start(port: UInt16) throws {
+        #if os(Windows)
+        let newListener = try WindowsTCPListener(port: port, queue: queue)
+        lock.withLock { listener = newListener }
+        newListener.start { [weak self] client in self?.accept(client) }
+        onEvent("Listening on 127.0.0.1:\(newListener.port)")
+        #else
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
             throw XCatError.server("Invalid TCP port \(port).")
         }
@@ -127,6 +150,7 @@ public final class TCPCommandServer: @unchecked Sendable {
             }
             throw XCatError.server("Could not listen on 127.0.0.1:\(port): \(failure)")
         }
+        #endif
     }
 
     public func stop() {
@@ -151,11 +175,12 @@ public final class TCPCommandServer: @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
+        let handlers = clientFactory?(UUID())
         let session = ConnectionSession(
             framing: framing,
-            handler: handler,
+            handler: handlers?.command ?? handler,
             transmitIntentResolver: transmitIntentResolver,
-            onDisconnect: onDisconnect
+            onDisconnect: handlers?.disconnect ?? onDisconnect
         )
         let identifier = ObjectIdentifier(connection)
         let accepted = lock.withLock {
@@ -176,6 +201,7 @@ public final class TCPCommandServer: @unchecked Sendable {
                     await session.disconnectAndWait()
                     self?.removeSession(identifier)
                 }
+            #if !os(Windows)
             case .cancelled:
                 onEvent("Client disconnected")
                 self?.removeConnection(identifier)
@@ -185,9 +211,14 @@ public final class TCPCommandServer: @unchecked Sendable {
                 }
             default:
                 break
+            #endif
             }
         }
+        #if os(Windows)
+        connection.start()
+        #else
         connection.start(queue: queue)
+        #endif
         receive(on: connection, session: session)
     }
 
@@ -303,11 +334,15 @@ actor ConnectionSession {
             buffer.removeSubrange(...delimiterIndex)
             guard let command = String(data: commandData, encoding: .utf8) else { continue }
             inFlightCommands += 1
+            #if os(Windows)
+            let response = await handler(command)
+            #else
             let response = await TCPCommandServer.$transmitAttemptObserver.withValue({
                 await self.recordTransmitAttempt()
             }) {
                 await handler(command)
             }
+            #endif
             inFlightCommands -= 1
             switch transmitIntentResolver(command, response) {
             case .acquire: ownsTransmit = true

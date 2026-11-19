@@ -60,3 +60,41 @@ export function customDeskPreset(base: LayoutPreset, height: number, equipment?:
   place("band-maps", { x: 1112, y: top + 12, width: 808, height: preset.height - top - 12 });
   return preset;
 }
+
+/** Lay out complete rows in saved canvas coordinates. Taller desks scroll vertically
+ * when panel minimum sizes cannot fit within one screen. */
+export function tileDeskPanels(preset: LayoutPreset, viewportWidth: number, viewportHeight: number): LayoutPreset {
+  const visible = preset.panels.filter(panel => panel.placement === "canvas");
+  if (!visible.length) return preset;
+  const width = Math.round(Math.min(16384, Math.max(640, viewportWidth || preset.width)));
+  const availableHeight = Math.round(Math.min(16384, Math.max(480, viewportHeight || preset.height)));
+  const gap = 10;
+  const desired = Math.max(1, Math.round(Math.sqrt(visible.length * width / (availableHeight * 1.6))));
+  const rows: PanelLayout[][] = [];
+  let row: PanelLayout[] = [], minimumWidth = 0;
+  for (const panel of visible) {
+    const min = panelMinimum(panel.id)[0];
+    if (row.length && (row.length >= desired || minimumWidth + gap + min > width)) {
+      rows.push(row); row = []; minimumWidth = 0;
+    }
+    minimumWidth += min + (row.length ? gap : 0); row.push(panel);
+  }
+  rows.push(row);
+  const heights = rows.map(items => Math.max(...items.map(panel => panel.id === "active-qso" ? 412 : panelMinimum(panel.id)[1])));
+  const required = heights.reduce((sum, height) => sum + height, 0) + gap * (rows.length - 1);
+  const height = Math.max(availableHeight, required);
+  const extra = height - required;
+  const rectangles = new Map<PanelLayout["id"], LayoutRect>();
+  let y = 0;
+  rows.forEach((items, index) => {
+    const rowHeight = heights[index] + Math.floor(extra * (index + 1) / rows.length) - Math.floor(extra * index / rows.length);
+    const free = width - gap * (items.length - 1) - items.reduce((sum, panel) => sum + panelMinimum(panel.id)[0], 0);
+    let x = 0;
+    items.forEach((panel, column) => {
+      const panelWidth = panelMinimum(panel.id)[0] + Math.floor(free * (column + 1) / items.length) - Math.floor(free * column / items.length);
+      rectangles.set(panel.id, { x, y, width: panelWidth, height: rowHeight }); x += panelWidth + gap;
+    });
+    y += rowHeight + gap;
+  });
+  return { ...preset, width, height, panels: preset.panels.map(panel => ({ ...panel, rect: rectangles.get(panel.id) ?? panel.rect })) };
+}

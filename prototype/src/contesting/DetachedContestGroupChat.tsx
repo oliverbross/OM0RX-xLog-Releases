@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { contestChatMentionsOperator, contestGroupChatContextFromSearch, maxContestChatBytes,
   readContestGroupChat, sendContestGroupChat, requestContestGroupAuthority, type ContestGroupCoordination, type ContestGroupChatSnapshot } from "./contestGroupChat";
@@ -104,6 +105,6 @@ export function DetachedContestGroupChat() {
       <label><span className="sr-only">Message</span><input autoFocus aria-label="Message" value={draft}
       disabled={snapshot?.status !== "connected" || sending} onChange={event => setDraft(event.target.value)}
       maxLength={maxContestChatBytes} /></label><button type="submit" disabled={snapshot?.status !== "connected" || sending}>Send</button></form>
-    {error && <p className="contest-chat-error" role="alert">{error}</p>}
+    {error && <ErrorNotice><p className="contest-chat-error" role="alert">{error}</p></ErrorNotice>}
   </main>;
 }

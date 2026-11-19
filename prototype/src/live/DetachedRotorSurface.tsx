@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import RotorCompass from "./RotorCompass";
 import { connectRotorTelemetry } from "./rotorTelemetry";
@@ -108,10 +109,10 @@ export function DetachedRotorSurface() {
           onChange={event => { void changeAutomatic(event.target.checked); }} />Auto rotor</label>
       <button type="button" aria-label="Turn automatic rotor off" title="Disarm future automatic turns."
         onClick={() => { void changeAutomatic(false); }}>Off</button>
-      {enabled && !armed && <><span role="status">Auto rotor is paused after a stop or operating context change.</span>
+      {enabled && !armed && <><ErrorNotice><span role="status">Auto rotor is paused after a stop or operating context change.</span></ErrorNotice>
         <button type="button" disabled={!canArm || arming} onClick={() => { void changeAutomatic(true); }}>Resume Auto rotor</button></>}
     </div>
-    {!contestContext && (autoError || automatic.error) && <p className="live-error" role="alert">{autoError || automatic.error}</p>}</>;
+    {!contestContext && (autoError || automatic.error) && <ErrorNotice><p className="live-error" role="alert">{autoError || automatic.error}</p></ErrorNotice>}</>;
   const manualControls = <ManualRotorControl observation={{ available: current, snapshot }} target={target} session={manualSession}
       onManual={() => automatic.state?.armed ? automatic.set(false, undefined, true) : undefined}
       onPark={parkCurrent} hideHeading contestLayout={!!contestContext} onFeedback={contestContext ? reportContestMessage : undefined} />;
@@ -120,8 +121,8 @@ export function DetachedRotorSurface() {
     onBearingSelect={contestContext ? bearing => void turnFromCompass(bearing) : undefined}
     bearingSelectionDisabled={!current || manualState.busy || !!manualState.pending}
     readout={contestContext ? { call: target?.callsign ?? "NO TARGET", status: current ? "Observed rotor bearing" : "Rotor telemetry unavailable" } : undefined} />
-    {!contestContext && compassError && <p className="live-error" role="alert">{compassError}</p>}
-    {!contestContext && <div className="live-station-readback"><div><span role="status">{current ? "Observed bearing" : snapshot ? "Position unavailable or stale" : "No rotor observation available"}</span>
+    {!contestContext && compassError && <ErrorNotice><p className="live-error" role="alert">{compassError}</p></ErrorNotice>}
+    {!contestContext && <div className="live-station-readback"><div><ErrorNotice><span role="status">{current ? "Observed bearing" : snapshot ? "Position unavailable or stale" : "No rotor observation available"}</span></ErrorNotice>
       <strong>{validBearing ? `${rotor.azimuth.toFixed(1)}°` : "Unavailable"}</strong></div></div>}</div>;
   return <div className="app live detached-task-app detached-rotor-app"><main aria-label="Detached Rotor"><section
     className={`detached-rotor-observation${contestContext ? " is-contest-rotor" : ""}`} aria-label="Rotor state">

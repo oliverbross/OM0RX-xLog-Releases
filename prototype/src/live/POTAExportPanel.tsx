@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ADIFSessionOwner } from "./adifSessionOwner";
@@ -67,7 +68,7 @@ export function POTAExportPanel({ request, readScope, selection, onClose, onWork
     {preview && <><p>{preview.physicalContacts} physical contacts · {preview.includedContacts} included · {preview.derivedRecords} derived ADIF records · {preview.files.length} files</p>
       <table><thead><tr><th>Station</th><th>Own park</th><th>Location</th><th>Contacts / records</th></tr></thead><tbody>{preview.files.map(file => <tr key={file.filename}><td>{file.stationCall}</td><td>{file.ownPark}</td><td>{file.state || "Review subdivision if park crosses boundaries"}</td><td>{file.physicalContacts} / {file.derivedRecords}</td></tr>)}</tbody></table>
       {preview.warnings.map((warning, i) => <p key={i}>{warning}</p>)}
-      {preview.issues.length > 0 && <><p role="alert">{preview.issues.length} source contacts excluded from the valid subset (first 100 shown; every exclusion is retained in the manifest):</p><ul>{preview.issues.slice(0, 100).map(issue => <li key={issue.contactID}>{issue.contactID}: {issue.message}</li>)}</ul>
+      {preview.issues.length > 0 && <><ErrorNotice><p role="alert">{preview.issues.length} source contacts excluded from the valid subset (first 100 shown; every exclusion is retained in the manifest):</p></ErrorNotice><ul>{preview.issues.slice(0, 100).map(issue => <li key={issue.contactID}>{issue.contactID}: {issue.message}</li>)}</ul>
         <label><input type="checkbox" checked={subset} onChange={e => setSubset(e.target.checked)} />Export the displayed valid subset and retain these exclusions in the manifest</label></>}
       <p>{preview.rulesVersion} · captured {preview.capturedAt}</p>
       <label><input type="checkbox" checked={locationsReviewed} onChange={e => setLocationsReviewed(e.target.checked)} />I reviewed own park identities and the correct subdivision for parks spanning locations</label>
@@ -96,6 +97,6 @@ export function POTAExportPanel({ request, readScope, selection, onClose, onWork
         } catch (cause) { if (reading && owner.current === session) invalidate(); throw cause; }
         finally { release(); }
       })}>Save reviewed file set</button></>}
-    <button type="button" disabled={busy} onClick={() => { invalidate(); onClose(); }}>Close POTA export</button>{message && <p role="status">{message}</p>}
+    <button type="button" disabled={busy} onClick={() => { invalidate(); onClose(); }}>Close POTA export</button>{message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}
   </section>;
 }

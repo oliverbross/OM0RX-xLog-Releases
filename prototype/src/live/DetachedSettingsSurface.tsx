@@ -1,22 +1,26 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { lazy, Suspense, useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import ServiceSettings from "./ServiceSettings";
-import WorkspaceSettings from "./WorkspaceSettings";
 import { readSettingsJournal, SettingsSession, settingsDraftIsDirty } from "./settingsSession";
 import { connectSettingsChanges, requestSettings } from "./settingsTransport";
 import { useWorkspaceLayout } from "./useWorkspaceLayout";
 import { clearLegacyRotorConfiguration, legacyRotorConfiguration, readRotorConfigurationJournal,
   RotorConfigurationSession, rotorConfigurationDirty } from "./rotorConfigurationSession";
 import { connectRotorConfigurationChanges } from "./rotorConfigurationTransport";
+import { isTransientStartupReadFailure } from "./startupReadRecovery";
+import { isMacOS } from "./platform";
 
 const journalKey = "xlog.integration.settings.detached.v1";
 const rotorJournalKey = "xlog.integration.rotorConfiguration.detached.v1";
+const ClusterPanel = lazy(() => import("./ClusterPanel"));
 const SyncPanel = lazy(() => import("./SyncPanel"));
 const RotorPanel = lazy(() => import("./RotorPanel"));
-const availableTabs = ["Station", "Logbook", "Wavelog", "Sync", "Integrations", "QRZ", "Online logs", "Reference data", "Rotator", "Radio spots", "Display", "Workspace", "Backups", "Experimental"] as const;
+const WorkspaceSettings = lazy(() => import("./WorkspaceSettings"));
+const availableTabs = ["Station", "Logbook", "Wavelog", "Sync", "Integrations", "QRZ", "Online logs", "Reference data", "Rotator", "KPA500 & KAT500", "Radio spots", "Cluster", "Display", "Workspace", "Alerts", "Backups", "Experimental"] as const;
 export const detachedSettingsMethods = [
   "settings_load", "settings_receipt", "settings_save", "secret_status", "secret_save", "lookup_call",
-  "online_log_status", "online_log_configure",
+  "online_log_status", "online_log_configure", "online_log_reconcile",
   "workspace_rotor_configuration_load", "workspace_rotor_configuration_receipt", "workspace_rotor_configuration_save", "hamlib_models",
   "sync_status", "sync_summary", "sync_mutation", "sync_receipt",
   "reference_status", "reference_resolve", "reference_refresh", "reference_schedule", "reference_configure",
@@ -25,7 +29,7 @@ export const detachedSettingsMethods = [
   "remote_backup_request",
   "wsjtx_snapshot", "wsjtx_configure", "wsjtx_start", "wsjtx_stop",
   "spot_bridge_snapshot", "spot_bridge_configure",
-  "cluster_snapshot", "cluster_radio_spots_configure",
+  "cluster_snapshot", "cluster_radio_spots_configure", "cluster_configure", "cluster_connect", "cluster_disconnect", "cluster_password_set",
 ] as const;
 
 function storedJournal() {
@@ -36,7 +40,8 @@ function storedRotorJournal() {
 }
 
 export async function requestDetachedSettings(method: string, params: Record<string, unknown> = {}): Promise<any> {
-  if (!detachedSettingsMethods.includes(method as typeof detachedSettingsMethods[number]))
+  if (!detachedSettingsMethods.includes(method as typeof detachedSettingsMethods[number])
+    && !(isMacOS() && ["station_configuration", "station_configuration_save"].includes(method)))
     throw new Error("This operation is unavailable in the Settings window.");
   return requestSettings(method, params);
 }
@@ -55,18 +60,20 @@ export function DetachedSettingsSurface() {
   const rotorDirty = rotorConfigurationDirty(rotorState.base, rotorState.draft);
   const dirty = settingsDirty || rotorDirty;
   const reload = useCallback(() => {
-    void Promise.all([settingsSession.load(), rotorSession.load(legacyRotorConfiguration(localStorage))])
-      .then(() => clearLegacyRotorConfiguration(localStorage))
-      .catch(cause => setMessage(cause instanceof Error ? cause.message : "Settings could not be loaded."));
+    return Promise.all([settingsSession.load(), rotorSession.load(legacyRotorConfiguration(localStorage))])
+      .then(() => { clearLegacyRotorConfiguration(localStorage); setMessage(""); });
   }, [settingsSession, rotorSession]);
-  useEffect(() => { reload(); return connectSettingsChanges(reload, setMessage); }, [reload]);
-  useEffect(() => connectRotorConfigurationChanges(() => { void rotorSession.load(); }, setMessage), [rotorSession]);
+  const refresh = useCallback(() => { void reload().catch(cause => {
+    if (!isTransientStartupReadFailure(cause)) setMessage(cause instanceof Error ? cause.message : "Settings could not be loaded.");
+  }); }, [reload]);
+  useEffect(() => { refresh(); return connectSettingsChanges(reload, setMessage); }, [reload, refresh]);
+  useEffect(() => connectRotorConfigurationChanges(refresh, setMessage), [refresh]);
   const recover = (action: () => Promise<void> | void, fallback: string) => Promise.resolve().then(action)
     .catch(cause => setMessage(cause instanceof Error ? cause.message : fallback));
 
   return <div className="app live monitor-app detached-settings-app"><main aria-label="Detached Settings">
-    {message && <p className="live-error" role="alert">{message}</p>}
-    {!state.draft ? <p role="status">Loading Settings…</p> : <ServiceSettings
+    {message && <ErrorNotice when={true} title="Message"><p className="live-error" role="alert">{message}</p></ErrorNotice>}
+    {!state.draft ? <ErrorNotice><p role="status">Loading Settings…</p></ErrorNotice> : <ServiceSettings
       values={state.draft} savedValues={state.base?.settings} request={requestDetachedSettings}
       availableTabs={availableTabs} dirty={dirty} saving={state.saving} pending={!!state.pending}
       conflict={!!state.conflict} workspaceChanged={state.workspaceChanged} sessionError={state.error}
@@ -77,13 +84,14 @@ export function DetachedSettingsSurface() {
         setMessage(cause instanceof Error ? cause.message : "Saved Settings could not be restored.");
       } }}
       syncSettings={state.draft.logbookMode === "local" ? <p>Integrated-only mode. Wavelog synchronization is disabled. Choose Integrated logbook + Wavelog synchronization in Logbook to enable it.</p>
-      : <Suspense fallback={<p role="status">Loading synchronization tools…</p>}><SyncPanel request={requestDetachedSettings} onChanged={reload} journalKey="xlog.sync.mutation.settings.v1" /></Suspense>}
-      rotorSettings={<Suspense fallback={<p role="status">Loading Rotator settings…</p>}>
+      : <Suspense fallback={<ErrorNotice><p role="status">Loading synchronization tools…</p></ErrorNotice>}><SyncPanel request={requestDetachedSettings} onChanged={refresh} journalKey="xlog.sync.mutation.settings.v1" /></Suspense>}
+      clusterSettings={<Suspense fallback={<p>Loading cluster settings…</p>}><ClusterPanel snapshot={null} onRequest={requestDetachedSettings} onSelect={() => {}} settingsOnly /></Suspense>}
+      rotorSettings={<Suspense fallback={<ErrorNotice><p role="status">Loading Rotator settings…</p></ErrorNotice>}>
         <RotorPanel snapshot={null} request={requestDetachedSettings} configurationSession={rotorSession} configurationOnly />
       </Suspense>}
-      workspaceSettings={<WorkspaceSettings {...layout}
-        available={["active-qso", "callsign-intelligence", "world-map", "band-maps", "dx-cluster", "logbook", "awards", "chaser-dx", "spot-history"]} />}
+      workspaceSettings={<Suspense fallback={<ErrorNotice><p role="status">Loading workspace layouts…</p></ErrorNotice>}><WorkspaceSettings {...layout}
+        available={["active-qso", "callsign-intelligence", "world-map", "band-maps", "dx-cluster", "logbook", "awards", "chaser-dx", "spot-history"]} /></Suspense>}
       dataRequest={requestDetachedSettings} dataWorkspaceGeneration={state.snapshot?.generation ?? state.base?.generation}
-      onDataChanged={() => { reload(); void layout.session.refresh(); }} />}
+      onDataChanged={() => { refresh(); void layout.session.refresh(); }} />}
   </main></div>;
 }

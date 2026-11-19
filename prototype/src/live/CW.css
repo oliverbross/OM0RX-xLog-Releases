@@ -49,6 +49,21 @@
 .cw-keyer-feedback { margin: 5px 0; font-size: 11px; color: var(--secondary); overflow-wrap: anywhere; }
 .cw-desk-row { flex-wrap: wrap; }
 .cw-state, .cw-key-only { color: var(--secondary); }
+.macro-strip { margin: 0; padding: 0; border: 0; width: 100%; min-width: 0; }
+.macro-strip .cw-desk-row { flex-wrap: nowrap; height: 32px; }
+.macro-strip .cw-desk-row .cw-macro { flex: 1 1 0; max-width: none; }
+.macro-strip .cw-desk-row select { flex: 0 1 130px; }
+.macro-strip .macro-status { white-space: nowrap; font-size: 10px; margin-left: auto; }
+.macro-strip .cw-keyer-feedback { display: none; }
+@container active-qso (max-width: 690px) {
+  .macro-strip .cw-desk-row { height: auto; min-height: 32px; flex-wrap: wrap; }
+  .macro-strip .cw-desk-row .cw-macro { flex: 1 1 86px; max-width: 180px; }
+  .macro-strip .macro-status { margin-left: 0; }
+}
+.macro-workbench { width: min(640px,90vw); max-height: 80vh; overflow: auto; border: 1px solid #31526a; border-radius: 12px; padding: 20px; background: #0b1928; color: #e6edf6; box-shadow: 0 20px 80px #000a; }
+.macro-workbench::backdrop { background: #0008; }
+.macro-workbench > header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; color: #48daf5; }
+.macro-workbench button, .macro-workbench input, .macro-workbench select { background: #102237; color: #e6edf6; border: 1px solid #31526a; border-radius: 5px; padding: 6px 9px; }
 .cw-error { color: #ffb6b0; }
 .cw-recovery { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
 .cw-recovery label { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }

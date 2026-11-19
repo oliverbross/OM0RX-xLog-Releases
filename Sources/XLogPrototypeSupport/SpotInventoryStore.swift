@@ -1,7 +1,11 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
 import CSQLitePrototype
+#if os(Windows)
+import WinSDK
+#else
 import Darwin
+#endif
 
 /// Durable per-receipt updates; SQLite arbitrates separate replacement workers.
 /// The legacy JSON is retained as a recovery artifact and imported exactly once.
@@ -9,7 +13,12 @@ final class SpotInventoryStore {
     private var database: OpaquePointer?
     private let url: URL
     private let publisher = UUID().uuidString
-    private var publisherLock: Int32 = -1
+    #if os(Windows)
+    private typealias PublisherLock = HANDLE
+    #else
+    private typealias PublisherLock = Int32
+    #endif
+    private var publisherLock: PublisherLock?
     private static let publishersLock = NSLock()
     nonisolated(unsafe) private static var livePublishers = Set<String>()
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -25,6 +34,7 @@ final class SpotInventoryStore {
         do {
             try execute("PRAGMA journal_mode=WAL;")
             try execute("PRAGMA synchronous=FULL;")
+            try execute("CREATE TABLE IF NOT EXISTS flex_attempts (identity TEXT PRIMARY KEY, expires REAL NOT NULL);")
             try execute("CREATE TABLE IF NOT EXISTS receipts (key TEXT PRIMARY KEY, payload BLOB NOT NULL, accepted_at REAL NOT NULL);")
             try execute("CREATE INDEX IF NOT EXISTS receipts_age ON receipts(accepted_at);")
             try execute("CREATE TABLE IF NOT EXISTS migration (version INTEGER PRIMARY KEY CHECK(version=1));")
@@ -32,21 +42,78 @@ final class SpotInventoryStore {
             try execute("CREATE TABLE IF NOT EXISTS quarantined_deliveries (key TEXT PRIMARY KEY, payload BLOB NOT NULL, identity TEXT);")
             try execute("CREATE UNIQUE INDEX IF NOT EXISTS quarantined_delivery_identity ON quarantined_deliveries(identity) WHERE identity IS NOT NULL;")
             try execute("CREATE TABLE IF NOT EXISTS active_delivery_leases (identity TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, publisher TEXT NOT NULL, archive_identity TEXT);")
-            publisherLock = try openPublisherLock(publisher)
-            guard flock(publisherLock, LOCK_EX | LOCK_NB) == 0 else { throw failure() }
+            let descriptor = try openPublisherLock(publisher)
+            publisherLock = descriptor
+            guard try lockPublisher(descriptor) else { throw failure() }
             Self.publishersLock.withLock { _ = Self.livePublishers.insert(publisher) }
             try transaction { try recoverInactiveDeliveries() }
         } catch {
             Self.publishersLock.withLock { _ = Self.livePublishers.remove(publisher) }
-            if publisherLock >= 0 { close(publisherLock); publisherLock = -1 }
+            if let publisherLock { closePublisher(publisherLock); self.publisherLock = nil }
             sqlite3_close(database); database = nil; throw error
         }
     }
 
     deinit {
         Self.publishersLock.withLock { _ = Self.livePublishers.remove(publisher) }
-        if publisherLock >= 0 { close(publisherLock) }
+        if let publisherLock { closePublisher(publisherLock) }
         sqlite3_close(database)
+    }
+
+    /// Mark before sending. A restart must wait for the matching radio report
+    /// or expiry even if the previous worker lost the add acknowledgement.
+    func reserveFlexSpot(identity: String, lifetime: Int?, now: Date = Date()) throws -> Bool {
+        try transaction {
+            let time = now.timeIntervalSince1970
+            try statement("DELETE FROM flex_attempts WHERE expires <= ?;") { handle in
+                sqlite3_bind_double(handle, 1, time)
+                guard sqlite3_step(handle) == SQLITE_DONE else { throw failure() }
+            }
+            let prior = try statement("SELECT 1 FROM flex_attempts WHERE identity=?;") { handle in
+                bind(identity, to: 1, in: handle)
+                let result = sqlite3_step(handle)
+                guard result == SQLITE_ROW || result == SQLITE_DONE else { throw failure() }
+                return result == SQLITE_ROW
+            }
+            if let lifetime, !prior {
+                try statement("INSERT INTO flex_attempts VALUES(?,?);") { handle in
+                    bind(identity, to: 1, in: handle)
+                    sqlite3_bind_double(handle, 2, time + Double(lifetime) + 10)
+                    guard sqlite3_step(handle) == SQLITE_DONE else { throw failure() }
+                }
+            }
+            return prior
+        }
+    }
+
+    func refreshFlexSpot(identity: String, lifetime: Int) throws {
+        try statement("UPDATE flex_attempts SET expires=max(expires,?) WHERE identity=?;") { handle in
+            sqlite3_bind_double(handle, 1, Date().timeIntervalSince1970 + Double(lifetime) + 10)
+            bind(identity, to: 2, in: handle)
+            guard sqlite3_step(handle) == SQLITE_DONE, sqlite3_changes(database) == 1 else { throw failure() }
+        }
+    }
+
+    func finishFlexRemoval(identity: String) throws {
+        try statement("DELETE FROM flex_attempts WHERE identity=?;") { handle in
+            bind(identity, to: 1, in: handle)
+            guard sqlite3_step(handle) == SQLITE_DONE else { throw failure() }
+        }
+    }
+
+    func flexSource() throws -> String {
+        try transaction {
+            try execute("CREATE TABLE IF NOT EXISTS flex_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), token TEXT NOT NULL);")
+            try statement("INSERT OR IGNORE INTO flex_identity VALUES(1, ?);") { handle in
+                bind(UUID().uuidString, to: 1, in: handle)
+                guard sqlite3_step(handle) == SQLITE_DONE else { throw failure() }
+            }
+            return try statement("SELECT token FROM flex_identity WHERE singleton=1;") { handle in
+                guard sqlite3_step(handle) == SQLITE_ROW, let raw = sqlite3_column_text(handle, 0),
+                      let token = UUID(uuidString: String(cString: raw)) else { throw failure() }
+                return "xLog-" + token.uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
+            }
+        }
     }
 
     func migrate(_ legacy: () throws -> [(String, Data, TimeInterval)]) throws {
@@ -206,11 +273,44 @@ final class SpotInventoryStore {
         }
     }
 
-    private func openPublisherLock(_ token: String) throws -> Int32 {
+    private func closePublisher(_ descriptor: PublisherLock) {
+        #if os(Windows)
+        CloseHandle(descriptor)
+        #else
+        close(descriptor)
+        #endif
+    }
+
+    private func lockPublisher(_ descriptor: PublisherLock) throws -> Bool {
+        #if os(Windows)
+        var offset = OVERLAPPED()
+        if LockFileEx(descriptor, DWORD(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY), 0, 1, 0, &offset) { return true }
+        if GetLastError() == ERROR_LOCK_VIOLATION { return false }
+        #else
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return true }
+        if errno == EWOULDBLOCK || errno == EAGAIN { return false }
+        #endif
+        throw failure()
+    }
+
+    private func openPublisherLock(_ token: String) throws -> PublisherLock {
         guard UUID(uuidString: token) != nil else { throw failure() }
         let file = url.appendingPathExtension("publisher-" + token + ".lock")
+        #if os(Windows)
+        let descriptor = file.path.withCString(encodedAs: UTF16.self) {
+            CreateFileW($0, DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE), DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE),
+                        nil, DWORD(OPEN_ALWAYS), DWORD(FILE_FLAG_OPEN_REPARSE_POINT), nil)
+        }
+        guard let descriptor, descriptor != INVALID_HANDLE_VALUE else { throw failure() }
+        var info = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(descriptor, &info),
+              info.dwFileAttributes & DWORD(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0 else {
+            CloseHandle(descriptor); throw failure()
+        }
+        #else
         let descriptor = open(file.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw failure() }
+        #endif
         return descriptor
     }
 
@@ -231,11 +331,8 @@ final class SpotInventoryStore {
         for owner in owners where owner != publisher {
             if Self.publishersLock.withLock({ Self.livePublishers.contains(owner) }) { continue }
             let descriptor = try openPublisherLock(owner)
-            defer { close(descriptor) }
-            if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
-                guard errno == EWOULDBLOCK || errno == EAGAIN else { throw failure() }
-                continue
-            }
+            defer { closePublisher(descriptor) }
+            guard try lockPublisher(descriptor) else { continue }
             // A dead publisher cannot finish a new attempt. Retain all of its
             // outcomes before releasing admission, coalescing only new records.
             let abandoned: [(String, Data, String?)] = try statement("SELECT p.key,p.payload,l.archive_identity FROM pending_deliveries p JOIN active_delivery_leases l ON l.key=p.key WHERE l.publisher=?;") { handle in

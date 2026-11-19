@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export type RecorderConfig={inputId:string;outputId:string;channels:number;rate:number;mapping:string;roles:string[];routeVerified:boolean;preSeconds:number;postSeconds:number;reserveBytes:number;warningBytes:number};
 export type QTCRecorderReference={schema:1;sessionID:string;seriesID:string;itemIndex:number|null;operationID:string;event:"series_start"|"item"|"series_end"|"interruption"};
@@ -29,11 +29,13 @@ export async function listenToAudio(request:{logId:string;qsoId?:string;fromUtcM
   await read({action:"prepare",...request});await open();
 }
 export function useRecorderStatus(read:RecorderRead=recorderRequest){
-  const [state,setState]=useState<RecorderStatus|null>(null),[error,setError]=useState("");
+  const [state,setState]=useState<RecorderStatus|null>(null),[error,setError]=useState(""),latest=useRef<RecorderStatus|null>(null);latest.current=state;
   useEffect(()=>{let live=true,pending=false;
     const refresh=async()=>{if(pending)return;pending=true;try{const next=await read<RecorderStatus>({action:"status"});if(live){setState(next);setError("");}}catch(e){if(live)setError(String(e));}finally{pending=false;}};
     void refresh();const timer=setInterval(()=>{if(!document.hidden)void refresh();},1000);
-    const escape=(event:KeyboardEvent)=>{if(event.key==="Escape")void read({action:"stop_replay"}).catch(()=>{});};
+    // Escape stops a replay that is playing (or one we cannot rule out); it no
+    // longer sends a recorder request on every Escape while nothing plays.
+    const escape=(event:KeyboardEvent)=>{if(event.key==="Escape"&&(latest.current===null||latest.current.playback))void read({action:"stop_replay"}).catch(()=>{});};
     window.addEventListener("keydown",escape,true);
     return()=>{live=false;clearInterval(timer);window.removeEventListener("keydown",escape,true);};
   },[read]);return {state,error};

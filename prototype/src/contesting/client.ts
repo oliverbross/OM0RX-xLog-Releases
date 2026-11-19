@@ -105,7 +105,7 @@ function validExchangeField(value: unknown) {
   return !!v && exact(v, ["id", "label", "acceptedKinds", "required", "maximumUTF8Bytes", "adifField"]) &&
     text(v.id, 32) && /^[a-z][a-z0-9-]*$/.test(v.id as string) && text(v.label, 64) &&
     Array.isArray(v.acceptedKinds) && v.acceptedKinds.length > 0 && v.acceptedKinds.length <= 5 &&
-    v.acceptedKinds.every(x => ["operatorName", "subdivision", "dxccPrefix", "serialNumber", "gridSquare", "cqZone", "jarlPrefectureNumber", "power", "nonnegativeInteger", "locationText"].includes(String(x))) &&
+    v.acceptedKinds.every(x => ["operatorName", "subdivision", "dxccPrefix", "serialNumber", "gridSquare", "maidenheadGrid4", "cqZone", "jarlPrefectureNumber", "power", "nonnegativeInteger", "alphaToken", "locationText"].includes(String(x))) &&
     typeof v.required === "boolean" && uint(v.maximumUTF8Bytes) && (v.maximumUTF8Bytes as number) > 0 && (v.maximumUTF8Bytes as number) <= 64 &&
     (v.adifField === null || ["STX", "SRX", "NAME", "MY_NAME", "STATE", "MY_STATE", "GRIDSQUARE", "MY_GRIDSQUARE"].includes(String(v.adifField)));
 }

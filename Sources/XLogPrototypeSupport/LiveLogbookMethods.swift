@@ -50,6 +50,9 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     private let aggregateReadPhaseObserver: (@Sendable (String) -> Void)?
     private var database: LogbookDatabase?
     private var workspace: IntegrationWorkspace?
+    private var currentCountryCache: (source: String, resolver: CTYResolver)?
+    private var needsReferenceStamp: String?
+    private static let bundledCountryFiles = try? CTYResolver.bundledCountryFiles()
     private var ctyResolverCache: (source: String, resolver: CTYResolver)?
     private struct CountryCorrectionReview {
         let generation: String
@@ -65,6 +68,8 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     private var countryScansSuspended = 0
     private var countryScansRetired = false
     var beforeCountryScanReadForTesting: (@Sendable () async throws -> Void)?
+    var beforeCompanionBearingPublicationForTesting: (@Sendable () -> Void)?
+    private var chaseProgressCache: (key: String, completed: [String])?
     private var clusterClassificationCache: LiveClusterClassificationSnapshot?
     private var syncLease: LiveLogbookSyncLease?
     private var manualSyncActive: Bool { syncLease != nil }
@@ -77,7 +82,21 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     }
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
-    private var adifExport: (token: String, generation: String, created: Date, snapshot: ADIFExportSnapshot)?
+    /// An open export holds the stored records it selected, frozen at begin
+    /// and still undecoded; each page read decodes just its own contacts, so
+    /// no whole-log snapshot is built and content cannot change mid-export.
+    private var adifExport: (token: String, generation: String, created: Date, records: [Data])?
+    /// The last settings_load answer, shared by the several panels and native
+    /// owners that each read settings within the same second (about 90 reads a
+    /// minute, each re-reading storage and checking sync authorization). Any
+    /// request outside `settingsCacheKeepers` clears it, so a change is visible
+    /// on the next read; otherwise it lives at most `settingsCacheLifetime`.
+    private var settingsCache: (at: Date, generation: String, value: [String: Any])?
+    static let settingsCacheLifetime: TimeInterval = 1.5
+    private static let settingsCacheKeepers: Set<String> = [
+        "settings_load", "workspace_status", "logbook_operator_draft", "logbook_list", "logbook_previous",
+        "logbook_duplicate", "logbook_matrix", "lookup_call", "cluster_history", "sync_summary",
+        "workspace_layout_load", "workspace_preferences_load", "workspace_rotor_configuration_load", "logbook_chase_progress"]
     private var potaExport: (token: String, preview: POTAExportPreview)?
     private struct ADIFPreviewSession {
         let token: String
@@ -97,6 +116,11 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     }
     private var adifPreview: ADIFPreviewSession?
     private let transferSessionLifetime: TimeInterval
+    /// Export page reads: up to this many records, and fewer once the page's
+    /// estimated JSON frame (text counted twice for escaping, plus metadata)
+    /// would pass the byte budget, which stays under the host's 1 MiB cap.
+    static let adifExportPageRecordLimit = 100
+    static let adifExportPageByteBudget = 900_000
     private let transferSessionNow: @Sendable () -> Date
     private var transferSessionTimer: DispatchSourceTimer?
     var beforeTransferSessionUseForTesting: (@Sendable () -> Void)?
@@ -431,6 +455,74 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
         return query
     }
 
+    /// Source-only producer; deliberately not registered in worker dispatch.
+    /// Cold/unavailable owners fail without opening a database or creating identity.
+    /// Server/workspace/worker pairing and lease authority must be attached by a
+    /// separately reviewed companion host route before this can be advertised.
+    func passiveCompanionContactDetail(contactID: UUID, expectedGeneration: String) throws -> [String: Any] {
+        guard lock.try() else { throw WorkerFailure("workspace_busy", "Contact detail is temporarily unavailable.") }
+        defer { lock.unlock() }
+        let observedAt = Date()
+        guard let db = database else { throw WorkerFailure("workspace_unavailable", "The logbook owner is not ready.") }
+        try validateWorkspaceLocation()
+        guard !fileManager.fileExists(atPath: workspaceURL.appendingPathComponent(".restore-incomplete").path),
+              let generation = try storedEditGeneration(), generation == expectedGeneration else {
+            throw WorkerFailure("workspace_changed", "The contact owner changed.")
+        }
+        let authority = try db.aggregateReadAuthority()
+        let read = try db.companionContactDetail(localID: contactID)
+        let data = try CompanionContactDetail.encodeBounded(read)
+        let currentAuthority = try db.aggregateReadAuthority()
+        guard database === db, try storedEditGeneration() == generation,
+              currentAuthority.fileIdentity == authority.fileIdentity,
+              currentAuthority.revision == read.logRevision, authority.revision == read.logRevision,
+              !fileManager.fileExists(atPath: workspaceURL.appendingPathComponent(".restore-incomplete").path) else {
+            throw WorkerFailure("contact_changed", "The contact read changed before publication.")
+        }
+        try validateWorkspaceLocation()
+        guard let detail = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw invalid() }
+        return ["generation": generation, "generated_at_unix_ms": Int64(observedAt.timeIntervalSince1970 * 1000),
+                "max_age_ms": 5000, "detail": detail]
+    }
+
+    /// Source-only passive producer. The authenticated host must supply the
+    /// retained saved-origin grid and validate its identity binding on both
+    /// sides of this read before exposing geometry. No Settings/credential read,
+    /// reference construction, network, lazy database open or motion occurs here.
+    func passiveCompanionBearing(call: String, originGrid: String, expectedGeneration: String) throws -> [String: Any] {
+        guard lock.try() else { throw WorkerFailure("workspace_busy", "Bearing is temporarily unavailable.") }
+        defer { lock.unlock() }
+        let began = Date()
+        guard let db = database else { throw WorkerFailure("workspace_unavailable", "The logbook owner is not ready.") }
+        try validateWorkspaceLocation()
+        guard !fileManager.fileExists(atPath: workspaceURL.appendingPathComponent(".restore-incomplete").path),
+              let generation = try storedEditGeneration(), generation == expectedGeneration else {
+            throw WorkerFailure("workspace_changed", "The bearing owner changed.")
+        }
+        let authority = try db.companionBearingAuthority()
+        let stamp = needsReferenceStamp
+        let resolver = stamp != nil && stamp == needsReferenceFilesStamp() ? currentCountryCache?.resolver : nil
+        let read = try db.companionBearingGrid(call: call)
+        let bearing = try CompanionBearing.project(call: call, originGrid: originGrid, read: read, resolver: resolver, at: began)
+        let data = try bearing.encoded()
+        beforeCompanionBearingPublicationForTesting?()
+        guard database === db, try storedEditGeneration() == generation,
+              !fileManager.fileExists(atPath: workspaceURL.appendingPathComponent(".restore-incomplete").path),
+              try db.companionBearingAuthority() == authority, authority.revision == read.logRevision else {
+            throw WorkerFailure("bearing_changed", "The bearing inputs changed.")
+        }
+        if let revision = bearing.referenceRevision {
+            guard currentCountryCache?.resolver.snapshotIdentity == revision,
+                  stamp == needsReferenceStamp, stamp == needsReferenceFilesStamp() else {
+                throw WorkerFailure("bearing_changed", "The bearing reference changed.")
+            }
+        }
+        try validateWorkspaceLocation()
+        guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw invalid() }
+        return ["generation": generation, "generated_at_unix_ms": Int64(began.timeIntervalSince1970 * 1000),
+                "max_age_ms": 5000, "bearing": payload]
+    }
+
     func aggregateReadOwner(expectedGeneration: String? = nil) throws -> LiveLogbookAggregateOwner {
         try lock.withLock {
             if let expectedGeneration {
@@ -529,7 +621,7 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                     guard query.selectionCount == nil || query.selectionCount == value.contacts.count else { throw WorkerFailure("export_selection_changed","A selected contact is no longer available. Select it again.") }
                     let token=UUID().uuidString
                     guard let snapshot=exportSnapshot, snapshot.records.count == value.contacts.count else { throw LogbookDatabaseError.corruptRecord }
-                    adifExport=(token,owner.generation,transferSessionNow(),snapshot); potaExport=nil
+                    adifExport=(token,owner.generation,transferSessionNow(),try owner.database.encodeExportRecords(value.contacts)); potaExport=nil
                     scheduleTransferSessionExpiryLocked()
                     response=["token":token,"total":snapshot.records.count]
                 } else {
@@ -847,6 +939,21 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     }
 
     private func currentCTYResolverSnapshot() throws -> (source: String, resolver: CTYResolver) {
+        let stamp = needsReferenceFilesStamp()
+        defer { needsReferenceStamp = stamp == needsReferenceFilesStamp() ? stamp : nil }
+        let base = try baseCTYResolverSnapshot()
+        let file = workspaceURL.appendingPathComponent("Reference Data/cty.dat")
+        let attributes = try? fileManager.attributesOfItem(atPath: file.path)
+        let source = "\(workspaceURL.path)|\(base.resolver.snapshotIdentity)|\(attributes?[.systemFileNumber] ?? "")|\(attributes?[.size] ?? "")|\((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        if let cached = currentCountryCache, cached.source == source { return cached }
+        let downloaded = (try? Data(contentsOf: file)).flatMap { try? CTYResolver(countryFiles: $0) }
+        let current = downloaded ?? Self.bundledCountryFiles
+        let resolver = current.map { base.resolver.supplemented(withCountryFiles: $0) } ?? base.resolver
+        currentCountryCache = (source, resolver)
+        return (source, resolver)
+    }
+
+    private func baseCTYResolverSnapshot() throws -> (source: String, resolver: CTYResolver) {
         _ = try readyDatabase()
         let referenceDirectory = workspaceURL.appendingPathComponent("Reference Data")
         let preferXML = try CountryReferenceSelection.read(directory: referenceDirectory)?.source == .clubLogXML
@@ -898,6 +1005,31 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
         guard lock.try() else { return nil }
         defer { lock.unlock() }
         return try? currentCTYResolverSnapshot().resolver
+    }
+
+    // No database open, reference parsing, full contact scan, or blocking on
+    // the foreground settings lock on the optional decoded-needs path.
+    func validateRetainedNeedsOwner(_ owner: LiveLogbookAggregateOwner, reference: String, expires: Date) async -> Bool {
+        await awaitRetainedNeedsValidation(expires: expires) {
+            self.retainedNeedsOwnerValidation(owner, reference: reference)
+        }
+    }
+
+    private func retainedNeedsOwnerValidation(_ owner: LiveLogbookAggregateOwner, reference: String) -> RetainedNeedsValidation {
+        guard lock.try() else { return .busy }
+        defer { lock.unlock() }
+        guard database != nil, currentCountryCache?.resolver.snapshotIdentity == reference,
+              let stamp = needsReferenceStamp, stamp == needsReferenceFilesStamp() else { return .invalid }
+        return (try? validateAggregateOwner(owner)) != nil ? .current : .invalid
+    }
+
+    private func needsReferenceFilesStamp() -> String {
+        let root = workspaceURL.appendingPathComponent("Reference Data")
+        return ["cty.dat", "cty.xml", "country-reference-pack.json", "country-reference-pack.previous.json",
+                CountryReferenceSelection.fileName].map { name in
+            let values = try? fileManager.attributesOfItem(atPath: root.appendingPathComponent(name).path)
+            return "\(name)|\(values?[.systemFileNumber] ?? "")|\(values?[.size] ?? "")|\((values?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        }.joined(separator: ";")
     }
 
     /// The existing immutable aggregate reader keeps country scans off the
@@ -1103,6 +1235,61 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     }
 
     public func handle(method: String, params: [String: Any]) throws -> [String: Any] {
+        if !Self.settingsCacheKeepers.contains(method) { lock.withLock { settingsCache = nil } }
+        if method == "logbook_companion_bearing" {
+            try requireKeys(params, allowed: ["callsign", "originGrid", "generation"], required: ["callsign", "originGrid", "generation"])
+            guard let call = params["callsign"] as? String, CompanionBearing.normalizedCall(call) != nil,
+                  let rawGrid = params["originGrid"] as? String, let grid = CompanionBearing.normalizedGrid(rawGrid),
+                  let generation = params["generation"] as? String, UUID(uuidString: generation) != nil else { throw invalid() }
+            return try passiveCompanionBearing(call: call, originGrid: grid, expectedGeneration: generation)
+        }
+        if method == "logbook_companion_contact_detail" {
+            try requireKeys(params, allowed: ["contactID", "generation"], required: ["contactID", "generation"])
+            guard let raw = params["contactID"] as? String, let id = UUID(uuidString: raw),
+                  raw == id.uuidString.lowercased(),
+                  let generation = params["generation"] as? String, UUID(uuidString: generation) != nil else { throw invalid() }
+            return try passiveCompanionContactDetail(contactID: id, expectedGeneration: generation)
+        }
+        if method == "logbook_chase_progress" {
+            return try lock.withLock {
+                try requireKeys(params, allowed: ["targets"], required: ["targets"])
+                guard let targets = params["targets"] as? [[String: Any]], targets.count <= 32 else { throw invalid() }
+                let database = try readyDatabase()
+                let serialized = try JSONSerialization.data(withJSONObject: targets, options: [.sortedKeys])
+                guard serialized.count <= 65_536 else { throw invalid() }
+                let key = "\(try editGeneration())|\(try database.currentRevision())|\(serialized.base64EncodedString())"
+                if let cached = chaseProgressCache, cached.key == key { return ["completed": cached.completed] }
+                func exactMode(_ raw: String) -> String {
+                    let mode = SpotLogic.normalizedMode(raw)
+                    if ["CWR", "CWL", "CWU"].contains(mode) { return "CW" }
+                    if ["DIGU", "DIGL", "DIGI"].contains(mode) { return "DATA" }
+                    return mode
+                }
+                var completed: [String] = []
+                var workedByCall: [String: Set<String>] = [:]
+                for target in targets {
+                    guard let id = target["id"] as? String, id.range(of: #"^[a-z0-9-]{1,64}$"#, options: .regularExpression) != nil,
+                          let call = target["call"] as? String, call.range(of: #"^[A-Z0-9/]{2,24}$"#, options: .regularExpression) != nil,
+                          let bands = target["bands"] as? [String], bands.count <= 13,
+                          let modes = target["modes"] as? [String], modes.count <= 12 else { throw invalid() }
+                    let worked: Set<String>
+                    if let cached = workedByCall[call] { worked = cached }
+                    else {
+                        worked = Set(try database.historyRows(call: call, adif: nil)
+                            .filter { $0.deletedAt == nil && $0.call.uppercased() == call }
+                            .map { "\($0.band.lowercased())|\(exactMode($0.submode.isEmpty ? $0.mode : $0.submode))" })
+                        workedByCall[call] = worked
+                    }
+                    for band in bands { for mode in modes {
+                        if worked.contains("\(band)|\(mode)") {
+                            completed.append("\(id)|\(band)|\(mode)")
+                        }
+                    }}
+                }
+                chaseProgressCache = (key, completed)
+                return ["completed": completed]
+            }
+        }
         if method == "logbook_operator_draft_apply" { return try handleOperatorDraftApply(params: params) }
         return try lock.withLock {
             if method.hasPrefix("spot_draft_") { return try handleSpotDraft(method: method, params: params) }
@@ -1282,8 +1469,12 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 let limit = try integer(params, "limit", default: 20, range: 1...25)
                 let offset = try integer(params, "offset", default: 0, range: 0...Int(Int32.max))
                 let source = try currentCTYResolverSnapshot()
+                // "bundled" only when neither a downloaded country pack/XML nor a
+                // downloaded cty.dat is in use (the bundled cty.dat always supplements).
+                let downloadedCTY = fileManager.fileExists(atPath: workspaceURL.appendingPathComponent("Reference Data/cty.dat").path)
+                let bundled = try baseCTYResolverSnapshot().source == "bundled" && !downloadedCTY
                 return ["preview": try json(readyDatabase().pjCorrectionPreview(resolver: source.resolver, limit: limit, offset: offset)),
-                        "source": source.source == "bundled" ? "bundled" : "downloaded",
+                        "source": bundled ? "bundled" : "downloaded",
                         "read_only": true]
             case "logbook_list":
                 return try synchronousAggregate(method: method, params: params)
@@ -1374,6 +1565,44 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                     throw WorkerFailure("callsign_present","Your entered callsign is retained.")
                 }
                 let next = try OperatorDraftNearbyCallsign.applying(to:current.qso,callsign:callsign)
+                let mutation = OperatorDraftMutation(operationID:operationID,draftID:draftID,expectedRevision:Int64(revision),action:.replace,qso:next)
+                let receipt = try db.applyOperatorDraft(mutation,nextDraft:current.qso)
+                return ["status":"applied","receipt":try scopedReceipt(receipt,field:"draft",generation:generation)]
+            case "logbook_operator_draft_follow_call":
+                // The native WSJT-X follower: the station a digital engine (Nexus,
+                // WSJT-X) is working becomes the Active QSO call. It fills an empty
+                // call, or replaces only the call it filled itself, never typing.
+                try requireKeys(params, allowed: ["operationID","draftID","expectedRevision","generation","callsign","grid","replacing"],
+                                required: ["operationID","draftID","expectedRevision","generation","callsign"])
+                let generation = try editGeneration()
+                if try !matchesEditGeneration(params, generation) { return ["status":"workspace_changed","generation":generation] }
+                guard let operationText = params["operationID"] as? String, let operationID = UUID(uuidString:operationText),
+                      let draftText = params["draftID"] as? String, let draftID = UUID(uuidString:draftText),
+                      let callsign = try string(params,"callsign",max:32),
+                      callsign.range(of: #"^[A-Z0-9/\-]{3,32}$"#, options:.regularExpression) != nil else { throw invalid() }
+                let grid = try string(params,"grid",max:6) ?? ""
+                guard grid.isEmpty || grid.range(of: #"^[A-R]{2}[0-9]{2}([A-X]{2})?$"#, options:.regularExpression) != nil else { throw invalid() }
+                let replacing = (try string(params,"replacing",max:32) ?? "").uppercased()
+                let revision = try integer(params,"expectedRevision",default:-1,range:0...9_007_199_254_740_990)
+                let db = try readyDatabase()
+                if let receipt = try db.operatorDraftReceipt(operationID:operationID) {
+                    guard receipt.mutation.draftID == draftID, receipt.mutation.expectedRevision == Int64(revision),
+                          receipt.mutation.action == .replace, receipt.mutation.qso?.call == callsign else { throw OperatorDraftError.operationReused }
+                    return ["status":"applied","receipt":try scopedReceipt(receipt,field:"draft",generation:generation)]
+                }
+                guard !db.spotDraftActivationActive else { throw WorkerFailure("spot_activation_busy","Wait for the current draft operation.") }
+                let current = try db.operatorDraft(initial:newOperatorDraft())
+                guard current.qso.id == draftID, current.revision == Int64(revision) else {
+                    return ["status":"conflict","draft":try scopedSnapshot(current,generation:generation)]
+                }
+                let present = current.qso.call.trimmingCharacters(in:.whitespacesAndNewlines).uppercased()
+                guard present.isEmpty || (!replacing.isEmpty && present == replacing) else {
+                    throw WorkerFailure("callsign_present","Your entered callsign is retained.")
+                }
+                var next = current.qso
+                next.call = callsign
+                if !grid.isEmpty, next.gridSquare.isEmpty || !present.isEmpty { next.gridSquare = grid }
+                else if !present.isEmpty { next.gridSquare = "" }
                 let mutation = OperatorDraftMutation(operationID:operationID,draftID:draftID,expectedRevision:Int64(revision),action:.replace,qso:next)
                 let receipt = try db.applyOperatorDraft(mutation,nextDraft:current.qso)
                 return ["status":"applied","receipt":try scopedReceipt(receipt,field:"draft",generation:generation)]
@@ -1491,6 +1720,18 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 let generation = try editGeneration()
                 let contact = try readyDatabase().contactSnapshot(localID: id)
                 return ["contact": try contact.map { try scopedSnapshot($0, generation: generation) } ?? NSNull(), "generation": generation]
+            case "logbook_duplicates":
+                // Whole-log exact duplicates (same call, start second, band, mode).
+                // Read-only: removing one stays with the logbook's own delete.
+                try requireKeys(params, allowed: ["limit"])
+                let limit = try integer(params, "limit", default: 200, range: 1...1_000)
+                let groups = try readyDatabase().exactDuplicateGroups(limit: limit)
+                let formatter = ISO8601DateFormatter()
+                return ["groups": groups.map { group in
+                    ["call": group.call, "start": formatter.string(from: Date(timeIntervalSince1970: group.start)),
+                     "band": group.band, "mode": group.mode,
+                     "contact_ids": group.contactIDs.map { $0.uuidString.lowercased() }] as [String: Any]
+                }, "group_count": groups.count, "truncated": groups.count >= limit]
             case "logbook_data_quality":
                 try requireKeys(params, allowed: ["contactID", "generation", "expectedRevision", "conflictID"],
                                 required: ["contactID", "generation", "expectedRevision"])
@@ -1591,6 +1832,66 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                     "contact_id": followUp.contactID.uuidString, "contact_revision": followUp.contactRevision,
                     "uploads": uploads, "confirmations": confirmations,
                     "award_impact": followUp.awardImpact.rawValue, "sponsor_credit": NSNull()]]
+            case "logbook_companion_history":
+                try requireKeys(params, allowed: ["callsign", "generation", "band", "mode"], required: ["callsign", "generation"])
+                guard let call = params["callsign"] as? String,
+                      call.range(of: #"^[A-Z0-9/\-]{1,32}$"#, options: .regularExpression) != nil else { throw invalid() }
+                let band = params["band"] as? String, mode = params["mode"] as? String
+                if params["band"] != nil {
+                    guard let band, band.utf8.count <= 16,
+                          band.lowercased().range(of: #"^[0-9]{1,4}(\.[0-9]{1,3})?(m|cm|mm)$"#, options: .regularExpression) != nil else { throw invalid() }
+                }
+                if params["mode"] != nil {
+                    guard band != nil, let mode,
+                          mode.range(of: #"^[A-Z0-9][A-Z0-9-]{0,19}$"#, options: .regularExpression) != nil else { throw invalid() }
+                }
+                let generation = try editGeneration()
+                if try !matchesEditGeneration(params, generation) { return ["status": "workspace_changed", "generation": generation] }
+                let observedAt = Date()
+                let read = try readyDatabase().companionLogbookRead(call:call)
+                let currentGeneration = try editGeneration()
+                guard currentGeneration == generation else { return ["status":"workspace_changed", "generation":currentGeneration] }
+                return CompanionHistoryProjection.history(read, call:call, generation:generation, requestedBand:band, requestedMode:mode, now:observedAt)
+            case "logbook_companion_recent":
+                try requireKeys(params, allowed:["generation"], required:["generation"])
+                let generation = try editGeneration()
+                if try !matchesEditGeneration(params, generation) { return ["status":"workspace_changed", "generation":generation] }
+                let observedAt = Date()
+                let read = try readyDatabase().companionLogbookRead()
+                let currentGeneration = try editGeneration()
+                guard currentGeneration == generation else { return ["status":"workspace_changed", "generation":currentGeneration] }
+                return CompanionHistoryProjection.recent(read, generation:generation, now:observedAt)
+            case "logbook_companion_receipt":
+                try requireKeys(params, allowed: ["operationID", "generation"], required: ["operationID", "generation"])
+                guard let text = params["operationID"] as? String, let id = UUID(uuidString: text) else { throw invalid() }
+                let generation = try editGeneration()
+                if try !matchesEditGeneration(params, generation) { return ["status": "workspace_changed", "generation": generation] }
+                let db = try readyDatabase()
+                let receipt = try db.companionReceipt(operationID: id)
+                return ["receipt": try receipt.map { try json($0) } ?? NSNull(),
+                        "logbook_revision": try db.aggregateReadAuthority().revision]
+            case "logbook_companion_apply":
+                try requireKeys(params, allowed: ["operationID", "generation", "qso", "expectedRevision"], required: ["operationID", "generation", "qso"])
+                guard let text = params["operationID"] as? String, let id = UUID(uuidString: text),
+                      let object = params["qso"] as? [String: Any] else { throw invalid() }
+                try requireKeys(object, allowed: ["contact_id", "callsign", "band", "mode", "started_at_unix_ms", "frequency_hz", "rst_sent", "rst_received", "grid", "comment"],
+                    required: ["contact_id", "callsign", "band", "mode", "started_at_unix_ms", "rst_sent", "rst_received", "grid", "comment"])
+                let generation = try editGeneration()
+                if try !matchesEditGeneration(params, generation) { return ["status": "workspace_changed", "generation": generation] }
+                // Escaping a valid 4096-byte comment can double its wire size.
+                // CompanionQSO still enforces every decoded field limit.
+                guard JSONSerialization.isValidJSONObject(object), try JSONSerialization.data(withJSONObject: object).count <= 16 * 1024 else { throw invalid() }
+                let draft: CompanionQSO = try decode(object)
+                let revision: Int64? = params["expectedRevision"] == nil ? nil : Int64(try integer(params, "expectedRevision", default: -1, range: 1...9_007_199_254_740_990))
+                do {
+                    let initial = revision == nil ? try newOperatorDraft() : nil
+                    let db = try readyDatabase()
+                    let receipt = try db.applyCompanionContact(operationID: id, draft: draft, expectedRevision: revision, initial: initial)
+                    return ["status": "applied", "receipt": try json(receipt),
+                            "logbook_revision": try db.aggregateReadAuthority().revision]
+                } catch LogbookContactError.conflict { return ["status": "rejected", "message": "Contact already exists or revision changed."] }
+                  catch LogbookContactError.operationReused { return ["status": "rejected", "message": "Companion operation ID already belongs to a different immutable draft."] }
+                  catch LogbookContactError.invalid { return ["status": "rejected", "message": "Companion draft is invalid; review the contact in xLog."] }
             case "logbook_contact_receipt":
                 try requireKeys(params, allowed: ["operationID", "generation"], required: ["operationID", "generation"])
                 guard let text = params["operationID"] as? String, let id = UUID(uuidString: text) else { throw invalid() }
@@ -1802,7 +2103,7 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 if params["action"] as? String == "retire" { return try retireTransferSession(importing: false, params: params) }
                 if let action = params["action"] as? String {
                     if action == "begin" {
-                        return try synchronousAggregate(method:method,params:params)
+                        return try beginPagedExport(params: params)
                     }
                     if ["pota_preview", "pota_files", "pota_issues", "pota_read"].contains(action) {
                         return try potaExportAction(action, params: params)
@@ -1813,22 +2114,36 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                           export.generation == (try editGeneration()), transferSessionNow().timeIntervalSince(export.created) < transferSessionLifetime else {
                         throw WorkerFailure("export_expired", "The export snapshot expired or the workspace changed. Start the export again.")
                     }
+                    // The lifetime bounds an idle export, not a working one: a
+                    // full logbook read in 25-record pages takes longer than the
+                    // lifetime on slower hosts, so each read restarts it. An
+                    // abandoned snapshot still expires one lifetime after its
+                    // last read, and a workspace change still ends it at once.
+                    adifExport?.created = transferSessionNow()
                     beforeTransferSessionUseForTesting?()
                     let offset = try integer(params, "offset", default: 0, range: 0...Int(Int32.max))
-                    let limit = try integer(params, "limit", default: 20, range: 1...25)
-                    let records = export.snapshot.records.dropFirst(offset).prefix(limit)
-                    let metadata: [Any] = try records.map { record in
-                        if let value = record.fieldMetadata { try value.validate(fields: record.fields); return try json(value) }
-                        return NSNull()
-                    }
-                    let body = records.map { record in
-                        record.fields.keys.sorted().map { key in
+                    let limit = try integer(params, "limit", default: 20, range: 1...Self.adifExportPageRecordLimit)
+                    // A page stops before its frame would approach the host's
+                    // 1 MiB response cap; the reader accepts any count >= 1.
+                    guard offset < export.records.count else { throw invalid() }
+                    let contacts = try readyDatabase().decodeExportRecords(export.records[offset..<min(export.records.count, offset + limit)])
+                    var metadata: [Any] = [], texts: [String] = [], pageBytes = 0
+                    for record in contacts.map(\.adifRecord) {
+                        let entry: Any
+                        if let value = record.fieldMetadata { try value.validate(fields: record.fields); entry = try json(value) }
+                        else { entry = NSNull() }
+                        let text = record.fields.keys.sorted().map { key in
                             let value = record.fields[key] ?? ""
                             return "<\(key):\(value.utf8.count)>\(value)"
                         }.joined() + "<EOR>\r\n"
-                    }.joined()
-                    return ["text": (offset == 0 ? "<ADIF_VER:5>3.1.7<EOH>\r\n" : "") + body, "count": records.count,
-                            "offset": offset, "total": export.snapshot.records.count, "fieldMetadata": metadata]
+                        let entryBytes = entry is NSNull ? 4 : (try JSONSerialization.data(withJSONObject: entry)).count
+                        let cost = text.utf8.count * 2 + entryBytes
+                        if !texts.isEmpty, pageBytes + cost > Self.adifExportPageByteBudget { break }
+                        texts.append(text); metadata.append(entry); pageBytes += cost
+                    }
+                    let body = texts.joined()
+                    return ["text": (offset == 0 ? "<ADIF_VER:5>3.1.7<EOH>\r\n" : "") + body, "count": texts.count,
+                            "offset": offset, "total": export.records.count, "fieldMetadata": metadata]
                 }
                 try requireKeys(params, allowed: ["limit", "offset"])
                 let limit = try integer(params, "limit", default: 20, range: 1...25)
@@ -1843,6 +2158,10 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                         "count": qsos.count, "offset": offset, "total": try db.stats().qsoCount, "fieldMetadata": metadata]
             case "settings_load":
                 try requireKeys(params, allowed: [])
+                if let cached = settingsCache, Date().timeIntervalSince(cached.at) < Self.settingsCacheLifetime,
+                   (try? storedEditGeneration()) == cached.generation {
+                    return cached.value
+                }
                 // All helpers run synchronously under this request's lock. Share
                 // its freshly validated workspace instead of walking the same
                 // filesystem ancestors repeatedly; the next request validates anew.
@@ -1853,8 +2172,10 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 let context = SettingsReadContext(generation: generation, keychainService: workspace.keychainService,
                                                   syncTargetRevision: snapshot.syncTargetRevision)
                 let settings = try presentedSettings(snapshot.settings, readContext: context)
-                return ["settings": try json(settings), "revision": snapshot.revision,
+                let value: [String: Any] = ["settings": try json(settings), "revision": snapshot.revision,
                         "generation": generation, "automatic_sync": settings.automaticSync]
+                settingsCache = (Date(), generation, value)
+                return value
             case "settings_receipt":
                 try requireKeys(params, allowed: ["operationID", "generation"], required: ["operationID", "generation"])
                 guard let raw = params["operationID"] as? String, let operationID = UUID(uuidString: raw) else { throw invalid() }
@@ -2922,6 +3243,27 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
         return query
     }
 
+    /// Opens an export by freezing the stored records the scope selects, in
+    /// one SQL statement and without decoding them. Runs under the service lock.
+    private func beginPagedExport(params: [String: Any]) throws -> [String: Any] {
+        let query = try aggregateQuery(method: "logbook_export_adif", params: params)
+        if let expected = query.expectedGeneration {
+            guard try storedEditGeneration() == expected else { throw LiveLogbookAggregateChange.retired.failure }
+        }
+        let database = try readyDatabase()
+        let generation = try editGeneration(validatedDatabase: database)
+        let at = query.referenceTime == 0 ? Date() : Date(timeIntervalSince1970: query.referenceTime)
+        let records = try database.exportContactRecords(search: query.search, query: query.definition ?? LogbookQuery(), at: at)
+        guard query.selectionCount == nil || query.selectionCount == records.count else {
+            throw WorkerFailure("export_selection_changed", "A selected contact is no longer available. Select it again.")
+        }
+        let token = UUID().uuidString
+        adifExport = (token, generation, transferSessionNow(), records); potaExport = nil
+        scheduleTransferSessionExpiryLocked()
+        return ["token": token, "total": records.count, "workspace_generation": generation,
+                "logbook_revision": try database.aggregateReadAuthority().revision]
+    }
+
     private func potaExportAction(_ action: String, params: [String: Any]) throws -> [String: Any] {
         guard let export = adifExport, params["token"] as? String == export.token,
               export.generation == (try editGeneration()), transferSessionNow().timeIntervalSince(export.created) < transferSessionLifetime else {
@@ -2940,7 +3282,7 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                       let state = value["state"] as? String, state.utf8.count <= 64 else { throw invalid() }
                 return try decode(value)
             }
-            let preview=try POTAExportPreview.prepare(snapshot:export.snapshot,now:Date(),assignment:assignment,splitByDay:params["splitByDay"] as? Bool ?? false)
+            let preview=try POTAExportPreview.prepare(snapshot:ADIFExportSnapshot(contacts:try readyDatabase().decodeExportRecords(export.records),scope:.all),now:Date(),assignment:assignment,splitByDay:params["splitByDay"] as? Bool ?? false)
             potaExport=(export.token,preview)
         } else {
             try requireKeys(params, allowed: ["action","token","offset","limit","fileIndex"],required:["action","token"])

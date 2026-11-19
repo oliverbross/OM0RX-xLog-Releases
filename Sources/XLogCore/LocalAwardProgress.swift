@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 /// Compact, complete-log evidence. No current home settings enter these values.
 public struct AwardEvidenceContact: Decodable, Equatable, Sendable {
@@ -64,9 +65,31 @@ public struct AwardEvidenceContact: Decodable, Equatable, Sendable {
     }
     var potaLocation:(state:String,issue:String?) { POTAExportPreview.countingLocation(own:ownPOTARaw,recordedState:extraFields["MY_STATE"] ?? "") }
 }
-struct AwardEvidenceSQLRow: Decodable {
+struct AwardEvidenceSQLRow: Decodable, Sendable {
     let contact: AwardEvidenceContact
     init(from decoder: Decoder) throws { contact = try AwardEvidenceContact(fromSQL: decoder) }
+}
+
+/// At most four 128-row buffers, each decoded by its own Foundation decoder.
+/// SQLite stays on its owning lane; only immutable copied JSON crosses lanes.
+final class AwardEvidenceBatchDecoder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Result<[AwardEvidenceSQLRow], Error>?]
+    private init(count: Int) { results = Array(repeating: nil, count: count) }
+    static func decode(_ batches: [Data]) throws -> [AwardEvidenceSQLRow] {
+        if batches.count == 1 { return try JSONDecoder().decode([AwardEvidenceSQLRow].self, from: batches[0]) }
+        let owner = AwardEvidenceBatchDecoder(count: batches.count)
+        DispatchQueue.concurrentPerform(iterations: batches.count) { index in
+            let result = Result { try JSONDecoder().decode([AwardEvidenceSQLRow].self, from: batches[index]) }
+            owner.lock.withLock { owner.results[index] = result }
+        }
+        return try owner.lock.withLock {
+            try owner.results.flatMap { result in
+                guard let result else { throw LogbookDatabaseError.corruptRecord }
+                return try result.get()
+            }
+        }
+    }
 }
 
 public struct LocalAwardEvidence: Codable, Equatable, Sendable {

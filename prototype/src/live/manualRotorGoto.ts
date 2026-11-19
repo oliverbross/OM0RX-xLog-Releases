@@ -29,7 +29,8 @@ export class ManualRotorGotoSession {
     try {
       const base = await this.transport.snapshot();
       if (base.last_receipt?.request.action === "manual_rotor_goto" && ["pending", "unknown"].includes(base.last_receipt.status)) {
-        this.journal.write(base.last_receipt.operation_id); this.update({ pending: base.last_receipt.operation_id });
+        this.journal.write(base.last_receipt.operation_id); this.update({ pending: base.last_receipt.operation_id,
+          reviewable: base.last_receipt.status === "unknown" });
         throw new Error("The previous manual rotor outcome is unknown. Check its receipt and observed bearing.");
       }
       const retained = base.rotor;

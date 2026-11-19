@@ -107,3 +107,15 @@
 .special-filter-option:hover { background:#13233a; }
 .special-filter-option strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .special-filter-option label { display:flex; align-items:center; justify-content:center; gap:4px; margin:0; }
+
+.operator-workspace.tools-only { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100%; min-height: 0; }
+.operator-tools-view { display: flex; align-items: center; gap: 6px; flex: none; color: var(--secondary); font-size: 11px; }
+.operator-tools-view select { width: auto; max-width: 230px; min-height: 28px; padding: 3px 6px; font: inherit; color: var(--text); }
+.operator-tools-stack, .operator-primary-tools { display: grid; min-width: 0; min-height: 0; overflow: hidden; }
+.operator-primary-tools > .operator-tool-content { grid-area: 1 / 1; }
+.operator-alerts-pane { display: flex; min-width: 0; min-height: 0; overflow: hidden; border-top: 1px solid var(--border); }
+.operator-alerts-pane > .chase-alert-table { flex: 1; }
+.operator-alerts-divider { position: relative; cursor: row-resize; touch-action: none; background: var(--canvas); }
+.operator-alerts-divider::after { content: ""; position: absolute; inset: 4px 12px; background: #46536b; border-radius: 2px; }
+.operator-alerts-divider:hover::after, .operator-alerts-divider:focus-visible::after { background: var(--cyan); }
+.operator-alerts-divider:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }

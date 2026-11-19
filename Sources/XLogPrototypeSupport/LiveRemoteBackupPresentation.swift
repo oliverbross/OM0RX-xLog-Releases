@@ -263,7 +263,7 @@ actor LiveRemoteBackupPresentation {
     private func invalid() -> WorkerFailure { WorkerFailure("backup_invalid_request", "The remote backup request or saved command record is invalid. Nothing was replayed.") }
     private func stale() -> WorkerFailure { WorkerFailure("backup_context_changed", "Backup context changed. Refresh and review the current workspace and account; no command was replayed.") }
 
-    private static func isBoolean(_ number: NSNumber) -> Bool {
+    static func isBoolean(_ number: NSNumber) -> Bool {
         #if canImport(CoreFoundation)
         CFGetTypeID(number) == CFBooleanGetTypeID()
         #else

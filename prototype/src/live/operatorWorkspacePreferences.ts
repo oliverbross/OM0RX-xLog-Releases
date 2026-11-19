@@ -9,10 +9,11 @@ export type CompactColumn = typeof compactClusterColumns[number][0];
 export const compactClusterHeader = (column: CompactColumn) =>
   column === "callStatus" ? "CS" : column === "dxccStatus" ? "DS" : compactClusterColumns.find(([id]) => id === column)![1];
 export type WorkspacePreferences = { version: 1; mapPercent: number; activeTab: "band-maps" | "cluster";
+  showAlerts: boolean; toolsPercent: number;
   columns: CompactColumn[]; widths: Record<CompactColumn, number> };
 export const boundColumnWidth = (value: number) => Math.round(Math.max(48, Math.min(480, value)));
 export function defaultWorkspacePreferences(): WorkspacePreferences {
-  return { version: 1, mapPercent: 58, activeTab: "band-maps", columns: ["score", "band", "frequency", "callsign", "mode", "comment"],
+  return { version: 1, mapPercent: 58, activeTab: "band-maps", showAlerts: false, toolsPercent: 65, columns: ["score", "band", "frequency", "callsign", "mode", "comment"],
     widths: Object.fromEntries(compactClusterColumns.map(([id, , width]) => [id, width])) as Record<CompactColumn, number> };
 }
 export function readWorkspacePreferences(raw: string | null): WorkspacePreferences {
@@ -23,6 +24,8 @@ export function readWorkspacePreferences(raw: string | null): WorkspacePreferenc
     if (!value || Array.isArray(value) || value.version !== 1) return result;
     if (typeof value.mapPercent === "number" && Number.isFinite(value.mapPercent)) result.mapPercent = Math.max(20, Math.min(80, value.mapPercent));
     if (value.activeTab === "cluster") result.activeTab = "cluster";
+    result.showAlerts = value.showAlerts === true;
+    if (typeof value.toolsPercent === "number" && Number.isFinite(value.toolsPercent)) result.toolsPercent = Math.max(20, Math.min(80, value.toolsPercent));
     if (Array.isArray(value.columns)) {
       const chosen = compactClusterColumns.map(([id]) => id).filter(id => value.columns.includes(id));
       if (chosen.length) result.columns = chosen;

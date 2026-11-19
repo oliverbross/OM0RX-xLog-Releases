@@ -1,0 +1,18 @@
+/* Keep a generous grab area inside the header so clipped/sticky tables retain
+   it. The line stays on the column edge; keyboard resizing is unchanged. */
+.app.live th > [role="separator"][aria-orientation="vertical"] {
+  width: 16px;
+  right: 0;
+  z-index: 3;
+  cursor: col-resize;
+  border-right: 2px solid var(--border);
+}
+.app.live th:has(> [role="separator"][aria-orientation="vertical"]) {
+  padding-right: 20px;
+}
+.app.live th > [role="separator"][aria-orientation="vertical"]:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--cyan) 22%, transparent);
+  border-right-color: var(--cyan);
+  outline: 1px solid var(--cyan);
+  outline-offset: -1px;
+}

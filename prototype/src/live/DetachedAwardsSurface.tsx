@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { workerRequest } from "../worker";
 import AwardsPanel from "./AwardsPanel";
@@ -10,7 +11,7 @@ export function DetachedAwardsSurface() {
   const [refresh, setRefresh] = useState(0), [error, setError] = useState("");
   useEffect(() => connectLogbookChanges(() => setRefresh(value => value + 1), setError), []);
   return <div className="app live monitor-app detached-awards-app"><main aria-label="Detached Awards">
-    {error && <p className="live-error" role="alert">{error}</p>}
+    {error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
     <AwardsPanel taskOnly readOnlySavedFilters request={request} refresh={refresh} />
   </main></div>;
 }

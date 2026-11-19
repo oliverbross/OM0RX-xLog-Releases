@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, BarChart3, Clock3, Download, Filter, Layers, ListChecks, RefreshCw, Target, Users } from "lucide-react";
 import { aggregate, analyticsReport, defaultAnalyticsFilters, hasMultiplierAdapter, numberText, utcText, type AnalyticsDataset, type AnalyticsFilters, type AnalyticsResult } from "./contestAnalytics";
@@ -48,7 +49,10 @@ export function ContestAnalyticsWindow({read=readAnalytics,initialSnapshot}:{rea
     try{const next=await collectAnalytics(read,abort.signal,setProgress);if(!mounted.current)return;
       const previous=snapshotRef.current;setSnapshot(next);
       if(previous)void read({action:"release",snapshotID:previous.meta.snapshotID},previous.meta).catch(()=>{});
-    }catch(cause){if(!abort.signal.aborted&&mounted.current){setError(errorText(cause));setSnapshot(null);setDataset(null);setResult(null);}}
+    }catch(cause){if(!abort.signal.aborted&&mounted.current){
+      // Keep the last good analysis on screen (and its snapshot held, so it is
+      // released normally later); only say the refresh failed.
+      setError(snapshotRef.current?`${errorText(cause)} Showing the previous analysis.`:errorText(cause));if(!snapshotRef.current){setDataset(null);setResult(null);}}}
     finally{busyRef.current=false;if(mounted.current){setBusy(false);setProgress("");}}
   },[read]);
   useEffect(()=>{mounted.current=true;if(!initialSnapshot)void refresh();return()=>{mounted.current=false;abortRef.current?.abort();const value=snapshotRef.current;if(value&&!initialSnapshot)void read({action:"release",snapshotID:value.meta.snapshotID},value.meta).catch(()=>{});};},[read,refresh,initialSnapshot]);
@@ -68,7 +72,7 @@ export function ContestAnalyticsWindow({read=readAnalytics,initialSnapshot}:{rea
       if(document.hidden||checking||busyRef.current)return;const current=snapshotRef.current;if(!current)return;checking=true;
       try{const check=await read({action:"check",snapshotID:current.meta.snapshotID},current.meta);if(!mounted.current||snapshotRef.current!==current)return;
         if(check.current!==true)await refresh();else if(workerRef.current){setAnalyzing(true);workerRef.current.postMessage({id:++requestRef.current,filters:filtersRef.current,now:Date.now()});}
-      }catch(cause){if(mounted.current&&snapshotRef.current===current){setError(errorText(cause));setDataset(null);setResult(null);setSnapshot(null);setDrill(null);}}
+      }catch(cause){if(mounted.current&&snapshotRef.current===current)setError(`${errorText(cause)} Showing the previous analysis; it refreshes when the log can be read.`);}
       finally{checking=false;}
     },15000);return()=>clearInterval(timer);
   },[live,read,refresh,initialSnapshot]);
@@ -82,9 +86,9 @@ export function ContestAnalyticsWindow({read=readAnalytics,initialSnapshot}:{rea
     <UnfinishedEditorWarning/>
     <header className="analytics-header"><div className="analytics-title"><BarChart3 size={27} aria-hidden="true"/><div><h1>Contest Analytics</h1><p>{dataset?`${dataset.meta.stationCall} · ${dataset.meta.name}`:"OM0RX-xLog · Contest analysis"}</p></div></div><div className="analytics-actions"><label className="analytics-live"><input type="checkbox" checked={live} onChange={e=>setLive(e.target.checked)}/><Activity size={14}/> Live refresh</label><button onClick={()=>void refresh()} disabled={busy}><RefreshCw size={15}/> {busy?"Loading…":"Refresh"}</button><button disabled={!dataset||locked||exportState.pending} onClick={()=>dataset&&void exportState.save(`xlog-${dataset.meta.pluginID}-analytics.json`,()=>JSON.stringify(analyticsReport(dataset,filters),null,2))}><Download size={15}/> Export report</button><button disabled={!dataset||locked||exportState.pending} onClick={()=>void exportState.print()}>Print / PDF</button></div></header>
     <div className="analytics-status" role="status"><span className={busy||analyzing?"analytics-attention":""}>{status}</span><span>Read-only · Local contest data</span></div>
-    {(exportState.pending||exportState.message)&&<p role="status" className="analytics-note">{exportState.pending?exportState.pendingLabel:exportState.message}</p>}
-    {exportState.error&&<p role="alert" className="analytics-error">{exportState.error}</p>}
-    {error&&<p role="alert" className="analytics-error">{error} <button disabled={busy} onClick={()=>void refresh()}>Retry</button></p>}
+    {(exportState.pending||exportState.message)&&<ErrorNotice><p role="status" className="analytics-note">{exportState.pending?exportState.pendingLabel:exportState.message}</p></ErrorNotice>}
+    {exportState.error&&<ErrorNotice><p role="alert" className="analytics-error">{exportState.error}</p></ErrorNotice>}
+    {error&&<ErrorNotice><p role="alert" className="analytics-error">{error} <button disabled={busy} onClick={()=>void refresh()}>Retry</button></p></ErrorNotice>}
     {dataset&&<>
       <div className="analytics-scope"><span>Claimed category <strong>{category}</strong></span><span>Viewing <strong>{filters.scope==="category"?"Claimed category":"All logged bands"}{filters.band!=="all"?` · ${filters.band}`:""}</strong></span><span>Host score remains authoritative</span></div>
       <nav className="analytics-tabs" aria-label="Analytics sections">{tabs.map(({id,label,icon:Icon})=><button key={id} aria-current={tab===id?"page":undefined} onClick={()=>{try{flushUnfinishedEditors();setTab(id);}catch(cause){setError(errorText(cause));}}}><Icon size={16}/>{label}</button>)}</nav>

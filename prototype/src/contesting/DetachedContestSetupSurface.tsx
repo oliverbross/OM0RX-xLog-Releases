@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -239,10 +240,10 @@ export function DetachedContestSetupSurface() {
 
   if (!context) return <main className="contest-workspace" aria-label="Contest Setup">
     <header className="contest-header"><div><h1>Contest Setup</h1><p>Detached contest session owner</p></div></header>
-    {error ? <p className="contest-alert is-error" role="alert">{error}</p> : <p role="status">Loading contest setup…</p>}
+    {error ? <ErrorNotice><p className="contest-alert is-error" role="alert">{error}</p></ErrorNotice> : <ErrorNotice><p role="status">Loading contest setup…</p></ErrorNotice>}
   </main>;
-  return <>{closeError&&<p role="alert" className="contest-alert is-error">Close cancelled; unfinished work remains open. {closeError}</p>}
-    {error && <p role="alert" className="contest-alert is-error">Live station or cluster observations are unavailable. {error}</p>}
+  return <>{closeError&&<ErrorNotice><p role="alert" className="contest-alert is-error">Close cancelled; unfinished work remains open. {closeError}</p></ErrorNotice>}
+    {error && <ErrorNotice><p role="alert" className="contest-alert is-error">Live station or cluster observations are unavailable. {error}</p></ErrorNotice>}
     <Not1MMContestWorkspace setupOnly request={contestRequest}
     serviceRequest={request} stationTune={tuneContestSpot} captureStationTune={()=>{
       const binding=passTuneBindingRef.current;if(!binding)throw Error("Refresh the observed radio before reviewing a directed pass tune.");

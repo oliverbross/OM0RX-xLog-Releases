@@ -13,3 +13,13 @@
 /* Removing equipment returns its grid track to the logging and intelligence panels. */
 .operator-desk-top.without-equipment { grid-template-columns: minmax(0, 1.8fr) minmax(0, 1.1fr); }
 @container operator-desk (max-width: 1420px) { .operator-desk-top.without-equipment { grid-template-columns: minmax(0, 1fr); } }
+
+.equipment-band-assignments { display: grid; grid-template-columns: repeat(auto-fit,minmax(135px,1fr)); gap: 8px; }
+.equipment-settings .equipment-band-assignments label { align-items: start; }
+.equipment-profiles { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 10px; }
+.equipment-profiles button { width: 100%; display: grid; gap: 6px; text-align: left; padding: 14px; min-height: 92px; }
+.equipment-profiles button[aria-pressed="true"] { border-color: var(--cyan); background: #133247; }
+.equipment-profiles strong { color: var(--teal); font-size: 15px; }
+.equipment-profiles small, .equipment-profiles span { color: var(--secondary); }
+.equipment-settings > fieldset { margin: 16px 0; padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+.live .equipment-settings > fieldset > label { display: grid; text-align: left; justify-items: stretch; gap: 5px; margin: 8px 0; }

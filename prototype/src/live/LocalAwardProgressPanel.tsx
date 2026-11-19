@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { LogbookFilterBuilder } from "./LogbookFilterBuilder";
 import { LogbookSavedFilters } from "./LogbookSavedFilters";
@@ -85,7 +86,7 @@ export function LocalAwardProgressPanel({ request, refresh, readScope, readOnlyS
     <button type="button" onClick={clearFilters}>Clear all contact filters</button>
     {filters && <><LogbookFilterBuilder value={draftFilter} onChange={setDraftFilter} onApply={() => apply(search,draftFilter)} />
       <LogbookSavedFilters readOnly={readOnlySavedFilters} onRequest={request} currentQuery={search} currentDefinition={draftFilter} onApply={(text,definition) => { const next=definition ?? emptyLogbookQuery(); setDraftFilter(next); apply(text,next); }} /></>}
-    {error && <p role="alert">{error}</p>}{loading && <p role="status">Updating complete-log evidence…</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{loading && <ErrorNotice><p role="status">Updating complete-log evidence…</p></ErrorNotice>}
     {page && <>
       <p>{page.workedUnits} distinct worked units · {page.supportingQSOs} supporting physical contacts · {page.confirmationUnits} units with recorded confirmation evidence.</p>
       {page.target != null && <p>Published reference target: {page.target} confirmed units. Local worked progress is not sponsor approval.</p>}
@@ -110,7 +111,7 @@ export function LocalAwardProgressPanel({ request, refresh, readScope, readOnlyS
         {!page.evidence.length && !loading && <p>No supporting contacts for this needed cell in the selected band/mode/filter.</p>}
         <table><thead><tr><th>Call</th><th>UTC</th><th>Band/mode</th><th>Recorded own location</th><th>Paper / LoTW</th><th>Why counted</th></tr></thead><tbody>{page.evidence.map(e => <tr key={e.id}><td><button type="button" onClick={() => void inspect(e)}>{e.call}</button></td><td>{utc(e.start)}</td><td>{e.band} {e.mode}</td><td>{e.recordedGrid || "Unknown grid"} · {e.recordedLocation || "Unknown location"}<small>{e.recordedContext}</small></td><td>{e.paper || "Unknown"} / {e.lotw || "Unknown"}</td><td>{e.reason}</td></tr>)}</tbody></table>
         <div className="awards-pagination"><button type="button" disabled={loading || evidenceOffset === 0} onClick={() => setEvidenceOffset(Math.max(0,evidenceOffset-20))}>Previous contacts</button><span>{page.evidenceTotal} total supporting contacts</span><button type="button" disabled={loading || evidenceOffset+20 >= page.evidenceTotal} onClick={() => setEvidenceOffset(evidenceOffset+20)}>Next contacts</button></div>
-        {detailError && <p role="alert">{detailError}</p>}{detail && <section aria-label="Supporting contact detail"><h4>{String(detail.call)} · Current stored contact</h4><button type="button" onClick={() => setDetail(null)}>Close contact detail</button><dl>{Object.entries(detail).filter(([,v]) => v != null && v !== "").map(([key,value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd></div>)}</dl></section>}
+        {detailError && <ErrorNotice><p role="alert">{detailError}</p></ErrorNotice>}{detail && <section aria-label="Supporting contact detail"><h4>{String(detail.call)} · Current stored contact</h4><button type="button" onClick={() => setDetail(null)}>Close contact detail</button><dl>{Object.entries(detail).filter(([,v]) => v != null && v !== "").map(([key,value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd></div>)}</dl></section>}
       </section>}
       <small>{page.rulesVersion} · log revision {page.logbook_revision}</small>
     </>}

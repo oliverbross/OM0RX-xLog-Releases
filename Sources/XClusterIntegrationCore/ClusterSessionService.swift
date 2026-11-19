@@ -478,11 +478,11 @@ public actor ClusterSessionService {
     private func validate(_ value: ClusterSessionConfiguration) throws {
         let enabled = value.servers.filter(\.enabled)
         for server in enabled {
-            guard !server.name.isEmpty, !server.host.isEmpty, server.port > 0, server.port <= 65_535,
+            guard !server.host.isEmpty, server.port > 0, server.port <= 65_535,
                   !server.host.contains(where: { $0.isWhitespace || $0.isNewline }),
                   !server.host.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }),
                   server.callsign.range(of: #"^[A-Za-z0-9/\-]{2,24}$"#, options: .regularExpression) != nil else {
-                throw ClusterSessionError.invalidConfiguration("Invalid name, host, port or login callsign for a cluster server.")
+                throw ClusterSessionError.invalidConfiguration("Enter a hostname without spaces, a port from 1 to 65535, and a login callsign (2–24 letters, digits, / or -) for each enabled cluster server.")
             }
         }
         guard Set(enabled.map(\.id)).count == enabled.count else {
@@ -868,6 +868,34 @@ public actor ClusterSessionService {
         console.append(.init(receivedAt: Date(), source: source,
                              text: String(decoding: Data(safe.utf8.prefix(1024)), as: UTF8.self), isCommand: isCommand))
         if console.count > 400 { console.removeFirst(console.count - 400) }
+    }
+
+    /// Read only the complete retained owner index. In particular, this does
+    /// not pass through addSpot, observation/archive hooks, or radio forwarding.
+    public func queryNeeds(_ queries: [ClusterNeedsQuery], expires: Date) -> ClusterNeedsBatch? {
+        guard !terminated, hasContactSnapshot, contactRevision >= 0, queries.count <= 32, Date() < expires else { return nil }
+        let observed = Date()
+        let results = queries.map { query in
+            let band = SpotLogic.band(for: Double(query.frequencyHz) / 1_000)
+            let facts = countries.facts(query.call, at: observed)
+            let entity = facts.status == "resolved" ? facts.country : nil
+            let validEntity = entity.flatMap { (1...9999).contains($0.adif) ? $0 : nil }
+            let classification = classify(call: query.call, band: band, mode: query.mode, adif: validEntity?.adif)
+            let reason: String? = band == "OTHER" ? "unsupported_band"
+                : facts.status == "knownNoEntity" ? "known_no_entity"
+                : facts.status == "ambiguous" ? "country_ambiguous"
+                : validEntity == nil ? "country_unknown" : nil
+            let (score, reasons) = SpotLogic.score(callStatus: classification.callStatus,
+                dxccStatus: classification.dxccStatus, specials: [], source: "rx")
+            let needed = ["New Call", "New Band", "New Mode", "New Band+Mode"].contains(classification.callStatus)
+                || ["ATNO", "C/New Band", "C/New Mode", "C/New Band+Mode", "W/New Band", "W/New Mode", "W/New Band+Mode"].contains(classification.dxccStatus)
+            return ClusterNeedsResult(query: query, band: band, country: validEntity?.name,
+                adif: validEntity?.adif, resolution: facts.status, callStatus: classification.callStatus,
+                dxccStatus: classification.dxccStatus, need: reason == nil ? (needed ? "needed" : "worked") : "unknown",
+                score: reason == nil ? score : nil, reasons: reason == nil ? reasons : [], reasonCode: reason)
+        }
+        guard Date() < expires else { return nil }
+        return ClusterNeedsBatch(revision: UInt64(contactRevision), reference: countries.snapshotIdentity, results: results)
     }
 
     private func classify(call: String, band: String, mode: String, adif: Int?) -> ClusterClassification {

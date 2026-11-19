@@ -9,20 +9,10 @@ use std::{
 };
 use tauri::Manager;
 const MAX: u64 = 9_007_199_254_740_991;
-// CW arm/send and carrier acquisition share this nonblocking authority. Their
-// urgent release paths deliberately never acquire it.
-static OUTPUT_ACQUISITION: Mutex<()> = Mutex::new(());
+// Compatibility facade: every current caller retains the same shared authority.
+pub use crate::output_authority::{output_intent, revoke_output_intent, require_output_intent, reserve_output};
 #[cfg(test)]
 pub static OUTPUT_TEST:Mutex<()>=Mutex::new(());
-static OUTPUT_INTENT: OnceLock<Mutex<String>> = OnceLock::new();
-pub fn output_intent() -> Result<String,String> { Ok(OUTPUT_INTENT.get_or_init(||Mutex::new(uuid::Uuid::new_v4().to_string())).lock().map_err(|_|"Output intent unavailable")?.clone()) }
-pub fn revoke_output_intent() -> Result<(),String> { *OUTPUT_INTENT.get_or_init(||Mutex::new(uuid::Uuid::new_v4().to_string())).lock().map_err(|_|"Output intent unavailable")?=uuid::Uuid::new_v4().to_string();Ok(()) }
-pub fn require_output_intent(expected:&str)->Result<(),String>{if output_intent()?!=expected{return Err("A later PTT off/Cancel retired this acquisition preparation".into());}Ok(())}
-pub fn reserve_output() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    OUTPUT_ACQUISITION.try_lock().map_err(|_| {
-        "A radio/CW acquisition is in progress. Stop and Cancel remain available.".into()
-    })
-}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {

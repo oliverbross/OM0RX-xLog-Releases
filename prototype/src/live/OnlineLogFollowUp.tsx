@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { sameGeneration, validGeneration } from "./operatorDraftSession";
 import "./onlineLogFollowUp.css";
@@ -77,8 +78,8 @@ export function OnlineLogFollowUpPanel({ contactID, call, onRequest, refreshKey,
     <header><h3>{call} · Upload follow-up</h3><div><button type="button" disabled={reading} onClick={() => void read()}>Refresh retained status</button>
       {onClose && <button type="button" onClick={onClose}>Close follow-up</button>}</div></header>
     <p>Reads saved local evidence only. Provider acceptance age, match age and sponsor credit are unknown. Upload acceptance does not establish confirmation.</p>
-    {reading ? <p role="status">Reading retained status…</p> : error ? <p role="alert">{error}</p>
-      : !value ? <p role="status">Use Refresh retained status to inspect this contact. Contact changes require a fresh read.</p> : <>
+    {reading ? <ErrorNotice><p role="status">Reading retained status…</p></ErrorNotice> : error ? <ErrorNotice><p role="alert">{error}</p></ErrorNotice>
+      : !value ? <ErrorNotice><p role="status">Use Refresh retained status to inspect this contact. Contact changes require a fresh read.</p></ErrorNotice> : <>
         <p>Contact revision {value.contact_revision}. Ages are fixed at this read.</p>
         <div className="follow-up-providers">{value.uploads.map(row => <article key={row.service} aria-label={`${provider[row.service]} upload`}>
           <h4>{provider[row.service]}</h4><p>{row.state ? stateLabel[row.state] : "No retained upload receipt"}</p>

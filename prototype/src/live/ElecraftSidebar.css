@@ -1,0 +1,69 @@
+.sidebar-instruments {
+  display: grid;
+  gap: 8px;
+  padding: 0 3px 10px;
+}
+.sidebar-instrument {
+  border: 1px solid #2b4958;
+  border-top: 2px solid #54d8b7;
+  border-radius: 7px;
+  background: #0d2030;
+  overflow: hidden;
+}
+.sidebar-instrument.kat {
+  border-top-color: #a4a2ef;
+}
+.sidebar-instrument > button {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 7px 6px;
+  color: #62dfc6;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 11px;
+  font-weight: 700;
+}
+.sidebar-instrument.kat > button {
+  color: #b7b6ff;
+}
+.sidebar-instrument > button:hover {
+  background: #1d3347;
+}
+.sidebar-instrument .instrument-connected {
+  font-size: 9px;
+  color: #8cdbc0;
+  font-weight: 400;
+}
+.sidebar-instrument dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 6px;
+  margin: 0;
+  padding: 2px 6px 8px;
+}
+.sidebar-instrument dl div {
+  min-width: 0;
+}
+.sidebar-instrument dt {
+  color: #a2b7c9;
+  font-size: 9px;
+}
+.sidebar-instrument dd {
+  margin: 2px 0 0;
+  color: #e4eef7;
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.monitor-instruments .sidebar-instrument.kat dl div:first-child {
+  grid-column: 1/-1;
+}
+.sidebar-instruments p {
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import {useEffect,useRef,useState} from 'react';
 import type {AnalyticsDataset} from './contestAnalytics';
 import {analyticalCandidate,inspectLearningEvidence,type LearningEvidence} from './analyticsEvidenceModel';
@@ -44,12 +45,12 @@ function LearningEditor({dataset,onDrill,exportState}:{dataset:AnalyticsDataset;
  return <section className="analytics-section"><h2>Read-only adjudication / learning evidence</h2><p>Import normalized annotations against this exact immutable log identity. Source claims are unverified; accepted/rejected labels do not alter score, duplicate ownership or contacts. Official LCR/UBN dialect conversion remains unsupported.</p>
    <UnfinishedRecovery editor={retained}/>
    {target&&<p>Draft analysis identity {target.identity} · reference {target.referenceID}. Not exported.</p>}
-   {!compatible&&<p role="alert">Retained text belongs to another analysis snapshot. Copy or discard it explicitly; no text was rebound.</p>}
+   {!compatible&&<ErrorNotice><p role="alert">Retained text belongs to another analysis snapshot. Copy or discard it explicitly; no text was rebound.</p></ErrorNotice>}
    <button disabled={!!text||!compatible||exportState.pending} onClick={()=>{setText(JSON.stringify(template,null,2));setReview(null);}}>Show identity-bound evidence template</button>
    <label>Original learning evidence<textarea aria-label="Original learning evidence" value={text} disabled={!compatible||exportState.pending} maxLength={1048576} rows={6} onChange={event=>{setText(event.target.value);setReview(null);}}/></label>
    {retained.draft&&<><button onClick={()=>void navigator.clipboard.writeText(text).catch(cause=>setError(String(cause)))}>Copy annotation draft</button>
      <button disabled={exportState.pending} onClick={()=>{try{retained.clear();setReview(null);}catch(cause){setError(String(cause));}}}>Discard draft</button></>}
-   <button disabled={!text||!compatible||exportState.pending} onClick={()=>void inspect()}>Inspect learning evidence without correction</button>{error&&<p role="alert">{error}</p>}
+   <button disabled={!text||!compatible||exportState.pending} onClick={()=>void inspect()}>Inspect learning evidence without correction</button>{error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
    {review&&compatible&&<><p>{review.evidence.findings.length} annotations · source {review.evidence.source} · SHA-256 {review.sha256}. Retained locally until explicitly exported; no log changes.</p>
      <ul>{['accepted','not-in-log','exchange','duplicate','operator-note'].map(status=>{const rows=review.evidence.findings.filter(row=>row.status===status);return rows.length>0&&<li key={status}><button onClick={()=>onDrill(`${status} · unverified external/operator evidence`,rows.map(row=>row.qsoID))}>{status} · {rows.length} contributing contacts</button></li>;})}</ul>
      <button disabled={exportState.pending} onClick={()=>{try{retained.flush();const draftID=retained.draft!.id;void exportState.save('xlog-learning-review.json',()=>JSON.stringify({snapshotIdentity:dataset.meta.identity,sessionID:dataset.meta.sessionID,referenceID:dataset.meta.referenceID,sourceRevision:dataset.meta.sourceRevision,sourceSHA256:review.sha256,sourceText:text,evidence:review.evidence,contactMutations:0,sourceClaimsVerified:false},null,2)).then(result=>{if(result==='Export saved.'){try{retained.complete(draftID,text);setReview(null);}catch(cause){setError(String(cause));}}});}catch(cause){setError(String(cause));}}}>Save read-only learning review</button>

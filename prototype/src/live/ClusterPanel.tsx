@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { formatSpotFrequency } from "../spotFrequency";
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { clusterBandColors, clusterModeColors, clusterStatusCode, clusterStatusColors, paletteColor, specialTagColors } from "./clusterPalette";
@@ -7,8 +8,10 @@ import { formatSpotAge, spotAgeColor, useSpotAgeClock } from "./spotAge";
 import { countryDisplay } from "./countryDisplay";
 import { clusterFilterChoices, defaultClusterFilter, normalizeClusterFilter, type ClusterFilter } from "./clusterFilters";
 import SpecialFilterOptions from "./SpecialFilterOptions";
+import { PushToPanButton } from "./PushToPanButton";
 import { useLogbookCapacity } from "./logbookCapacity";
 import { useClusterAppearancePreference } from "./clusterAppearance";
+import { useClusterAlertMenu } from "./useClusterAlertMenu";
 import { contestBandMapMultiplierLabel, contestBandMapSpotColor, contestBandMapSpotPending, contestBandMapSpotWorked, contestNeededMultiplierCount } from "./contestSpotPresentation";
 import "./ClusterPanel.css";
 
@@ -45,7 +48,7 @@ type Configuration = { servers: Server[]; connectOnStartup: boolean; requestRece
   reconnect: boolean; requestSkimmer: boolean;
   showWorkedBandModeSpots: boolean; hideWSPRSpots: boolean; maximumSpots: number; specialRules: Rule[];
   palette: Palette; filter: Filter; commandPresets: CommandPreset[]; forwardSpotsToFlex: boolean; radioSpotColorPolicy?: "callsign" | "dxcc" };
-type Forwarding = { accepted_count: number; status: string };
+type Forwarding = { accepted_count: number; status: string; flex_status?: string };
 type Response = { configuration?: Configuration; snapshot?: Snapshot; password_servers?: string[];
   password_storage_available?: boolean; flex_forwarding_available?: boolean;
   forwarding?: Forwarding; snapshot_truncated?: boolean };
@@ -153,6 +156,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
   preferenceStorageKey = fullClusterColumnsKey, onSpotContextMenu, contestBands, contestCurrentBand, contestBandPreferenceKey, radioFrequencyHz,
   contestWorkedFilter,onContestWorkedFilterReset }: Props) {
   const saveToast = useSettingsSaveToast();
+  const alertMenu = useClusterAlertMenu(!presentationOnly && !contestPresentation);
   const clusterAppearance = useClusterAppearancePreference();
   const classic = !presentationOnly && clusterAppearance.appearance === "classic";
   const ageClock = useSpotAgeClock();
@@ -185,7 +189,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
   const [filter, setFilter] = useState<Filter>(emptyFilter);
   const [passwordServers, setPasswordServers] = useState<string[]>([]);
   const [passwordStorageAvailable, setPasswordStorageAvailable] = useState((snapshot as Response | null)?.password_storage_available !== false);
-  const [, setForwardingAvailable] = useState((snapshot as Response | null)?.flex_forwarding_available !== false);
+  const [forwardingAvailable, setForwardingAvailable] = useState((snapshot as Response | null)?.flex_forwarding_available !== false);
   const canEditPasswords = passwordControlsEnabled && passwordStorageAvailable;
   const passwordUnavailableReason = !passwordStorageAvailable ? "Secure password storage is unavailable on this platform" : "Dock back to manage passwords";
   const [savedServerIDs, setSavedServerIDs] = useState<string[]>([]);
@@ -243,7 +247,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
   const [contestBand, setContestBand] = useState<ContestBandFilter>(() =>
     initialStoredContestBand.current ?? defaultContestBand(contestCurrentBand, contestBands));
   const contestBandOptions=contestBandFilters.filter(band=>band==="all"||!contestBands?.length||contestBands.includes(band));
-  const [, setForwarding] = useState<Forwarding | null>(null);
+  const [forwarding, setForwarding] = useState<Forwarding | null>(null);
   const [snapshotTruncated, setSnapshotTruncated] = useState(false);
   const tableArea = useRef<HTMLDivElement>(null);
   const [spotPage, setSpotPage] = useState(0);
@@ -278,6 +282,8 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
   useEffect(() => {
     const next = snapshot as Response | null;
     if (next?.password_storage_available != null) setPasswordStorageAvailable(next.password_storage_available);
+    if (next?.flex_forwarding_available != null) setForwardingAvailable(next.flex_forwarding_available);
+    if (next?.forwarding) setForwarding(next.forwarding);
     if (next?.snapshot) setLive(next.snapshot);
     if (next?.configuration) {
       const remoteConfiguration = JSON.stringify(next.configuration);
@@ -338,27 +344,37 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
   useEffect(() => {
     if (passive) return;
     let active = true;
+    let pending = true;
     requestRef.current("cluster_snapshot", {}).then((raw) => {
       if (!active) return;
       const next = raw as Response;
       if (next.password_storage_available != null) setPasswordStorageAvailable(next.password_storage_available);
       if (next.flex_forwarding_available != null) setForwardingAvailable(next.flex_forwarding_available);
-      if (next.configuration) { setConfiguration(next.configuration); draftBaseConfiguration.current = next.configuration; lastRemoteConfiguration.current = JSON.stringify(next.configuration); setFilter(normalizeClusterFilter(next.configuration.filter)); setSavedServerIDs(next.configuration.servers.map((s) => s.id)); }
+      if (next.configuration) { setSavedServerIDs(next.configuration.servers.map(server => server.id)); setConfiguration(next.configuration); draftBaseConfiguration.current = next.configuration; lastRemoteConfiguration.current = JSON.stringify(next.configuration); setFilter(normalizeClusterFilter(next.configuration.filter)); setSavedServerIDs(next.configuration.servers.map((s) => s.id)); }
       if (next.snapshot) setLive(next.snapshot);
       setPasswordServers(next.password_servers ?? []);
       if (next.forwarding) setForwarding(next.forwarding);
       if (next.snapshot_truncated != null) setSnapshotTruncated(next.snapshot_truncated);
-    }).catch(() => { if (active) setError("Cluster state is unavailable. Check the worker and retry."); });
+    }).catch(() => { if (active) setError("Cluster state is unavailable. Check the worker and retry."); }).finally(() => { pending = false; });
     const timer = window.setInterval(() => {
+      if (!active || pending) return;
+      pending = true;
       requestRef.current("cluster_snapshot", {}).then((raw) => {
         if (active && (raw as Response).password_storage_available != null) setPasswordStorageAvailable((raw as Response).password_storage_available!);
         if (active && (raw as Response).flex_forwarding_available != null) setForwardingAvailable((raw as Response).flex_forwarding_available!);
         if (active && (raw as Response).snapshot) {
+          const config = (raw as Response).configuration;
+          if (config && !draftBaseConfiguration.current) {
+            draftBaseConfiguration.current = config;
+            lastRemoteConfiguration.current = JSON.stringify(config);
+            setConfiguration(config); setFilter(normalizeClusterFilter(config.filter));
+            setSavedServerIDs(config.servers.map(server => server.id)); setError("");
+          }
           setLive((raw as Response).snapshot ?? null);
           if ((raw as Response).forwarding) setForwarding((raw as Response).forwarding ?? null);
           if ((raw as Response).snapshot_truncated != null) setSnapshotTruncated((raw as Response).snapshot_truncated ?? false);
         }
-      }).catch(() => {});
+      }).catch(() => {}).finally(() => { pending = false; });
     }, 1000);
     return () => { active = false; window.clearInterval(timer); };
   }, [passive]);
@@ -367,7 +383,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
     const next = raw as Response;
     if (next.password_storage_available != null) setPasswordStorageAvailable(next.password_storage_available);
     if (next.flex_forwarding_available != null) setForwardingAvailable(next.flex_forwarding_available);
-    if (next.configuration) { setConfiguration(next.configuration); draftBaseConfiguration.current = next.configuration; lastRemoteConfiguration.current = JSON.stringify(next.configuration); }
+    if (next.configuration) { setSavedServerIDs(next.configuration.servers.map(server => server.id)); setConfiguration(next.configuration); draftBaseConfiguration.current = next.configuration; lastRemoteConfiguration.current = JSON.stringify(next.configuration); }
     if (next.snapshot) setLive(next.snapshot);
     if (next.password_servers) setPasswordServers(next.password_servers);
     if (next.forwarding) setForwarding(next.forwarding);
@@ -392,15 +408,22 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
       if (version === filterVersion.current && (raw as Response).snapshot) setLive((raw as Response).snapshot ?? null);
     }).catch(() => { if (version === filterVersion.current) setError("Could not apply cluster filters."); });
   };
-  const saveConfig = async () => {
+  const saveConfig = async (connection?: "connect" | "reconnect") => {
     if (!configuration) return;
     setBusy(true); setError(""); setMessage("");
     try {
       const base = draftBaseConfiguration.current;
       if (!base) throw new Error("Current cluster settings are unavailable. Refresh and retry.");
-      accept(await onRequest("cluster_configure", { configuration, base_configuration: base }));
-      setSavedServerIDs(configuration.servers.map((server) => server.id));
-      saveToast.show("Cluster settings saved. Received spots retained.");
+      if (!connection || JSON.stringify(configuration) !== JSON.stringify(base)) {
+        accept(await onRequest("cluster_configure", { configuration, base_configuration: base }));
+
+        saveToast.show("Cluster settings saved. Received spots retained.");
+      }
+      if (connection) {
+        if (connection === "reconnect") accept(await onRequest("cluster_disconnect", {}));
+        accept(await onRequest("cluster_connect", {}));
+        setMessage("Connecting to configured clusters…");
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Cluster settings could not be saved. Check settings and retry.");
     } finally { setBusy(false); }
@@ -441,8 +464,8 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
   };
 
   if (settingsOnly) return <section className="live-cluster" aria-label="DX Cluster settings">
-    {error && <p className="live-cluster-error" role="alert">{error}</p>}
-    {message && <p className="live-cluster-message" role="status">{message}</p>}{saveToast.toast}
+    {error && <ErrorNotice><p className="live-cluster-error" role="alert">{error}</p></ErrorNotice>}
+    {message && <ErrorNotice when={true} title="Message"><p className="live-cluster-message" role="status">{message}</p></ErrorNotice>}{saveToast.toast}
     {renderToolbarPanels()}
   </section>;
 
@@ -450,7 +473,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
     <header className="live-cluster-head">
       <div>{!taskOnly && <h2>DX Cluster</h2>}<p>{contestPresentation
         ? <span aria-label="CQ WW opportunity totals">QSO {contestSummary.qsos} · Mults {contestSummary.mults} · Country {contestSummary.countries} · Zone {contestSummary.zones}</span>
-        : presentationOnly ? `${connected} live · ${spotCount} shown / ${live?.loadedSpots ?? 0} received` : `${connected} live · ${live?.spots.length ?? 0} shown / ${live?.loadedSpots ?? 0} received · ${live?.contactCount ?? 0} log contacts`}</p></div>
+        : presentationOnly ? `${connected} live · ${spotCount} shown / ${live?.loadedSpots ?? 0} received` : `${connected} live · ${live?.spots.length ?? 0} shown / ${live?.loadedSpots ?? 0} received · ${live?.logbookDataLoaded ? `${live.contactCount} log contacts` : "Preparing logbook classifications…"}`}</p></div>
       {contestPresentation && <div className="live-cluster-contest-controls"><label>Band <select aria-label="CQ WW band" value={contestBand}
         onChange={event=>{const next=event.currentTarget.value as ContestBandFilter;contestBandWasChosen.current=true;setContestBand(next);setSpotPage(0);
           try{localStorage.setItem(contestBandStorageKey,next);}catch{/* Keep the explicit choice in memory when storage is unavailable. */}}}>{contestBandOptions.map(band=><option key={band} value={band}>{band==="all"?"All":band.replace("m","")}</option>)}</select></label>
@@ -469,10 +492,11 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
       {!presentationOnly && <div className="live-cluster-actions">
         <div className="live-cluster-connection-summary" role="status" aria-label="Cluster connections">{allConnections.length ? allConnections.map(connection => {
           const phase = connection.phase.toLowerCase(), label = phase.charAt(0).toUpperCase() + phase.slice(1);
-          return <span key={connection.serverID} className={phase === "connected" ? "live-cluster-connected" : "live-cluster-disconnected"}><i className={`phase-${phase}`} />{connection.serverName} · {label}{connection.error && <small className="live-cluster-connection-error"> · {connection.error}</small>}</span>;
+          return <span key={connection.serverID} className={phase === "connected" ? "live-cluster-connected" : "live-cluster-disconnected"}><i className={`phase-${phase}`} />{connection.serverName} · {label}{connection.error && <ErrorNotice><small className="live-cluster-connection-error"> · {connection.error}</small></ErrorNotice>}</span>;
         }) : <span className={connected ? "live-cluster-connected" : "live-cluster-disconnected"}>{connected ? `${connected} cluster${connected === 1 ? "" : "s"} · Connected` : "Disconnected"}</span>}</div>
-        <button type="button" disabled={busy || !configuration?.servers.some((s) => s.enabled)} onClick={() => void request("cluster_connect", {}, "Connecting to configured clusters…")}>Connect</button>
-        <button type="button" disabled={busy || !live?.connections?.length} onClick={() => void request("cluster_disconnect", {}, "Disconnected")}>Disconnect</button>
+        {connected === 0 && !allConnections.some(server => server.phase === "connecting") && <button type="button" disabled={busy || !configuration?.servers.some((s) => s.enabled)} onClick={() => void request("cluster_connect", {}, "Connecting to configured clusters…")}>Connect</button>}
+        {!contestPresentation && <PushToPanButton cluster={{ flex_forwarding_available: forwardingAvailable, snapshot: live, forwarding }} onRequest={onRequest} />}
+        {(connected > 0 || allConnections.some(server => server.phase === "connecting")) && <button type="button" disabled={busy} onClick={() => void request("cluster_disconnect", {}, "Disconnected")}>Disconnect</button>}
         <button type="button" disabled={busy} onClick={() => void request("cluster_snapshot")}>Refresh</button>
         <button type="button" aria-expanded={consoleOpen} aria-controls={`${panelId}-console`} onClick={() => setConsoleOpen(value => !value)}>Console</button>
         <button type="button" aria-expanded={settingsOpen} aria-controls={`${panelId}-settings`} onClick={() => setSettingsOpen(value => !value)}>Settings</button>
@@ -486,8 +510,8 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
     {!presentationOnly && !live?.logbookDataLoaded && <p className="live-cluster-note">No integrated logbook is open; worked and confirmed status remains Unknown.</p>}
     {!presentationOnly && !live?.countryDataLoaded && <p className="live-cluster-note">Country reference data is unavailable; DXCC status stays Unknown.</p>}
     {!presentationOnly && snapshotTruncated && <p className="live-cluster-note">The live snapshot exceeded the worker limit; older console lines or spots are hidden. Narrow filters to view more.</p>}
-    {error && <p className="live-cluster-error" role="alert">{error}</p>}
-    {message && <p className="live-cluster-message" role="status">{message}</p>}{saveToast.toast}
+    {error && <ErrorNotice><p className="live-cluster-error" role="alert">{error}</p></ErrorNotice>}
+    {message && <ErrorNotice when={true} title="Message"><p className="live-cluster-message" role="status">{message}</p></ErrorNotice>}{saveToast.toast}
     {!presentationOnly && renderToolbarPanels()}
 
     {!presentationOnly && <div className="live-cluster-filter-container"><div className="live-cluster-filterrail" aria-label="Spot filters">
@@ -556,7 +580,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
       className={`${(selectedSpotId ?? selectedSpot?.id) === spot.id ? "is-selected" : ""}${spot.id===currentVfoSpot?" is-current-vfo":""}${spot.marked ? " is-marked" : ""} ${index % 2 ? "is-odd" : "is-even"}`}
       onClick={()=>{setSelectedSpot(spot);onSelect(spot);}} onContextMenu={event=>onSpotContextMenu?.(spot,event)}
       onKeyDown={event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();setSelectedSpot(spot);onSelect(spot);}
-        else if(event.key==="ContextMenu"||event.shiftKey&&event.key==="F10")onSpotContextMenu?.(spot,event);}}
+        else if(event.key==="ContextMenu"||event.shiftKey&&event.key==="F10"){if(onSpotContextMenu)onSpotContextMenu(spot,event);else alertMenu.onKeyDown(event,spot);}}}
       aria-label={`${spot.callsign}${spot.marked?" marked":""} spot`} title="Load this spot into the contest draft and tune the selected radio">
       {contestColumns.map(([id])=>{
         switch(id){
@@ -591,7 +615,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
       style={{ backgroundColor: presentationOnly || classic || (selectedSpotId ?? selectedSpot?.id) === spot.id ? undefined : clusterRowTint(spot.dxccStatus, configuration?.palette.status) }}
       onClick={() => { setSelectedSpot(spot); onSelect(spot); }} onContextMenu={event => onSpotContextMenu?.(spot, event)}
       onKeyDown={event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();setSelectedSpot(spot);onSelect(spot);}
-        else if(event.key==="ContextMenu"||event.shiftKey&&event.key==="F10")onSpotContextMenu?.(spot,event);}}
+        else if(event.key==="ContextMenu"||event.shiftKey&&event.key==="F10"){if(onSpotContextMenu)onSpotContextMenu(spot,event);else alertMenu.onKeyDown(event,spot);}}}
       aria-label={`${spot.callsign}${spot.marked?" marked":""} spot`}
       title={presentationOnly ? "Load this spot into the contest draft and tune the selected radio" : "Load this spot into the logger and tune through xCat"}>
       <td hidden={!visibleColumns.has("time")} className="mono live-cluster-age live-cluster-age-strip"
@@ -599,8 +623,8 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
       <td hidden={!visibleColumns.has("score")}><span className={`live-cluster-score ${(displayedScore??0) >= 80 ? "priority" : (displayedScore??0) >= 55 ? "high" : (displayedScore??0) >= 30 ? "medium" : "low"}`}>{displayedScore??"—"}</span></td>
       <td hidden={!visibleColumns.has("band")}><span className="live-cluster-category" style={{ color: paletteColor(spot.band, configuration?.palette.band, clusterBandColors) }}>{spot.band}</span></td>
       <td hidden={!visibleColumns.has("frequency")} className="cyan mono">{formatSpotFrequency(spot.frequencyKHz * 1000)}</td>
-      <td hidden={!visibleColumns.has("callsign")}>{presentationOnly ? <span className="live-cluster-call">{spot.marked && <span className="live-cluster-mark" aria-label="Marked">★ </span>}{spot.callsign}</span>
-        : <button type="button" className="call-button live-cluster-call" onClick={(event) => { event.stopPropagation(); void openHistory(spot); }} title="Show previous QSOs">{spot.callsign}</button>}</td>
+      <td hidden={!visibleColumns.has("callsign")} onContextMenu={!presentationOnly && !contestPresentation ? event => alertMenu.open(event, spot) : undefined}>{presentationOnly ? <span className="live-cluster-call">{spot.marked && <span className="live-cluster-mark" aria-label="Marked">★ </span>}{spot.callsign}</span>
+        : <span className="live-cluster-call">{spot.callsign}</span>}</td>
       <td hidden={!visibleColumns.has("mode")}><span className="live-cluster-category" style={{ color: paletteColor(spot.mode, configuration?.palette.mode, clusterModeColors) }}>{spot.mode}</span></td>
       <td hidden={!visibleColumns.has("country")} title={countryDisplay(spot.country)}>{countryDisplay(spot.country)}</td><td hidden={!visibleColumns.has("cq")}>{spot.cqZone ?? "—"}</td>
       <td hidden={!visibleColumns.has("spotter")} title={`${isRbnSource(spot.source) ? "RBN" : "DX Cluster"} · ${spot.clusterName}`}>{spot.aggregateCount > 1 ? `${spot.spotter} +${spot.aggregateCount - 1}` : spot.spotter}</td>
@@ -609,13 +633,13 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
       <td hidden={!visibleColumns.has("special")} className="live-cluster-special">{clusterSpotTags(spot).length
         ? clusterSpotTags(spot).slice(0, 2).map(tag => <span className="live-cluster-special-tag" style={{ ...specialTagColors(tag), ...(classic ? { backgroundColor: "transparent" } : {}) }} key={tag}>{tag}</span>)
         : "—"}</td>
-      <td hidden={!visibleColumns.has("workedBefore")} title={formatDate(spot.workedBefore)} className="live-cluster-worked-before">{spot.workedBefore == null ? "—" : `✓ ${formatDate(spot.workedBefore)}`}</td>
+      <td hidden={!visibleColumns.has("workedBefore")} title={formatDate(spot.workedBefore)} className="live-cluster-worked-before">{presentationOnly ? formatDate(spot.workedBefore) : <button type="button" className="call-button" title="Show previous QSOs" aria-label={`Show previous QSOs for ${spot.callsign}`} onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openHistory(spot); }}>{spot.workedBefore == null ? "—" : `✓ ${formatDate(spot.workedBefore)}`}</button>}</td>
       <td hidden={!visibleColumns.has("comment")} title={spot.comment}>{spot.comment || "—"}</td>
     </tr>;})}</tbody></table>}
       {!spotCount && <p className="empty">{contestPresentation && (live?.spots.length??0)>0 ? "No needed CQ WW spots. Enable Show worked to include duplicates." : presentationOnly ? connected ? "No shared cluster spots are available." : "No shared spots. Use Connect above to receive live spots." : connected ? "No live spots match the current filters." : configuration?.servers.some(server => server.enabled) ? "Your cluster is configured. Use Connect to resume live spots; the radio can remain offline." : "Configure a cluster, then connect to receive live spots."}</p>}
     </div>
     {presentationOnly && <footer className={`live-cluster-terminal-status ${connected ? "is-connected" : "is-disconnected"}`}>
-      <span role="status" aria-label="Contest cluster connection">{connected ? `Connected · ${connected} cluster${connected === 1 ? "" : "s"}` : "Disconnected"}</span>
+      <ErrorNotice><span role="status" aria-label="Contest cluster connection">{connected ? `Connected · ${connected} cluster${connected === 1 ? "" : "s"}` : "Disconnected"}</span></ErrorNotice>
       <nav aria-label="Cluster pages"><button type="button" disabled={currentSpotPage === 0} onClick={() => setSpotPage(currentSpotPage - 1)}>Previous</button>
         <output aria-label="Cluster page">{spotCount ? `${firstSpotIndex + 1}–${Math.min(firstSpotIndex + pageSize, spotCount)} of ${spotCount}` : "0 spots"}</output>
         <button type="button" disabled={currentSpotPage + 1 >= pageCount} onClick={() => setSpotPage(currentSpotPage + 1)}>Next</button></nav>
@@ -663,10 +687,16 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
         <button type="button" disabled={!live?.console.length} onClick={() => { void navigator.clipboard.writeText((live?.console ?? []).map((line) => `${formatDate(line.receivedAt)} · ${line.source} · ${line.text}`).join("\n")).then(() => setMessage("Transcript copied")).catch(() => setError("Could not copy the transcript.")); }}>Copy</button>
       </div>
       <div className="live-cluster-transcript" role="log" aria-live="polite">{live?.console.length ? live.console.map((line, index) => <p key={`${line.receivedAt}-${index}`}><time>{formatDate(line.receivedAt)}</time><b>{line.source}</b><span>{line.text}</span></p>) : <p>No cluster replies yet.</p>}</div>
-    </section>
+    {alertMenu.overlay}</section>
 
     <section className="live-cluster-settings" id={`${panelId}-settings`} hidden={!settingsOpen} aria-labelledby={`${panelId}-settings-title`}><h3 id={`${panelId}-settings-title`}>Cluster settings</h3>
       {configuration && <div className="live-cluster-settings-body">
+        <button type="button" disabled={busy} onClick={() => void saveConfig()}>Save cluster settings</button>
+        {settingsOnly && <div className="live-actions">
+          <button type="button" disabled={busy || !configuration.servers.some(server => server.enabled)} onClick={() => void saveConfig(connected ? "reconnect" : "connect")}>
+            {JSON.stringify(configuration) !== JSON.stringify(draftBaseConfiguration.current) ? "Save & " : ""}{connected ? "Reconnect" : "Connect"}</button>
+          <button type="button" disabled={busy || !allConnections.length} onClick={() => void request("cluster_disconnect", {}, "Disconnected")}>Disconnect</button>
+        </div>}
         <div className="live-cluster-setting-row"><label>Maximum visible spots <select value={configuration.maximumSpots} onChange={(event) => setConfiguration({ ...configuration, maximumSpots: Number(event.target.value) })}>{[50, 100, 200, 500].map((count) => <option key={count}>{count}</option>)}</select></label>
           <label><input type="checkbox" checked={configuration.connectOnStartup} onChange={(event) => setConfiguration({ ...configuration, connectOnStartup: event.target.checked })} /> Connect automatically when xLog starts</label>
           <label><input type="checkbox" checked={configuration.requestRecentSpotsOnConnect} onChange={(event) => setConfiguration({ ...configuration, requestRecentSpotsOnConnect: event.target.checked })} /> Request 100 recent DX spots after connecting</label>
@@ -705,7 +735,7 @@ export function ClusterPanel({ snapshot, onRequest, onSelect, passive = false, p
           <button type="button" onClick={() => setConfiguration({ ...configuration, specialRules: configuration.specialRules.filter((item) => item.id !== rule.id) })}>Remove rule</button>
         </div>)}<button type="button" disabled={configuration.specialRules.length >= 64} onClick={() => setConfiguration({ ...configuration, specialRules: [...configuration.specialRules, { id: crypto.randomUUID(), name: "", keywords: [], referenceFormat: "none", advancedPattern: "", enabled: true }] })}>Add special rule</button></div></details>
         <details><summary>Status, band and mode colours</summary>{(["status", "band", "mode"] as const).map((family) => <div className="live-cluster-colours" key={family}><h4>{family}</h4>{Object.entries(configuration.palette[family]).map(([name, colour]) => <label key={name}>{name}<input type="color" value={colour} onChange={(event) => setConfiguration({ ...configuration, palette: { ...configuration.palette, [family]: { ...configuration.palette[family], [name]: event.target.value } } })} /></label>)}</div>)}</details>
-        <button type="button" disabled={busy} onClick={() => void saveConfig()}>Save cluster settings</button>
+
       </div>}
     </section>
     </div>;

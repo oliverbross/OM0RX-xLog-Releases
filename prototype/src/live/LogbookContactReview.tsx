@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { requestQSODataQuality, requestQSOCorrectionPreview, type QSODataQualityEvidence,
   type QSODataQualityReport, type QSOCorrectionPreview } from "../worker";
@@ -151,7 +152,7 @@ export function LogbookContactReview({ contactID, call, onRequest, pageContext, 
   const canPreviewCTY = !!contact && !!report?.referenceComparison &&
     report.findings.some(finding => finding.kind === "storedDXCCDisagreesWithReference");
   return <section id="logbook-contact-details" className="live-logbook-contact-review" aria-label={`Details for ${call}`} aria-busy={loading || reading || previewing} tabIndex={0}>
-    {loading ? <p role="status">Reading canonical contact…</p> : contact && renderContact(contact)}
+    {loading ? <ErrorNotice><p role="status">Reading canonical contact…</p></ErrorNotice> : contact && renderContact(contact)}
     <section className="qso-quality" aria-label="Read-only data quality">
       <div className="qso-quality-actions"><h3>Data quality · read only</h3>
         <button type="button" disabled={!contact || loading || reading || previewing || retired} onClick={() => void inspect()}>Read findings</button>
@@ -159,13 +160,13 @@ export function LogbookContactReview({ contactID, call, onRequest, pageContext, 
       </div>
       <p>Stored values remain authoritative. Comparisons are not corrections, eligibility, completion or sponsor credit. No award or sync delta is calculated.</p>
       {contact && <p>Exact contact revision {contact.revision}. Record updated {String(contact.qso.updatedAt ?? "Unknown")} — not a field-origin date.</p>}
-      {error && <p role="alert">{error}</p>}
-      {previewing && <p role="status">Checking the exact CTY comparison…</p>}
+      {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
+      {previewing && <ErrorNotice><p role="status">Checking the exact CTY comparison…</p></ErrorNotice>}
       {correctionPreview && <section className="qso-correction-preview" aria-label="Read-only DXCC correction preview">
         <p>DXCC preview: {correctionPreview.retainedValue ?? "Not recorded"} → {correctionPreview.proposedValue}</p>
         <p>No change has been applied. Apply and undo are not available from this read-only preview.</p>
       </section>}
-      {reading ? <p role="status">Reading local findings…</p> : report ? <>
+      {reading ? <ErrorNotice><p role="status">Reading local findings…</p></ErrorNotice> : report ? <>
         <p>Conflict alternatives not requested. CTY comparison: {report.referenceStatus === "resolved" ? "Resolved locally" : report.referenceStatus === "notProvided" ? "Reference unavailable" : report.referenceStatus === "unresolved" ? "Unresolved" : "Contact date invalid"}.</p>
         <DuplicateReview value={report.duplicateReview} />
         <details><summary>Retained field evidence and reference context</summary>

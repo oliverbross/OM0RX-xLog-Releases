@@ -49,3 +49,7 @@
   .dxp-list { display:block; flex:0 0 auto; }
   .dxp-card { height:auto; min-height:100px; margin-bottom:7px; }
 }
+
+.dxp-pin > * { pointer-events: none; }
+.dxp-pin-body small:empty { display: none; }
+.dxp-map { isolation: isolate; }

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import {useEffect,useRef,useState} from "react";
 import {workerRequest} from "../worker";
 import {normalActions,checkedBindings,bindingFor,bindingConflict,chordForEvent,defaultNormalBindings,displayChord,setNormalBindings,type NormalAction,type NormalBindings} from "./normalCommands";
@@ -69,7 +70,7 @@ export function NormalShortcutSettings(){
     {!!unknown.length&&<p>Unavailable actions preserved from another version: {unknown.join(", ")}</p>}
     <button type="button" onClick={()=>setDraft({version:1,overrides:Object.fromEntries(unknown.map(id=>[id,draft.overrides[id]]))})}>Reset all supported actions</button>
     <button type="button" disabled={!base||busy} onClick={()=>void save()}>Save shortcuts</button>
-    {captureState&&<p role="status">{captureState.phase==="pending"?"Preparing native capture — wait for confirmation.":"Recording shortcut. Press a supported chord; Tab leaves capture."}</p>}
-    {error&&<p role="alert">{error}</p>}{message&&<p role="status">{message}</p>}
+    {captureState&&<ErrorNotice><p role="status">{captureState.phase==="pending"?"Preparing native capture — wait for confirmation.":"Recording shortcut. Press a supported chord; Tab leaves capture."}</p></ErrorNotice>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{message&&<ErrorNotice><p role="status">{message}</p></ErrorNotice>}
   </section>;
 }

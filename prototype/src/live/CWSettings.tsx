@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { cwColors, cwOutputLimit, cwShortcuts, cwTokens, defaultCWProfile, expandCWMacro, type CWContext, type CWMacro, type CWProfile, type WinKeyerPreferences } from "./cwMacros";
@@ -64,10 +65,10 @@ export default function CWSettings({ value, saved, onChange, context = {}, reque
         <button type="button" disabled={busy || dirty || live?.phase !== "ready" || !request} onClick={() => void act("winkeyer_speed", { generation: live?.generation, wpm: keyer.wpm })}>Apply saved speed</button>
       </div>
       {dirty && <p>Save settings before connecting or applying speed.</p>}
-      <p role="status">WinKeyer: {live?.phase ?? "disconnected"}{live?.firmware ? ` · firmware ${live.firmware}` : ""}{live?.error ? ` · ${live.error}` : ""}</p>
+      <ErrorNotice when={Boolean(live?.error) || undefined}><p role="status">WinKeyer: {live?.phase ?? "disconnected"}{live?.firmware ? ` · firmware ${live.firmware}` : ""}{live?.error ? ` · ${live.error}` : ""}</p></ErrorNotice>
       {live && <div role="status"><p>Applied speed source: {live.speed_source ?? "inherited"}{live.requested_wpm ? ` · requested ${live.requested_wpm} WPM` : ""}. Pot report: {live.pot_wpm != null ? `${live.pot_wpm} WPM` : live.pot_position != null ? `position ${live.pot_position}; range not known` : "unavailable"}{live.pot_age_ms != null && live.pot_age_ms > 2000 ? " · stale" : ""}.</p><p>Device echo · uncorrelated, no RF confirmation: {live.reported_echo || "none"}</p><p>{live.configuration_uncertain ? "Configuration uncertain; reconnect after checking the keyer." : live.applied_commands?.length ? `Commands accepted: ${live.applied_commands.join(", ")}. No option readback.` : "No preferences applied this connection."}</p></div>}
       {live?.phase === "uncertain" && live?.owns_output && <label className="cw-check"><input type="checkbox" checked={checkedStopped} onChange={event => setCheckedStopped(event.target.checked)} />I physically checked that the keyer output has stopped</label>}
-      {message && <p role="status">{message}</p>}
+      {message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}
     </div>}
     <div className="cw-editor">
       <div className="cw-list"><div className="cw-list-heading"><strong>Messages · {profile.macros.length}/20</strong><button type="button" aria-label="Add CW macro" disabled={profile.macros.length >= 20} onClick={() => {

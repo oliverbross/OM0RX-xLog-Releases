@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./live/ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
 import geometryUrl from "../../Sources/XLogCore/Resources/dxcc-boundaries.geojson?url";
 import { grayline, greatCircle, solarPosition, type Coordinate } from "./MapGeography";
@@ -95,8 +96,8 @@ export default function SoftwareWorldMap<T extends MapSpot>({ spots, selected, o
     </g>;
   };
   return <div className="software-map" data-map-renderer="svg">
-    <p className="software-map-notice" role="status">Compatibility map · bundled geography · satellite imagery unavailable</p>
-    {error ? <p role="alert">{error} <button type="button" onClick={() => setAttempt(value => value + 1)}>Reload map</button></p> : null}
+    <ErrorNotice><p className="software-map-notice" role="status">Compatibility map · bundled geography · satellite imagery unavailable</p></ErrorNotice>
+    {error ? <ErrorNotice><p role="alert">{error} <button type="button" onClick={() => setAttempt(value => value + 1)}>Reload map</button></p></ErrorNotice> : null}
     <svg viewBox={`${left} ${top} ${width} ${height}`} role="region" tabIndex={0}
       aria-label="Interactive compatibility world map, arrow keys pan, plus and minus zoom"
       onKeyDown={event => {

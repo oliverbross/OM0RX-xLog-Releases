@@ -1,10 +1,11 @@
+import { ErrorNotice } from "./ErrorNotice";
 import type { DraftSessionState, OperatorDraftSession } from "./operatorDraftSession";
 
 type Props = { state: DraftSessionState; session: OperatorDraftSession;
   run: (action: () => Promise<unknown>) => Promise<void> };
 export function OperatorDraftStatus({ state, session, run }: Props) {
   if (!state.error && !state.conflict) return null;
-  return <div className="live-error contact-recovery" role="alert" aria-label="QSO draft recovery">
+  return <ErrorNotice><div className="live-error contact-recovery" role="alert" aria-label="QSO draft recovery">
     <span>{state.error || "The shared QSO draft has changed. Your local text is retained."}</span>
     {state.workspaceChanged ? <>
       <button type="button" disabled={state.locked} onClick={() => void run(() => session.useShared())}>Load current workspace draft</button>
@@ -18,5 +19,5 @@ export function OperatorDraftStatus({ state, session, run }: Props) {
       {state.conflict.qso.id === state.draft?.id && <button type="button" disabled={state.locked} onClick={() => void run(async () => { session.keepLocal(); await session.flush(); })}>Keep my text</button>}
       <button type="button" onClick={() => void run(() => navigator.clipboard.writeText(JSON.stringify(state.draft, null, 2)))}>Copy my draft</button>
     </> : !state.locked && <button type="button" onClick={() => void run(() => session.flush())}>Retry draft save</button>}
-  </div>;
+  </div></ErrorNotice>;
 }

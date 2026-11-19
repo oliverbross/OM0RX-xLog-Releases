@@ -40,31 +40,43 @@ let portableDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-crypto.git", exact: "3.8.0"),
 ]
 let portableCrypto: [Target.Dependency] = [.product(name: "Crypto", package: "swift-crypto")]
+#if os(Windows)
+let nativeTransferTargets: [Target] = [.target(name: "CCurlBackup", cSettings: [.define("CURL_STATICLIB")],
+    linkerSettings: ["libcurl", "crypt32", "secur32", "bcrypt", "ws2_32", "advapi32", "iphlpapi", "normaliz", "zlib"].map { .linkedLibrary($0) })]
+let windowsCoreSources = ["FTPBackupTransport.swift", "XCatClient.swift"]
+#else
 let nativeTransferTargets: [Target] = []
+let windowsCoreSources: [String] = []
+#endif
 let sqlitePkgConfig: String? = "sqlite3"
 let liveCoreName = "XLogPortableCore"
 let liveIntegrationDependencies: [Target.Dependency] = ["XCatIntegrationCore"]
+#if os(Windows)
+let windowsStationSources = ["Models.swift", "DXSpot.swift", "FlexRadioClient.swift", "WindowsTCPConnection.swift", "WindowsTCPListener.swift", "Rotator.swift", "RemoteAgentModels.swift", "RemoteAgentClient.swift", "RemoteStationConfiguration.swift", "TCIWebSocketSession.swift", "CATCommandProcessor.swift", "RigCtlCommandProcessor.swift", "TCPCommandServer.swift"]
+#else
+let windowsStationSources: [String] = []
+#endif
 let prototypeCoreTargets: [Target] = [
     // Propagation and protocol parsing share the native implementation.
     // Radio/network owners remain excluded from this portable source slice.
-    .target(name: "XCatIntegrationCore", exclude: [
+    .target(name: "XCatIntegrationCore", dependencies: [.target(name: "CClusterSocket", condition: .when(platforms: [.windows]))], exclude: [
         "Models.swift", "DXSpot.swift", "SmartLinkRadioClient.swift", "CATCommandProcessor.swift", "SimulatedRadio.swift",
-        "RemoteStationConfiguration.swift", "FlexRadioClient.swift", "Rotator.swift",
+        "RemoteStationConfiguration.swift", "FlexRadioClient.swift", "Rotator.swift", "WindowsTCPConnection.swift",
         "RigCtlCommandProcessor.swift", "RemoteAgentModels.swift", "RemoteAgentClient.swift",
         "TCPCommandServer.swift", "LegacyXCATClient.swift", "SmartLinkBroker.swift",
-        "SmartLinkAuth.swift", "RemoteAgentAuth.swift"
-    ], sources: ["XCatError.swift", "PropagationConditions.swift", "TCIProtocol.swift",
-                 "FlexCWX.swift"]),
-    .target(name: "XLogPortableCore", dependencies: portableCrypto + ["CSQLitePrototype", .target(name: "CPlatformDigest", condition: .when(platforms: [.windows]))], path: "Sources/XLogCore",
+        "SmartLinkAuth.swift", "RemoteAgentAuth.swift", "WindowsTCPListener.swift"
+    ].filter { !windowsStationSources.contains($0) }, sources: ["XCatError.swift", "PropagationConditions.swift", "TCIProtocol.swift",
+                 "FlexCWX.swift", "FlexDAXAssignment.swift", "DigitalPTTPermit.swift"] + windowsStationSources),
+    .target(name: "XLogPortableCore", dependencies: portableCrypto + nativeTransferTargets.map { Target.Dependency.byName(name: $0.name) } + [.target(name: "CClusterSocket", condition: .when(platforms: [.windows])), .target(name: "CZlibReference", condition: .when(platforms: [.windows])), "CSQLitePrototype", .target(name: "CPlatformDigest", condition: .when(platforms: [.windows]))], path: "Sources/XLogCore",
         exclude: ["DXCCBoundaries.swift", "FlexSpotForwarder.swift",
                   "SecretStore.swift",
-                  "Solar.swift", "TransmitPowerCapture.swift", "XCatClient.swift"],
-        sources: ["ADIF.swift", "Models.swift", "QSOADIF.swift", "SemanticQSOIdentity.swift", "OnlineLogDelivery.swift", "WavelogClient.swift", "QRZClient.swift", "SyncEngine.swift",
+                  "Solar.swift", "TransmitPowerCapture.swift", "XCatClient.swift"].filter { !windowsCoreSources.contains($0) },
+        sources: ["ADIF.swift", "Models.swift", "QSOADIF.swift", "SemanticQSOIdentity.swift", "OnlineLogDelivery.swift", "WavelogClient.swift", "QRZClient.swift", "SyncEngine.swift", "CompanionLogbookRead.swift", "CompanionContactDetail.swift", "CompanionBearing.swift",
                   "LogbookDatabase.swift", "LogbookQuery.swift", "LogbookAggregateRead.swift", "HMControlLogbook.swift", "ContestLogTransfer.swift", "SpotHistoryDatabase.swift", "OperatorDraft.swift", "OperatorDraftNearbyCallsign.swift", "OperatorDraftPower.swift", "SpotDraftActivation.swift", "LogbookContact.swift", "WorkspaceLayout.swift", "IntegrationWorkspace.swift", "Settings.swift", "CWProfile.swift", "VoiceProfile.swift",
                   "BackupManager.swift", "BackupEnvelope.swift", "NativeBackupRestoreOwner.swift", "RemoteBackupPlanning.swift", "FTPBackupConfiguration.swift", "SFTPBackupConfiguration.swift", "RemoteBackupRetentionReview.swift", "RemoteBackupAuthorization.swift", "RemoteBackupScheduler.swift", "RemoteBackupOwner.swift", "RemoteBackupHostDriver.swift", "RemoteBackupLocalAdapters.swift", "DropboxBackupTransport.swift", "DropboxBackupHTTPClient.swift", "GoogleDriveBackupTransport.swift", "GoogleDriveBackupHTTPClient.swift", "OneDriveBackupTransport.swift", "OneDriveBackupHTTPClient.swift", "LocalFilePermissions.swift", "LocalFilePath.swift", "CTYResolver.swift", "Geo.swift",
                   "OperatingSupport.swift", "OperatorIntelligence.swift", "AwardCatalog.swift", "LocalAwardProgress.swift", "LocalAwardPresentation.swift", "AntennaPortableContext.swift", "POTAExport.swift", "BandMapGuides.swift",
                   "AwardRegistry.swift", "AwardReferences.swift", "ClusterSpotFeed.swift",
-                  "ActivationReferenceDirectory.swift", "OpportunityFeeds.swift", "WeatherClient.swift", "ReferenceDataUpdater.swift"],
+                  "ActivationReferenceDirectory.swift", "OpportunityFeeds.swift", "WeatherClient.swift", "ReferenceDataUpdater.swift"] + windowsCoreSources,
         resources: [.process("Resources")])
 ]
 #endif
@@ -81,8 +93,13 @@ var prototypeSupportDependencies: [Target.Dependency] = [
 prototypeSupportDependencies.append(contentsOf: portableCrypto)
 prototypeSupportDependencies.append(contentsOf: liveIntegrationDependencies)
 var portableTargets = nativeTransferTargets + platformVaultTargets
+#if os(Windows)
+prototypeSupportDependencies.append(contentsOf: ["CWindowsOfflineProfile", "CClusterSocket"])
+portableTargets.append(.target(name: "CWindowsOfflineProfile", linkerSettings: [.linkedLibrary("Advapi32")]))
+#endif
 portableTargets.append(contentsOf: prototypeCoreTargets)
 portableTargets.append(contentsOf: [
+    .systemLibrary(name: "CZlibReference"),
     .systemLibrary(name: "CSQLitePrototype", pkgConfig: sqlitePkgConfig, providers: [.apt(["libsqlite3-dev"])]),
     .target(name: "CPlatformDigest", linkerSettings: [.linkedLibrary("bcrypt", .when(platforms: [.windows]))]),
     .target(name: "CClusterSocket", linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]),

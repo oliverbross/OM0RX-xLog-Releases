@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
@@ -210,7 +211,7 @@ export function DetachedContestSetupDialog() {
   }, [kind, snapshot]);
   const title = kind === "station" ? "Station Settings" : kind === "macros" ? "Edit Macros" : kind === "keys" ? "Edit Keys" : "Configuration Settings";
   return <main ref={shell} className="contest-workspace contest-setup-dialog" data-dialog-kind={kind} aria-label={title}>
-    {error && <><p role="alert">{error}</p><button type="button" onClick={() => void closeContestSetupDialog()}>Cancel</button></>}
+    {error && <><ErrorNotice><p role="alert">{error}</p></ErrorNotice><button type="button" onClick={() => void closeContestSetupDialog()}>Cancel</button></>}
     {snapshot ? <ContestSetupPanel value={snapshot.document} sessions={[]} catalog={snapshot.auxiliary.catalog ?? []} detachedDialog={kind}
       activeSessionID={snapshot.auxiliary.activeSessionID} effectiveMacros={snapshot.auxiliary.effectiveMacros}
       initialTab={kind === "station" ? "Station" : kind === "macros" ? "Macros" : kind === "keys" ? "Key bindings" : "Lookup"} onCancel={closeContestSetupDialog}
@@ -218,6 +219,6 @@ export function DetachedContestSetupDialog() {
       onSave={async document => { await saveContestSetupDialog(snapshot, document); await closeContestSetupDialog(); }}
       onCreate={async () => { throw new Error("Create contests in Contest Setup."); }}
       onOpen={async () => { throw new Error("Choose contests in Contest Setup."); }} onOpenSettings={openContestSetupService}/>
-      : !error && <p role="status">Loading settings…</p>}
+      : !error && <ErrorNotice><p role="status">Loading settings…</p></ErrorNotice>}
   </main>;
 }

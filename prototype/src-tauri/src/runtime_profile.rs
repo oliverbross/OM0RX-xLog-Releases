@@ -11,9 +11,18 @@ fn offline_coordinate(args: &[String]) -> Result<Option<(std::path::PathBuf, uui
         return Err("Offline contest acceptance requires one production-candidate launch coordinate.".into());
     }
     let root = std::path::PathBuf::from(values[0]);
+    #[cfg(windows)]
+    let root = dunce::simplified(&root).to_path_buf();
     let canonical = root.canonicalize().map_err(|_| "Offline acceptance directory is unavailable")?;
+    #[cfg(windows)]
+    let canonical = dunce::simplified(&canonical).to_path_buf();
     let temp = std::env::temp_dir().canonicalize().map_err(|_| "Temporary directory unavailable")?;
+    #[cfg(windows)]
+    let temp = dunce::simplified(&temp).to_path_buf();
+    #[cfg(not(windows))]
     let system_temp = std::path::Path::new("/tmp").canonicalize().unwrap_or_else(|_| temp.clone());
+    #[cfg(windows)]
+    let system_temp = temp.clone();
     if !root.is_absolute() || root != canonical || !root.file_name().is_some_and(|name| name.to_string_lossy().starts_with("xlog-wave1-"))
         || ![temp, system_temp].iter().any(|parent| root.parent() == Some(parent.as_path())) {
         return Err("Offline acceptance requires a canonical xlog-wave1-* directory directly in temporary storage.".into());
@@ -26,6 +35,10 @@ fn offline_coordinate(args: &[String]) -> Result<Option<(std::path::PathBuf, uui
     }
     let marker = root.join(".xlog-offline-acceptance.json");
     if !std::fs::symlink_metadata(&marker).map_err(|e| e.to_string())?.is_file() { return Err("Offline acceptance marker must be a regular file.".into()); }
+    #[cfg(windows)]
+    if !private_windows_path(&root, true) || !private_windows_path(&marker, false) {
+        return Err("Offline acceptance requires a private Windows directory and marker.".into());
+    }
     let bytes = std::fs::read(marker).map_err(|e| e.to_string())?;
     if bytes.len() > 1024 { return Err("Offline acceptance marker is too large.".into()); }
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
@@ -34,8 +47,29 @@ fn offline_coordinate(args: &[String]) -> Result<Option<(std::path::PathBuf, uui
     Ok(Some((root, id)))
 }
 
+#[cfg(windows)]
+fn private_windows_path(path: &std::path::Path, directory: bool) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    extern "C" { fn xlog_private_windows_path(path: *const u16, directory: i32) -> i32; }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe { xlog_private_windows_path(wide.as_ptr(), i32::from(directory)) != 0 }
+}
+
 pub(crate) fn configure_offline(args: Vec<String>, config: &mut tauri::utils::config::Config) -> Result<(), String> {
     if let Some((root, id)) = offline_coordinate(&args)? {
+        // WebView2 environment settings apply to every view, including views
+        // created later by a plugin. Keep the same private store on restart.
+        #[cfg(windows)]
+        {
+            let browser_data = root.join("WebView2");
+            if !browser_data.exists() {
+                std::fs::create_dir(&browser_data).map_err(|err| err.to_string())?;
+            }
+            if !private_windows_path(&browser_data, true) {
+                return Err("Offline WebView2 storage must be a private directory in the fixture.".into());
+            }
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", browser_data);
+        }
         config.identifier = format!("com.oliverbross.xlog.wave1-acceptance.{}", id.simple());
         configure_offline_windows(config, id);
         config.app.security.csp = Some(tauri::utils::config::Csp::Policy(
@@ -60,10 +94,19 @@ pub(crate) fn connected_loopback() -> bool {
         .filter(|bytes|bytes.len()<=1024).and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .is_some_and(|marker|marker["schema"]==1&&marker["connectedLoopback"]==true)
 }
+/// This opt-in is considered only after the complete offline launch coordinate
+/// has passed its package, private-path and marker checks. It grants no I/O.
+pub(crate) fn companion_loopback() -> bool {
+    offline_root().and_then(|root| std::fs::read(root.join(".xlog-offline-acceptance.json")).ok())
+        .filter(|bytes| bytes.len() <= 1024)
+        .is_some_and(|bytes| crate::companion_bridge::companion_fixture_marker(&bytes))
+}
 pub(crate) fn require_group_io() -> Result<(),String> {if connected_loopback(){Ok(())}else{require_external_io_disabled()}}
 pub(crate) fn offline_webview(builder: tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle>) -> tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle> {
     #[cfg(target_os = "macos")]
     if let Some((_, id)) = OFFLINE.get() { return builder.data_store_identifier(*id.as_bytes()); }
+    #[cfg(windows)]
+    if let Some(root) = offline_root() { return builder.data_directory(root.join("WebView2")); }
     builder
 }
 
@@ -117,8 +160,22 @@ mod tests {
     #[cfg(not(feature = "contesting-test"))]
     fn offline_acceptance_requires_private_marked_temporary_storage_and_blocks_outputs() {
         let temp = std::env::temp_dir().canonicalize().unwrap();
+        #[cfg(windows)]
+        let temp = dunce::simplified(&temp);
+        #[cfg(not(windows))]
         let directory = tempfile::Builder::new().prefix("xlog-wave1-").tempdir_in(&temp).unwrap();
+        #[cfg(not(windows))]
         let root = directory.path();
+        #[cfg(windows)]
+        let directory = temp.join(format!("xlog-wave1-{}", uuid::Uuid::new_v4()));
+        #[cfg(windows)]
+        let root = {
+            use std::os::windows::ffi::OsStrExt;
+            extern "C" { fn xlog_create_private_windows_directory(path: *const u16) -> i32; }
+            let path: Vec<_> = directory.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            assert_ne!(unsafe { xlog_create_private_windows_directory(path.as_ptr()) }, 0);
+            directory.as_path()
+        };
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let args = vec![format!("{OFFLINE_ARGUMENT}{}", root.display())];
         assert!(offline_coordinate(&args).is_err());
@@ -127,6 +184,11 @@ mod tests {
         assert_eq!(offline_coordinate(&args).unwrap(), Some((root.to_path_buf(), id)));
         assert!(offline_coordinate(&[args[0].clone(), args[0].clone()]).is_err());
         assert!(offline_coordinate(&[args[0].clone(), "--acceptance-report".into()]).is_err());
+        #[cfg(windows)]
+        {
+            std::fs::remove_file(root.join(".xlog-offline-acceptance.json")).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();

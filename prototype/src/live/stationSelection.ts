@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { StationProvider } from "../worker";
 import type { RadioID } from "./stationSession";
+import { isReadContention } from "./readContention";
 export type StationSelection = { radio_id: RadioID; provider: StationProvider; generation: number; selection_id?: string | null; control_revision?: number };
 export type StationSlotSelection = Omit<StationSelection, "provider"> & { provider: StationProvider | null };
 export const nativeStationSelection = () => isTauri() && new URLSearchParams(location.search).get("acceptance") !== "local";
@@ -24,7 +25,7 @@ export function connectStationSelection(radioId: RadioID, legacy: string | null,
       try {
         const value = checked(await invoke("station_selection_snapshot", { radioId, legacy }), radioId);
         if (active && value.generation >= revision) { revision = value.generation; changed(value); }
-      } catch (cause) { if (active) failed(cause instanceof Error ? cause.message : "Native radio selection is unavailable."); }
+      } catch (cause) { if (active && !isReadContention(cause)) failed(cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "Native radio selection is unavailable."); }
     } while (active && again);
     reading = false;
   };

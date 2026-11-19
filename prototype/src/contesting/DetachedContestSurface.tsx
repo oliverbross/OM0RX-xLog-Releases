@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent,
   type ReactNode, type Ref } from "react";
@@ -68,14 +69,16 @@ function useContestSurface(context: Context) {
       const next = message(cause); if (errorRef.current !== next) { errorRef.current = next; setError(next); }
     } return null; }
   }, [context]);
-  useEffect(() => { mounted.current = true; void refresh(); let stop: undefined | (() => void);
+  useEffect(() => { mounted.current = true; void refresh(); let stop: undefined | (() => void), live = true;
     void onContestSurfaceWake(changedPanelID => {
-      if (changedPanelID === null || changedPanelID === context.panelID) void refresh();
-    }).then(value => { if (mounted.current) { stop = value; void refresh(); } else value(); })
-      .catch(cause => { if (mounted.current) setError(message(cause)); });
+      if (live && (changedPanelID === null || changedPanelID === context.panelID)) void refresh();
+    // A listener that arrives after this effect was replaced is released at
+    // once, even though a newer effect has set mounted again.
+    }).then(value => { if (live) { stop = value; void refresh(); } else value(); })
+      .catch(cause => { if (live) setError(message(cause)); });
     const visible = () => { if (document.visibilityState === "visible") void refresh(); };
     window.addEventListener("focus", refresh); document.addEventListener("visibilitychange", visible);
-    return () => { mounted.current = false; ticket.current += 1; stop?.(); window.removeEventListener("focus", refresh);
+    return () => { live = false; mounted.current = false; ticket.current += 1; stop?.(); window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", visible); };
   }, [refresh]);
   const retryableLoading = (snapshot === null || snapshot.projection.status === "unavailable") &&
@@ -220,15 +223,16 @@ function Surface({ context }: { context: Context }) {
         if(!editing){await closeContestContactEditorWindow();return;}
         const result=await send({action:"log_edit_cancel",params:{qsoID:editing.qsoID}},current!.projectionRevision,{safePresentation:true});
         if(result.applied)await closeContestContactEditorWindow();
-      }finally{closingEditor.current=false;}
+      }catch(cause){if(active)reportDiagnostic("error",`The contact editor could not close: ${cause instanceof Error?cause.message:String(cause)}`);}
+      finally{closingEditor.current=false;}
     }).then(dispose=>{if(active)unlisten=dispose;else dispose();}).catch(()=>{});
     return()=>{active=false;unlisten?.();};
-  },[editorOnly,refresh,send]);
-  if (!snapshot) return <main aria-label="Contest panel"><p role="status">Loading shared contest panel…</p>{context.panelID==="messages"&&error&&<p role="alert">{error}</p>}</main>;
+  },[editorOnly,refresh,send,reportDiagnostic]);
+  if (!snapshot) return <main aria-label="Contest panel"><ErrorNotice><p role="status">Loading shared contest panel…</p></ErrorNotice>{context.panelID==="messages"&&error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}</main>;
   const projection = snapshot.projection;
   return <main aria-label={`Contest ${context.panelID}`}>
     {projection.status === "unavailable" ? retryableUnavailablePanels.has(context.panelID)
-      ? <p role="status">Loading shared contest panel…</p>
+      ? <ErrorNotice><p role="status">Loading shared contest panel…</p></ErrorNotice>
       : context.panelID === "awards" || context.panelID === "chaser-dx"
       ? <section className="contest-surface-unavailable"><h1>{context.panelID === "awards" ? "DXCC" : "Zones"}</h1>
           <p>{projection.reason??"This multiplier view is not yet implemented for the selected contest."}</p></section>
@@ -269,8 +273,8 @@ function Surface({ context }: { context: Context }) {
 function Messages({projection}:{projection:ContestMessagesSurfaceProjection}) {
   const messages=projection.messages;
   return <section className="contest-surface-messages" aria-label="Contest Messages"><h1>Messages</h1>
-    {messages.length===0?<p>No contest messages.</p>:<ol>{messages.map((item,index)=><li key={`${item.kind}:${index}:${item.text}`}
-      role={item.kind==="error"?"alert":"status"} className={item.kind==="error"?"is-error":undefined}>{item.text}</li>)}</ol>}
+    {messages.length===0?<p>No contest messages.</p>:<ol>{messages.map((item,index)=><ErrorNotice key={`${item.kind}:${index}:${item.text}`}><li key={`${item.kind}:${index}:${item.text}`}
+      role={item.kind==="error"?"alert":"status"} className={item.kind==="error"?"is-error":undefined}>{item.text}</li></ErrorNotice>)}</ol>}
   </section>;
 }
 
@@ -305,7 +309,7 @@ function ScoreReporting({ projection, projectionRevision, send }: { projection: 
       <button type="button" disabled={pending||!username||(!password&&!projection.credentialSaved)} onClick={()=>void configure(projection.reportingEnabled)}>Save securely</button>
       <button type="button" disabled={pending||!projection.credentialSaved} onClick={()=>void sendNow()}>Send score now</button>
     </fieldset>
-    <p id="rtc-reporting-status" className="contest-score-reporting-boundary" role="status"><strong>{projection.reportState.replace(/^[a-z]/,c=>c.toUpperCase())}.</strong> {projection.lastOutcome} {projection.reason}</p>
+    <ErrorNotice><p id="rtc-reporting-status" className="contest-score-reporting-boundary" role="status"><strong>{projection.reportState.replace(/^[a-z]/,c=>c.toUpperCase())}.</strong> {projection.lastOutcome} {projection.reason}</p></ErrorNotice>
     <ul className="contest-score-reporting-services">{projection.services.map(service => <li key={service.id}>
       <span>{service.name}</span><code>{service.url}</code>{service.transportSecurity === "legacy-http" && <em>Legacy HTTP endpoint — not eligible for credentials.</em>}
     </li>)}</ul>
@@ -354,7 +358,7 @@ function ContestSpotsMap({projection,projectionRevision,send}:{projection:Contes
   useEffect(()=>{const connection=connectMapContext(setMapContext,()=>{});
     return()=>connection.dispose();},[]);
   const view=useMemo(()=>contestMapView(projection,mapContext?.cluster.response?.snapshot?.spots??[],mapContext),[projection,mapContext]);
-  return <section className="contest-spots contest-spots-map" aria-label="Contest Spots Map"><Suspense fallback={<p role="status">Loading contest map…</p>}><WorldMap
+  return <section className="contest-spots contest-spots-map" aria-label="Contest Spots Map"><Suspense fallback={<ErrorNotice><p role="status">Loading contest map…</p></ErrorNotice>}><WorldMap
     selected={view.selected} data={view.spots} home={view.home} target={view.target} dxccStatuses={view.dxccStatuses}
     frequencyHz={projection.radioFrequencyHz??undefined}
     onSpot={spot=>void send({action:"spot_select",params:{draftID:projection.draftID,
@@ -612,7 +616,7 @@ function EntryIntentInput({label,accessibleLabel,intentKey,value,maximumUTF8Byte
       element.current=node;if(typeof inputRef==="function")inputRef(node);else if(inputRef)inputRef.current=node;
     }} data-contest-field-id={operatorField} onFocus={onFocus} onSelect={event=>rememberSelection(event.currentTarget)}
     value={value} disabled={disabled} aria-describedby={warning?warningID:undefined} onChange={event=>{rememberSelection(event.currentTarget);const next=event.target.value;if(new TextEncoder().encode(next).length<=maximumUTF8Bytes)
-      onChange(intentKey,next);}}/>{warning&&<small id={warningID} className="contest-exchange-advisory" role="status" title={warning}><span aria-hidden="true">Check exchange</span><span className="contest-advisory-description">{warning}</span></small>}</div>;
+      onChange(intentKey,next);}}/>{warning&&<ErrorNotice><small id={warningID} className="contest-exchange-advisory" role="status" title={warning}><span aria-hidden="true">Check exchange</span><span className="contest-advisory-description">{warning}</span></small></ErrorNotice>}</div>;
 }
 function Entry({ projection, disabled, sending, context, projectionRevision, send, refresh, settle, feedback, clearFeedback, reportConflict }: { projection: any; disabled: boolean; sending:boolean;
   context:ContestSurfaceContext;
@@ -839,9 +843,9 @@ function Entry({ projection, disabled, sending, context, projectionRevision, sen
       <button type="submit" disabled={!cwInput.trim()||disabled||sending||!operator?.outputAvailable||operator.status==="uncertain"||!operator.armed}>Send</button>
       <button type="button" onClick={closeCWInput}>Close</button>
     </form>}
-    {testSimulation&&<p role="status" className="contest-alert">{projection.draft.mode === "SSB"
+    {testSimulation&&<ErrorNotice><p role="status" className="contest-alert">{projection.draft.mode === "SSB"
       ? "CONTESTING TEST · simulated SSB voice-keyer intent only · no audio playback, RF, PTT, radio, or network output"
-      : "CONTESTING TEST · simulated CW only · no RF, audio, PTT, radio, or network output"}</p>}
+      : "CONTESTING TEST · simulated CW only · no RF, audio, PTT, radio, or network output"}</p></ErrorNotice>}
     <div className="contest-surface-logging-body"><aside className="contest-surface-band-ladder" aria-label="Current band and mode"><strong>{projection.draft.mode}</strong>{displayedBands.map((band:string)=><span key={band} aria-current={projection.draft.band===band?"true":undefined}>{band.replace("m","")}</span>)}</aside>
     <div className="contest-surface-logging-controls">
     <div className="contest-surface-main-fields" style={{"--contest-entry-field-columns":entryFieldColumns} as CSSProperties}>
@@ -866,7 +870,7 @@ function Entry({ projection, disabled, sending, context, projectionRevision, sen
       warning={projection.draft.exchangeWarnings?.filter((item:any)=>item.fieldID===field.id).map((item:any)=>item.message).join(" ")}
        operatorField={fieldID} inputRef={fieldID?setFieldRef(fieldID):undefined} onFocus={fieldID?()=>focusField(fieldID):undefined} onChange={(changed,value)=>intents.change(changed,value,actionFor(changed))}/>;}) : <div className="contest-surface-sent-number"><span>RcvNR</span><output>—</output></div>}
     </div>
-    <div className={`contest-surface-entry-status is-${duplicateState}`} role={duplicateState==="duplicate"?"alert":"status"}>
+    <ErrorNotice><div className={`contest-surface-entry-status is-${duplicateState}`} role={duplicateState==="duplicate"?"alert":"status"}>
       {intendedCall===""?<span>Ready for callsign</span>:duplicatePending?<span>Checking — {intendedCall}</span>:duplicateState==="duplicate"
         ?<strong>DUPE — {authoritativeCall}</strong>
         :duplicateState==="unchecked"?<span>{projection.draft.dupe.reason||"Checking duplicate…"}</span>
@@ -874,11 +878,11 @@ function Entry({ projection, disabled, sending, context, projectionRevision, sen
         :multiplierLabel?<span>{multiplierLabel} — {authoritativeCall} on {projection.draft.band}</span>
         :<span>Clear — {authoritativeCall}</span>}
       {!duplicatePending&&duplicateState==="duplicate"&&projection.draft.dupe.reason&&<small>{projection.draft.dupe.reason}</small>}
-    </div>
+    </div></ErrorNotice>
     {(feedback||(projection.schemaVersion===2&&(projection.draft.frequencyError||projection.draft.validation.errors[0])))&&
-      <p className={`contest-surface-entry-feedback${feedback?.kind==="saved"?" is-saved":""}`} role={feedback?.kind==="saved"?"status":"alert"}>
+      <ErrorNotice><p className={`contest-surface-entry-feedback${feedback?.kind==="saved"?" is-saved":""}`} role={feedback?.kind==="saved"?"status":"alert"}>
         {feedback?.text||projection.draft.frequencyError||projection.draft.validation.errors[0]}
-      </p>}
+      </p></ErrorNotice>}
     <div className="contest-surface-run-strip" role="region" aria-label={testSimulation?"Run and S&P test simulation":phoneMode?"Run and S&P phone controls":fldigiMode?"Run and S&P fldigi controls":cwMode&&operator?.output==="xlog-native"?"Run and S&P CW controls":"Run and S&P output controls"}>
       <div role="group" aria-label="Run and S&P">{([['run','Run'],['search-and-pounce','S&P']] as const).map(([value,label])=><label className={`contest-style-${value}`} key={value}><input type="radio" name="contest-operating-style" checked={operator?.style===value} disabled={!operator||disabled||operator.pending!==null}
         onChange={()=>void send({action:"entry_operator_style",params:{...base,value}},projectionRevision)}/>{label}</label>)}</div>
@@ -888,7 +892,7 @@ function Entry({ projection, disabled, sending, context, projectionRevision, sen
       {operator&&(cwMode||phoneMode&&operator.outputAvailable)&&<button type="button" className="contest-surface-arm" aria-pressed={operator.armed}
         disabled={disabled||!operator.outputAvailable||operator.pending!==null}
         onClick={()=>void send({action:"entry_operator_arm",params:{...base,armed:!operator.armed}},projectionRevision)}>{operator.armed?"Disarm":phoneMode?testSimulation?"Arm phone simulation":"Arm recorded phone":operator.output==="xlog-native"?"Arm CW":"Arm simulation"}</button>}
-      {operator&&(!phoneMode||operator.outputAvailable||operator.fldigi?.transmit_release_required||operator.fldigi?.transmit_release_uncertain)&&<span className="contest-surface-output-state" role="status">{testSimulation?"Test simulation":phoneMode?"xLog recorded phone":fldigiMode?"fldigi":cwMode&&operator.output==="xlog-native"?"xLog CW":"Contest output"} · {operator.fldigi?.transmit_release_required||operator.fldigi?.transmit_release_uncertain?operator.fldigi.status:operator.outputAvailable?operator.status:"unavailable"}</span>}
+      {operator&&(!phoneMode||operator.outputAvailable||operator.fldigi?.transmit_release_required||operator.fldigi?.transmit_release_uncertain)&&<ErrorNotice><span className="contest-surface-output-state" role="status">{testSimulation?"Test simulation":phoneMode?"xLog recorded phone":fldigiMode?"fldigi":cwMode&&operator.output==="xlog-native"?"xLog CW":"Contest output"} · {operator.fldigi?.transmit_release_required||operator.fldigi?.transmit_release_uncertain?operator.fldigi.status:operator.outputAvailable?operator.status:"unavailable"}</span></ErrorNotice>}
       {operator?.autoCQ?.active&&<div className="contest-surface-auto-cq" role="status"><span>Auto CQ</span><progress aria-label="Auto CQ countdown" max={operator.autoCQ.delaySeconds*1000} value={Math.max(0,operator.autoCQ.delaySeconds*1000-(operator.autoCQ.remainingMs??0))}/></div>}</div>
       {projection.schemaVersion===2&&<><div className="contest-surface-entry-actions" role="group" aria-label="Logging actions">
         <button type="button" aria-label={operator?.fldigi?.transmit_release_required||operator?.fldigi?.transmit_release_uncertain?"Retry fldigi release":"Stop"} disabled={disabled||sending||!operator} onClick={()=>operatorKey("Escape",operator?.focusedField)}>{operator?.fldigi?.transmit_release_required||operator?.fldigi?.transmit_release_uncertain?"Retry fldigi release":"Stop"} <kbd>Esc</kbd></button>
@@ -901,8 +905,8 @@ function Entry({ projection, disabled, sending, context, projectionRevision, sen
         title={phoneMode&&!operator.outputAvailable?"Recorded phone is optional; manual QSO logging remains available.":undefined}><summary>Function key macros</summary><div className="contest-surface-macros" role="group" aria-label="Function key macros">{Array.from({length:12},(_,index)=>{const key=`F${index+1}`,item=operator.functionKeys.find((item:any)=>item.key===key),label=item?.macro??"Unassigned";return <button type="button" key={key}
         className={item?.highlighted?"contest-primary":undefined} disabled={disabled||!item||!operator.outputAvailable||operator.status==="uncertain"||phoneMode&&!operator.armed}
         aria-label={`${key} ${label}`} onClick={()=>operatorKey(key,operator.focusedField)}><kbd>{key}:</kbd> <span>{label}</span></button>;})}</div></details>}
-        {operator?.fldigi?.configuration_error&&<p role="alert">{operator.fldigi.configuration_error}</p>}
-        {operator&&!operator.outputAvailable&&!phoneMode&&<p role="status">{operator.outputUnavailableReason}</p>}</>}
+        {operator?.fldigi?.configuration_error&&<ErrorNotice><p role="alert">{operator.fldigi.configuration_error}</p></ErrorNotice>}
+        {operator&&!operator.outputAvailable&&!phoneMode&&<ErrorNotice><p role="status">{operator.outputUnavailableReason}</p></ErrorNotice>}</>}
     </div></div>
     <div className="contest-surface-contact-footer"><div className="contest-surface-contact-path"><div aria-label="Contact heading, long path and distance">{projection.manual?.headingDegrees==null?"—":Math.round(projection.manual.headingDegrees)%360}° Hdg · LP {projection.manual?.longPathHeadingDegrees==null?"—":Math.round(projection.manual.longPathHeadingDegrees)%360}° / distance {projection.manual?.distanceKm==null?"—":Math.round(projection.manual.distanceKm).toLocaleString()} km</div><div aria-label="Country and zones">{projection.manual?.country??"—"} cq:{projection.manual?.cqZone??"—"} itu:{projection.manual?.ituZone??"—"}</div></div><output aria-label="QSOs and multipliers"><span>QSO / mults</span><strong>{projection.manual?.qsos??"—"}/{projection.manual?.multipliers??"—"}</strong></output><output aria-label="Score"><span>{projection.manual?.scoringComplete===false?"Score (partial)":"Score"}</span><strong>{projection.manual?.total??"—"}</strong></output></div>
     </section>;
@@ -949,9 +953,9 @@ function Check({ projection, disabled, projectionRevision, receipts, send }: { p
         <button type="button" disabled={disabled} onClick={()=>assistance("assistance_refresh")}>Refresh</button>
         {projection.scp.error&&<button type="button" disabled={disabled} onClick={()=>assistance(availability==="ready"||availability==="status_unavailable"?"assistance_refresh":"assistance_download")}>Retry</button>}</div>
     </div></details>
-    {projection.scp.error&&<p role="alert">{projection.scp.error}</p>}
-    {projection.scp.notice&&<p role="status">{projection.scp.notice}</p>}
-    {projection.busy&&<p role="status">Checking callsign suggestions…</p>}
+    {projection.scp.error&&<ErrorNotice><p role="alert">{projection.scp.error}</p></ErrorNotice>}
+    {projection.scp.notice&&<ErrorNotice><p role="status">{projection.scp.notice}</p></ErrorNotice>}
+    {projection.busy&&<ErrorNotice><p role="status">Checking callsign suggestions…</p></ErrorNotice>}
     <details className="contest-surface-pane-controls"><summary>Panes</summary><div role="group" aria-label="Check Partial panes">{paneChoices.map(pane=><label key={pane.key}>
       <input type="checkbox" checked={shownPanes.includes(pane.key)} onChange={event=>setShownPanes(current=>event.target.checked?[...current,pane.key]:current.filter(key=>key!==pane.key))}/>{pane.title}</label>)}</div></details>
     {panes.length===0&&<p>No panes are visible. Choose panes above.</p>}<div className="contest-surface-check-columns" data-pane-count={panes.length}>
@@ -1126,9 +1130,9 @@ function ContactEditor({projection,disabled,sending,projectionRevision,receipts,
     {cqWWSSB?<ReadOnlyContactField label="Op" value={editing.operator??""}/>:<IntentInput label="Op" value={editing.operator??""} identity={`${editing.qsoID}/operator`} projectionRevision={projectionRevision} receipts={receipts} disabled={disabled} maximumUTF8Bytes={32} send={send} action={value=>({action:"log_edit_set_text",params:{qsoID:editing.qsoID,field:"operator",value}})}/>}
     <ReadOnlyContactField label="Misc" value={details.misc??""}/><ReadOnlyContactField label="Rover QTH" value={details.roverQTH??""}/>
     </div><div className="contest-surface-editor-note"><IntentInput label="Correction note" value={editing.correctionReason} identity={`${editing.qsoID}/correctionReason`} projectionRevision={projectionRevision} receipts={receipts} disabled={disabled} maximumUTF8Bytes={1024} send={send} action={value=>({action:"log_edit_set_text",params:{qsoID:editing.qsoID,field:"correctionReason",value}})}/></div>
-    </div>{editing.frequencyError&&<p role="alert">{editing.frequencyError}</p>}
-    {editing.receiveFrequencyError&&<p role="alert">{editing.receiveFrequencyError}</p>}
-    {editing.powerError&&<p role="alert">{editing.powerError}</p>}
+    </div>{editing.frequencyError&&<ErrorNotice><p role="alert">{editing.frequencyError}</p></ErrorNotice>}
+    {editing.receiveFrequencyError&&<ErrorNotice><p role="alert">{editing.receiveFrequencyError}</p></ErrorNotice>}
+    {editing.powerError&&<ErrorNotice><p role="alert">{editing.powerError}</p></ErrorNotice>}
     {editing.confirmDelete&&<div className="contest-surface-delete"><IntentInput label="Deletion reason" value={editing.deletionReason} identity={`${editing.qsoID}/deletionReason`} projectionRevision={projectionRevision} receipts={receipts} disabled={disabled} maximumUTF8Bytes={1024} send={send} action={value=>({action:"log_edit_set_text",params:{qsoID:editing.qsoID,field:"deletionReason",value}})}/>
       <button disabled={disabled||sending||!editing.deletionReason.trim()} onClick={()=>void finish({action:"log_edit_delete",params:{qsoID:editing.qsoID,expectedSessionRevision:projection.sessionRevision}})}>Delete contact</button></div>}
     <footer className="contest-surface-editor-actions"><button disabled={disabled||sending} aria-pressed={editing.confirmDelete} onClick={()=>void send({action:"log_edit_confirm_delete",params:{qsoID:editing.qsoID,confirmed:!editing.confirmDelete}},projectionRevision)}>{editing.confirmDelete?"Keep contact":"Delete…"}</button>

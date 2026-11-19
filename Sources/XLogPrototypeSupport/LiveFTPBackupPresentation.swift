@@ -13,7 +13,7 @@ import XLogCore
 import XLogPortableCore
 #endif
 
-#if os(macOS)
+#if os(macOS) || os(Windows)
 
 /// Exact non-secret Settings projection used as the native FTP/FTPS authority.
 /// IDs are derived natively, so renderer input never supplies account or
@@ -180,7 +180,7 @@ actor LiveFTPBackupPresentation {
               let raw = params["operation_id"] as? String, let id = UUID(uuidString: raw),
               let owner = params["owner"] as? [String: Any], Set(owner.keys) == ["generation", "revision", "token"],
               let generationText = owner["generation"] as? String, let generation = UUID(uuidString: generationText),
-              let revision = owner["revision"] as? NSNumber, CFGetTypeID(revision) != CFBooleanGetTypeID(),
+              let revision = owner["revision"] as? NSNumber, !LiveRemoteBackupPresentation.isBoolean(revision),
               revision.doubleValue >= 0, revision.doubleValue < 9_007_199_254_740_991,
               revision.doubleValue == Double(revision.int64Value),
               owner["token"] is NSNull || (owner["token"] as? String).flatMap(UUID.init(uuidString:)) != nil else {

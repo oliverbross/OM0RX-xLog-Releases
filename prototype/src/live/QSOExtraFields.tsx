@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useState, type SetStateAction } from "react";
 
 type Data = Record<string, any>;
@@ -46,6 +47,6 @@ export function QSOExtraFields({ draft, setDraft, disabled, name, setName }: {
       onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); add(); } }} /></label>
     <button type="button" disabled={disabled || !name.trim()} onClick={add}>Add ADIF field</button>
     {name && <p>Add this field or clear its name before saving.</p>}
-    {error && <p role="alert">{error}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </div>;
 }

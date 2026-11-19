@@ -1,3 +1,5 @@
+import { ErrorNotice } from "./live/ErrorNotice";
+import { FeedbackDialogProvider } from "./live/FeedbackDialogProvider";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { loadWindowSurface } from "./windowSurface";
@@ -12,6 +14,7 @@ import "./live/HFPropagationLive.css";
 import "./live/HFPropagationCanvas.css";
 import "./live/live.css";
 import "./style.css";
+import "./live/tableResize.css";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 // Listening cancellation accompanies the existing window-specific emergency
@@ -33,13 +36,13 @@ async function mount() {
   let App: React.ComponentType;
   try { App = await loadWindowSurface(location.search); }
   catch {
-    root.render(<div className="app live monitor-app"><main aria-label="Window unavailable"><p role="alert" className="live-error">
+    root.render(<FeedbackDialogProvider><div className="app live monitor-app"><main aria-label="Window unavailable"><ErrorNotice><p role="alert" className="live-error">
       This window could not load. Reload it to try again.<button onClick={() => location.reload()}>Reload window</button>
-    </p></main></div>);
+    </p></ErrorNotice></main></div></FeedbackDialogProvider>);
     return;
   }
   root.render(
-    <React.StrictMode><WindowRenderBoundary><UiScaleProvider><App /></UiScaleProvider></WindowRenderBoundary></React.StrictMode>,
+    <React.StrictMode><FeedbackDialogProvider><WindowRenderBoundary><UiScaleProvider><App /></UiScaleProvider></WindowRenderBoundary></FeedbackDialogProvider></React.StrictMode>,
   );
   if (acceptance) void import("./integratedAcceptance").then(module => module.startIntegratedAcceptance()).catch(error => {
     const surface = new URLSearchParams(location.search).get("view");

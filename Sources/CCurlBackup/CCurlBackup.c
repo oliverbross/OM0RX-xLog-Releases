@@ -1,12 +1,23 @@
 #include "CCurlBackup.h"
 
 #include <curl/curl.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+static INIT_ONCE xlog_curl_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK xlog_curl_initialize(PINIT_ONCE once, void *arg, void **context) {
+    return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+}
+#else
 static pthread_once_t xlog_curl_once = PTHREAD_ONCE_INIT;
 static void xlog_curl_initialize(void) { (void)curl_global_init(CURL_GLOBAL_DEFAULT); }
+#endif
 
 struct xlog_upload_cursor {
     const uint8_t *bytes;
@@ -52,7 +63,11 @@ static CURL *xlog_curl_handle(const char *url, const char *username,
                               const uint8_t *ca_pem, size_t ca_length) {
     if ((ca_pem == NULL) != (ca_length == 0) || ca_length > 65536 ||
         (ca_length > 0 && (!require_tls || strncmp(url, "ftps://", 7) != 0))) return NULL;
+#ifdef _WIN32
+    if (!InitOnceExecuteOnce(&xlog_curl_once, xlog_curl_initialize, NULL, NULL)) return NULL;
+#else
     pthread_once(&xlog_curl_once, xlog_curl_initialize);
+#endif
     CURL *handle = curl_easy_init();
     if (handle == NULL) return NULL;
     if (curl_easy_setopt(handle, CURLOPT_URL, url) != CURLE_OK ||

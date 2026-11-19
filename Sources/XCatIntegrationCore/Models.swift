@@ -20,6 +20,11 @@ public struct RadioVFO: Equatable, Sendable {
     public var ritOffsetHz: Int
     public var xitEnabled: Bool
     public var xitOffsetHz: Int
+    /// Observed FLEX subscription identity. Absent for other providers or an
+    /// unreported/invalid DAX assignment; never inferred from the VFO letter.
+    public var flexSliceID: Int?
+    public var flexClientHandle: String?
+    public var daxChannel: Int?
 
     public init(
         letter: String,
@@ -30,7 +35,10 @@ public struct RadioVFO: Equatable, Sendable {
         ritEnabled: Bool = false,
         ritOffsetHz: Int = 0,
         xitEnabled: Bool = false,
-        xitOffsetHz: Int = 0
+        xitOffsetHz: Int = 0,
+        flexSliceID: Int? = nil,
+        flexClientHandle: String? = nil,
+        daxChannel: Int? = nil
     ) {
         self.letter = letter.uppercased()
         self.frequencyHz = frequencyHz
@@ -41,6 +49,9 @@ public struct RadioVFO: Equatable, Sendable {
         self.ritOffsetHz = ritOffsetHz
         self.xitEnabled = xitEnabled
         self.xitOffsetHz = xitOffsetHz
+        self.flexSliceID = flexSliceID
+        self.flexClientHandle = flexClientHandle
+        self.daxChannel = daxChannel
     }
 }
 
@@ -78,6 +89,8 @@ public struct RemoteStationStatus: Equatable, Sendable {
     public var katDetailPrimary: String
     public var katDetailSecondary: String
     public var routeDetail: String
+    /// Allowlisted accessory telemetry retained with this same Agent observation.
+    public var instrumentReadings: Data? = nil
 
     public init(
         revision: Int = 0,
@@ -197,6 +210,7 @@ public struct RadioSnapshot: Equatable, Sendable {
     public var transmitSlice: String
     public var transmitFrequencyHz: Int64
     public var station: String
+    public var availableStations: [String] = []
     public var vfos: [RadioVFO]
     public var remoteStationStatus: RemoteStationStatus?
     public var rfPowerWatts: Int?
@@ -251,6 +265,7 @@ public struct RadioSnapshot: Equatable, Sendable {
     }
 }
 
+#if !os(Windows)
 public struct AppConfiguration: Codable, Equatable, Sendable {
     public enum ConnectionKind: String, Codable, CaseIterable, Sendable {
         case smartLink = "SmartLink"
@@ -344,6 +359,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         rotator = try values.decodeIfPresent(RotatorConfiguration.self, forKey: .rotator) ?? RotatorConfiguration()
     }
 }
+
+#endif
 
 public enum CATTransmitMode: Sendable {
     case microphone

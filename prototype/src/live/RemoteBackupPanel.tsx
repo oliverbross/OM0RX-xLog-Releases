@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type Data = Record<string, any>;
@@ -86,8 +87,8 @@ export default function RemoteBackupPanel({ request, visible }: { request: Reque
         <button type="button" disabled={locked || state.running} onClick={() => void act("prepare")}>{ftpFamily ? `Prepare ${provider} backup` : "Review native Dropbox setup"}</button>
         {state.prepared && <>
           <dl><dt>Account</dt><dd>{state.account}</dd>{state.endpoint && <><dt>Endpoint</dt><dd>{state.endpoint}</dd></>}<dt>Destination folder</dt><dd>{state.folder}</dd><dt>Backup</dt><dd>{state.backup_id} · {state.byte_count?.toLocaleString()} bytes</dd></dl>
-          <p role="status">{state.running ? "Backup execution is active. This is not verified completion." : state.upload_outcome ? "Backup execution finished; review its durable outcome below." : state.approved ? "Approved; waiting for explicit Start." : state.registered ? (ftpFamily ? "Saved credentials checked locally; the server has not been contacted. Backup not approved." : "Native account registration verified; backup not approved.") : (ftpFamily ? "Check the saved credentials locally before approval. This does not contact the server." : "Account registration requires native verification.")}</p>
-          {state.upload_outcome && <p role="status">Durable upload outcome: {state.upload_outcome}.{state.remote_identity_recorded ? " Provider object identity is recorded." : " No pinned provider object identity is recorded."}</p>}
+          <ErrorNotice><p role="status">{state.running ? "Backup execution is active. This is not verified completion." : state.upload_outcome ? "Backup execution finished; review its durable outcome below." : state.approved ? "Approved; waiting for explicit Start." : state.registered ? (ftpFamily ? "Saved credentials checked locally; the server has not been contacted. Backup not approved." : "Native account registration verified; backup not approved.") : (ftpFamily ? "Check the saved credentials locally before approval. This does not contact the server." : "Account registration requires native verification.")}</p></ErrorNotice>
+          {state.upload_outcome && <ErrorNotice><p role="status">Durable upload outcome: {state.upload_outcome}.{state.remote_identity_recorded ? " Provider object identity is recorded." : " No pinned provider object identity is recorded."}</p></ErrorNotice>}
           <button type="button" disabled={locked || state.running || state.registered} onClick={() => void act("verify_account")}>{ftpFamily ? "Check saved FTP credentials" : "Verify native account registration"}</button>
           <label><input type="checkbox" disabled={locked || state.running || !state.registered} checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />I approve this account, destination and one backup.</label>
           <button type="button" disabled={locked || state.running || !state.registered || !confirmed} onClick={() => void act("approve")}>Approve one backup</button>
@@ -101,10 +102,10 @@ export default function RemoteBackupPanel({ request, visible }: { request: Reque
         </>}
       </>}
     <p className="secondary">Remote deletion is unavailable. Retention review cannot delete backups. Unknown outcomes require a status review and are never retried automatically.</p>
-    {state?.retention_review && <p role="status">Retained evidence review: {state.retention_review.protected} protected · {state.retention_review.candidates} candidates for a future review. No deletion is authorized.</p>}
-    {state?.staged_restore && <p role="status">Verified remote backup staged locally as {state.staged_restore.name} ({state.staged_restore.qso_count?.toLocaleString()} contacts). Inspect it under Local backups before an explicit restore.</p>}
-    {state?.last_error_code && <p role="alert" className="live-data-feedback error">Last backup command did not complete: {state.last_error_code}. Refresh and review the durable status; the command will not be replayed.</p>}
-    {error && <p role="alert" className="live-data-feedback error">{error}</p>}
+    {state?.retention_review && <ErrorNotice><p role="status">Retained evidence review: {state.retention_review.protected} protected · {state.retention_review.candidates} candidates for a future review. No deletion is authorized.</p></ErrorNotice>}
+    {state?.staged_restore && <ErrorNotice><p role="status">Verified remote backup staged locally as {state.staged_restore.name} ({state.staged_restore.qso_count?.toLocaleString()} contacts). Inspect it under Local backups before an explicit restore.</p></ErrorNotice>}
+    {state?.last_error_code && <ErrorNotice><p role="alert" className="live-data-feedback error">Last backup command did not complete: {state.last_error_code}. Refresh and review the durable status; the command will not be replayed.</p></ErrorNotice>}
+    {error && <ErrorNotice><p role="alert" className="live-data-feedback error">{error}</p></ErrorNotice>}
     {pending && <button type="button" disabled={busy || !state} onClick={() => {
       try { localStorage.removeItem(key); setPending(false); void read(); } catch (cause) { setError(message(cause)); }
     }}>I reviewed current status; dismiss unresolved backup intent</button>}

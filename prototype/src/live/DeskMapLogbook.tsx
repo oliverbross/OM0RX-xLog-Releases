@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { boundDeskLogbookPercent, defaultDeskMapLogbookPreferences, deskMapLogbookBounds, deskMapLogbookDividerHeight,
   deskMapLogbookKey, deskMapLogbookViews, minimumDeskLogbookHeight, minimumDeskMapHeight,
@@ -75,7 +76,7 @@ export function DeskMapLogbook({ map, logbook, previousQSOs, hasPreviousQSOs = f
         setMounted(previous => ({ map: previous.map || view !== "logbook", logbook: previous.logbook || view !== "map" }));
         save({ ...current.current, view });
       }}>{deskMapLogbookViews.map(([view, label]) => <option key={view} value={view}>{label}</option>)}</select>
-      {(denied || storageError) && <span className="desk-map-logbook-feedback" role="status">{denied || storageError}</span>}
+      {(denied || storageError) && <ErrorNotice when={Boolean(storageError) || undefined}><span className="desk-map-logbook-feedback" role="status">{denied || storageError}</span></ErrorNotice>}
     </div>
     <div className={`desk-map-logbook-panes${stacked ? " is-stacked" : ""}${previousMode ? " is-previous" : ""}`} ref={body} style={bodyStyle}>
       <div className="desk-map-logbook-map" hidden={preferences.view === "logbook"} inert={preferences.view === "logbook"}

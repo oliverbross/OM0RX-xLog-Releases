@@ -1,5 +1,7 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { isReadContention } from "./readContention";
 import { loadStationSession, radioConnected, radioLabel, radioName, stationSessionRequest, type RadioID, type StationSession } from "./stationSession";
 
 /** Operating routing only. This never connects, arms or modifies a radio profile. */
@@ -15,7 +17,7 @@ export function RadioOperatingSelector({ onSettings }: { onSettings?: (radioId: 
         const next = await Promise.all([loadStationSession("radio1"), loadStationSession("radio2")]);
         if (active.current) { setSessions(next); setReadError(""); }
       } while (active.current && again.current);
-    } catch (cause) { if (active.current) setReadError(`Radio routing is unavailable. ${typeof cause === "string" ? cause : cause instanceof Error ? cause.message : "Check connection status in Settings."}`); }
+    } catch (cause) { if (active.current && !isReadContention(cause)) setReadError(`Radio routing is unavailable. ${typeof cause === "string" ? cause : cause instanceof Error ? cause.message : "Check connection status in Settings."}`); }
     finally { reading.current = false; }
   };
   useEffect(() => {
@@ -49,6 +51,6 @@ export function RadioOperatingSelector({ onSettings }: { onSettings?: (radioId: 
         title={state?.active_radio === id ? "Active for logging" : `Use ${radioLabel(id)} for logging`}
         onClick={() => void choose(id)}>{id === "radio1" ? "R1" : "R2"} · {radioName(state ?? null)} · {radioConnected(state ?? null) ? "Connected" : "Offline"}</button>;
     })}
-    {(error || readError) && <p role="alert">{error || readError}{owner && onSettings && <button type="button" onClick={() => onSettings(owner)}>Open {radioLabel(owner)} settings</button>}</p>}
+    {(error || readError) && <ErrorNotice><p role="alert">{error || readError}{owner && onSettings && <button type="button" onClick={() => onSettings(owner)}>Open {radioLabel(owner)} settings</button>}</p></ErrorNotice>}
   </section>;
 }

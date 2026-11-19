@@ -14,7 +14,7 @@ function valid(value: any): value is AutomaticRotorState {
 export function useAutoRotor() {
   const [state, setState] = useState<AutomaticRotorState | null>(null), [error, setError] = useState("");
   const latest = useRef<AutomaticRotorState | null>(null), active = useRef(false), reading = useRef(false);
-  const lifecycle = useRef(0), readEpoch = useRef(0), again = useRef(false);
+  const lifecycle = useRef(0), readEpoch = useRef(0), again = useRef(false), pollError = useRef("");
   const adopt = (value: unknown) => {
     if (!valid(value)) throw new Error("Native automatic rotor status could not be verified.");
     if (active.current && (!latest.current || value.epoch >= latest.current.epoch)) { latest.current = value; setState(value); setError(value.error); }
@@ -26,8 +26,15 @@ export function useAutoRotor() {
     try {
       do {
         again.current = false; const captured = readEpoch.current;
-        try { const value = await invoke("auto_rotor_snapshot"); if (active.current && mount === lifecycle.current && captured === readEpoch.current) adopt(value); }
-        catch (cause) { if (active.current && mount === lifecycle.current && captured === readEpoch.current) setError(cause instanceof Error ? cause.message : "Native automatic rotor status unavailable."); }
+        try {
+          const value = await invoke("auto_rotor_snapshot");
+          if (active.current && mount === lifecycle.current && captured === readEpoch.current) {
+            adopt(value);
+            // A good read clears only the error a failed read set.
+            if (pollError.current) { const cleared = pollError.current; pollError.current = ""; setError(current => current === cleared ? "" : current); }
+          }
+        }
+        catch (cause) { if (active.current && mount === lifecycle.current && captured === readEpoch.current) { pollError.current = cause instanceof Error ? cause.message : "Native automatic rotor status unavailable."; setError(pollError.current); } }
       } while (active.current && mount === lifecycle.current && again.current);
     } finally { reading.current = false; }
   };

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 
 // Only unsent note/learning text lives here. Attempted note operations retain
@@ -95,11 +96,11 @@ export function useUnfinishedEditor<T>(prefix: string, valid: (target: unknown) 
 export function UnfinishedEditorWarning(){
   const [message,setMessage]=useState("");
   useEffect(()=>{const update=()=>setMessage([...failures.values()].join(" "));update();window.addEventListener("xlog:unfinished-editor-failure",update);return()=>window.removeEventListener("xlog:unfinished-editor-failure",update);},[]);
-  return message?<p role="alert">{message}</p>:null;
+  return message?<ErrorNotice><p role="alert">{message}</p></ErrorNotice>:null;
 }
 
 export function UnfinishedRecovery<T>({editor}:{editor:ReturnType<typeof useUnfinishedEditor<T>>}) {
-  return <>{editor.status&&<p role="status">{editor.status}. This is unfinished editor text.</p>}{editor.error&&<p role="alert">{editor.error}</p>}
+  return <>{editor.status&&<ErrorNotice><p role="status">{editor.status}. This is unfinished editor text.</p></ErrorNotice>}{editor.error&&<ErrorNotice><p role="alert">{editor.error}</p></ErrorNotice>}
     <button onClick={()=>editor.scan()}>Refresh retained drafts</button>
     {editor.records.filter(row=>!row.draft||row.draft.id!==editor.draft?.id).map(row=><div key={row.key}>
       <p>{row.draft?`Retained draft ${row.draft.id.slice(0,8)}`:"Unreadable draft recovery — original bytes preserved"}</p>

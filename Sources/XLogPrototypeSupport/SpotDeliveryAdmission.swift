@@ -2,9 +2,10 @@ import Foundation
 
 /// Evidence for this new delivery attempt only. It says nothing about a prior
 /// inventory entry or a different command that may already have crossed the wire.
-struct ConfirmedSpotDeliveryNotAdmitted: Error, Sendable {
+struct ConfirmedSpotDeliveryNotAdmitted: LocalizedError, Sendable {
     let code: String
     let message: String
+    var errorDescription: String? { message }
 }
 
 /// Admission for the native station_add_spot route. A different station method
@@ -40,6 +41,7 @@ enum SpotDeliveryAdmission {
                 guard let failure = error as? WorkerFailure else { throw error }
                 let prewireCodes: Set<String>
                 switch provider {
+                case "direct_flex_lan": prewireCodes = ["invalid_params", "station_unavailable"]
                 case "direct_agent": prewireCodes = directAgentPrewireCodes
                 case "direct_tci": prewireCodes = directTCIPrewireCodes
                 default: throw error

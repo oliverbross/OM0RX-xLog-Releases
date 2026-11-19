@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { confirmContestCWCall, dispatchContestCWCall, editContestCWCall, newContestCWCallState, previewContestCWCorrection, stopContestCWCall,
   type ContestCWCallScope } from "./contestCWCorrection";
@@ -69,6 +70,6 @@ export function ContestCWCorrectionPanel({ context, call, serial, disabled = fal
     <button type="button" disabled={disabled || pending || stopping || !complete || Boolean(state.attempt) || Boolean(state.confirmed) && preview.action !== "whole-call"}
       onClick={() => void send()}>{state.confirmed ? "Send whole corrected call" : "Send current call"}</button>
     <button type="button" disabled={stopping} onClick={() => void stop()}>Stop lane CW</button>
-    {message && <p role="status">{message}</p>}
+    {message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}
   </section>;
 }

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { connectAntenna, type AntennaSnapshot } from "./antennaSession";
 import { DeskAntenna } from "./StationEquipment";
@@ -11,9 +12,9 @@ export function DetachedAntennaSurface() {
   }, []);
   const profile = projection?.snapshot, current = verified && projection?.available === true;
   return <div className="app live detached-reference-app detached-antenna-app"><main aria-label="Detached Antenna"><section aria-label="Saved antenna profile">
-    {!current && <p role="status">{profile ? "Saved profile unavailable or changing — retained reference only" : "No saved antenna profile. Configure an antenna in Settings → Display."}</p>}
+    {!current && <ErrorNotice><p role="status">{profile ? "Saved profile unavailable or changing — retained reference only" : "No saved antenna profile. Configure an antenna in Settings → Display."}</p></ErrorNotice>}
     {profile?.display === "antenna" ? <DeskAntenna taskOnly profile={profile} /> : profile ? <p>No fixed antenna selected. Configure an antenna in Settings → Display.</p> : null}
     {profile && <dl className="detached-reference-metadata"><dt>Saved settings revision</dt><dd>{profile.settings_revision}</dd><dt>Workspace generation</dt><dd>{profile.workspace_generation}</dd></dl>}
-    {error && <p role="alert">{error}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section></main></div>;
 }

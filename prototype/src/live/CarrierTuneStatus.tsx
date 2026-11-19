@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { carrierTuneSession, type CarrierTuneSession } from "./carrierTune";
@@ -12,7 +13,7 @@ export function CarrierTuneStatus({session=carrierTuneSession()}:{session?:Carri
     return()=>{active=false;stop?.();};
   },[session]);
   const recover=(action:()=>Promise<void>)=>{setError("");void action().catch(cause=>setError(cause instanceof Error?cause.message:"Carrier Tune receipt unavailable."));};
-  return <section aria-label="Carrier Tune receipts">{state.message&&<p role="status">{state.message}</p>}{error&&<p role="alert">{error}</p>}
+  return <section aria-label="Carrier Tune receipts">{state.message&&<ErrorNotice><p role="status">{state.message}</p></ErrorNotice>}{error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     {state.pending&&<button type="button" disabled={state.busy} onClick={()=>recover(()=>session.check())}>Check carrier Tune receipt</button>}
     {state.reviewable&&<button type="button" disabled={state.busy} onClick={()=>recover(()=>session.review())}>I have reviewed carrier Tune and observed radio state</button>}
   </section>;

@@ -1,52 +1,30 @@
-import { formatSpotFrequency } from "../spotFrequency";
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { clusterRowTint, clusterSpotTags, type ClusterPalette, type LiveClusterSpot } from "./ClusterPanel";
+import type { ClusterPalette, LiveClusterSpot } from "./ClusterPanel";
+import { ChaseAlertsTable } from "./ChaseAlertsTable";
+import { CompactSpotTable } from "./CompactSpotTable";
 import { defaultClusterFilter, normalizeClusterFilter, type ClusterFilter } from "./clusterFilters";
 import { BandMapsToolbarContext } from "./BandMaps";
 import ClusterFilterDialog from "./ClusterFilterDialog";
-import { clusterBandColors, clusterModeColors, clusterStatusCode, clusterStatusColors, paletteColor, specialTagColors } from "./clusterPalette";
-import { boundColumnWidth, compactClusterColumns, compactClusterHeader, defaultWorkspacePreferences, operatorWorkspaceKey, readWorkspacePreferences, splitBounds,
+import { PushToPanButton } from "./PushToPanButton";
+import { boundColumnWidth, compactClusterColumns, defaultWorkspacePreferences, operatorWorkspaceKey, readWorkspacePreferences, splitBounds,
   type CompactColumn, type WorkspacePreferences } from "./operatorWorkspacePreferences";
-import { formatSpotAge, spotAgeColor, useSpotAgeClock } from "./spotAge";
-import { countryDisplay } from "./countryDisplay";
 import { useClusterAppearancePreference } from "./clusterAppearance";
 import "./OperatorWorkspace.css";
 
-export type OperatorWorkspaceProps = { map: ReactNode; bandMaps: ReactNode; cluster: unknown;
+export type OperatorWorkspaceProps = { map: ReactNode; toolsOnly?: boolean; bandMaps: ReactNode; cluster: unknown;
   onSelect: (spot: LiveClusterSpot) => void; onRequest?: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
   selectedSpotId?: string | null; palette?: ClusterPalette };
 type ClusterProjection = { snapshot?: { spots?: LiveClusterSpot[]; connectedClusters?: number; connections?: { serverName: string; phase: string; error?: string | null }[] };
   configuration?: { palette?: ClusterPalette; filter?: ClusterFilter; specialRules?: { name: string; enabled: boolean }[] } };
-const spotTags = (spot: LiveClusterSpot): string[] => clusterSpotTags(spot);
-function spotText(column: CompactColumn, spot: LiveClusterSpot, now: number): string {
-  switch (column) {
-    case "time": return formatSpotAge(spot.receivedAt, now);
-    case "frequency": return formatSpotFrequency(spot.frequencyKHz * 1000);
-    case "cq": return String(spot.cqZone ?? "—");
-    case "country": return countryDisplay(spot.country);
-    case "spotter": return `${spot.spotter}${spot.aggregateCount > 1 ? ` +${spot.aggregateCount - 1}` : ""}`;
-    case "special": return spotTags(spot).length ? spotTags(spot).join(" · ") : "—";
-    case "workedBefore": return spot.workedBefore == null ? "—" : `✓ ${new Date((spot.workedBefore + 978307200) * 1000).toLocaleString()}`;
-    default: return String(spot[column] || "—");
-  }
-}
-function cell(column: CompactColumn, spot: LiveClusterSpot, now: number, palette?: ClusterPalette, classic = false): ReactNode {
-  if (column === "time") return <span className="live-cluster-age live-cluster-age-strip" style={{ backgroundColor: classic ? undefined : spotAgeColor(spot.receivedAt, now) }}>{spotText(column, spot, now)}</span>;
-  if (column === "band" || column === "mode") return <span className="live-cluster-category" style={{ color: paletteColor(spot[column], palette?.[column], column === "band" ? clusterBandColors : clusterModeColors) }}>{spot[column]}</span>;
-  if (column === "callStatus" || column === "dxccStatus") return <span className="live-cluster-status" style={{ color: paletteColor(spot[column], palette?.status, clusterStatusColors) }}>{clusterStatusCode(spot[column])}</span>;
-  if (column === "score") return <span className={`live-cluster-score ${spot.score >= 80 ? "priority" : spot.score >= 55 ? "high" : spot.score >= 30 ? "medium" : "low"}`}>{spot.score}</span>;
-  if (column === "special") return spotTags(spot).length ? spotTags(spot).slice(0, 2).map(tag => <span key={tag} className="live-cluster-special-tag" style={{ ...specialTagColors(tag), ...(classic ? { backgroundColor: "transparent" } : {}) }}>{tag}</span>) : "—";
-  return spotText(column, spot, now);
-}
-
-export function OperatorWorkspace({ map, bandMaps, cluster, onSelect, onRequest, selectedSpotId, palette }: OperatorWorkspaceProps) {
+export function OperatorWorkspace({ map, toolsOnly = false, bandMaps, cluster, onSelect, onRequest, selectedSpotId, palette }: OperatorWorkspaceProps) {
   const { appearance } = useClusterAppearancePreference();
   const classic = appearance === "classic";
-  const ageClock = useSpotAgeClock();
   const [preferences, setPreferences] = useState<WorkspacePreferences>(() => {
     try { return readWorkspacePreferences(window.localStorage.getItem(operatorWorkspaceKey)); } catch { return defaultWorkspacePreferences(); }
   });
-  const [width, setWidth] = useState(0), [clusterHeight, setClusterHeight] = useState(0);
+  const [width, setWidth] = useState(0), [clusterHeight, setClusterHeight] = useState(0), [toolsHeight, setToolsHeight] = useState(0);
+  const toolsStack = useRef<HTMLDivElement>(null), verticalDrag = useRef(false);
   const [bandToolbarHost, setBandToolbarHost] = useState<HTMLDivElement | null>(null);
   const [columnsOpen, setColumnsOpen] = useState(false), [filtersOpen, setFiltersOpen] = useState(false);
   const [filter, setFilter] = useState<ClusterFilter>(defaultClusterFilter), [filterError, setFilterError] = useState("");
@@ -54,19 +32,26 @@ export function OperatorWorkspace({ map, bandMaps, cluster, onSelect, onRequest,
   const root = useRef<HTMLDivElement>(null), clusterPane = useRef<HTMLDivElement>(null);
   const filtersButton = useRef<HTMLButtonElement>(null), filterVersion = useRef(0);
   const id = useId();
-  const drag = useRef<{ kind: "split" | CompactColumn; startX: number; startWidth: number; total: number; pixels: number } | null>(null);
+  const drag = useRef(false);
   useEffect(() => {
     try { window.localStorage.setItem(operatorWorkspaceKey, JSON.stringify(preferences)); } catch { /* Restricted storage: keep this session usable. */ }
   }, [preferences]);
   useEffect(() => {
-    const measure = () => { setWidth(root.current?.getBoundingClientRect().width ?? 0); setClusterHeight(clusterPane.current?.getBoundingClientRect().height ?? 0); };
+    const measure = () => { setWidth(root.current?.getBoundingClientRect().width ?? 0); setClusterHeight(clusterPane.current?.getBoundingClientRect().height ?? 0); setToolsHeight(toolsStack.current?.clientHeight || toolsStack.current?.getBoundingClientRect().height || 0); };
     measure();
     if (typeof ResizeObserver === "undefined") { window.addEventListener("resize", measure); return () => window.removeEventListener("resize", measure); }
     const observer = new ResizeObserver(measure);
     if (root.current) observer.observe(root.current);
     if (clusterPane.current) observer.observe(clusterPane.current);
+    if (toolsStack.current) observer.observe(toolsStack.current);
     return () => observer.disconnect();
-  }, [preferences.activeTab]);
+  }, [preferences.activeTab, preferences.showAlerts]);
+  const toolsMinimum = toolsHeight > 210 ? Math.max(20, 100 / (toolsHeight - 10) * 100) : 50;
+  const toolsMaximum = 100 - toolsMinimum;
+  const toolsPercent = Math.max(toolsMinimum, Math.min(toolsMaximum, preferences.toolsPercent));
+  const setToolsSplit = (value: number) => {
+    if (Number.isFinite(value)) setPreferences(current => ({ ...current, toolsPercent: Math.max(toolsMinimum, Math.min(toolsMaximum, value)) }));
+  };
   const bounds = splitBounds(width);
   const percent = Math.max(bounds.min, Math.min(bounds.max, preferences.mapPercent));
   const projection = cluster as ClusterProjection | null;
@@ -77,7 +62,6 @@ export function OperatorWorkspace({ map, bandMaps, cluster, onSelect, onRequest,
   const columnRows = Math.max(1, Math.min(7, Math.floor((clusterHeight - 93) / 26) || 1)), columnPageSize = columnRows * 2;
   const columnPages = Math.ceil(compactClusterColumns.length / columnPageSize), currentColumnPage = Math.min(columnPage, columnPages - 1);
   const pages = Math.max(1, Math.ceil(spots.length / rows)), currentPage = Math.min(page, pages - 1), offset = currentPage * rows;
-  const totalWidth = preferences.columns.reduce((sum, column) => sum + preferences.widths[column], 0);
   useEffect(() => { if (remoteFilter) setFilter(normalizeClusterFilter(remoteFilter)); }, [remoteFilter]);
   useEffect(() => {
     if (!filtersOpen) return;
@@ -102,44 +86,44 @@ export function OperatorWorkspace({ map, bandMaps, cluster, onSelect, onRequest,
     setPreferences(current => ({ ...current, widths: { ...current.widths, [column]: boundColumnWidth(value) } }));
   };
   const move = (clientX: number) => {
-    const current = drag.current; if (!current) return;
-    if (current.kind === "split") { if (width > 740) setSplit((clientX - (root.current?.getBoundingClientRect().left ?? 0)) / (width - 10) * 100); }
-    else {
-      const fraction = Math.max(0.01, Math.min(0.99, (current.startWidth / current.total * current.pixels + clientX - current.startX) / current.pixels));
-      if (current.total > current.startWidth) setColumnWidth(current.kind, fraction * (current.total - current.startWidth) / (1 - fraction));
-    }
+    if (drag.current && width > 740) setSplit((clientX - (root.current?.getBoundingClientRect().left ?? 0)) / (width - 10) * 100);
   };
-  return <div className={`operator-workspace${width > 0 && width <= 740 ? " is-stacked" : ""}`} ref={root} style={{ "--operator-map-share": `${percent}%` } as CSSProperties}>
-    <div className="operator-map-pane">{map}</div>
+  return <div className={`operator-workspace${toolsOnly ? " tools-only" : ""}${width > 0 && width <= 740 ? " is-stacked" : ""}`} ref={root} style={{ "--operator-map-share": `${percent}%` } as CSSProperties}>
+    {!toolsOnly && <><div className="operator-map-pane">{map}</div>
     <div className="operator-pane-divider" role="separator" aria-label="Map and tools width" aria-orientation="vertical" tabIndex={0}
       aria-valuemin={Math.round(bounds.min)} aria-valuemax={Math.round(bounds.max)} aria-valuenow={Math.round(percent)} aria-valuetext={`${Math.round(percent)}% map`}
       onKeyDown={event => { const value = event.key === "Home" ? bounds.min : event.key === "End" ? bounds.max : event.key === "ArrowLeft" ? percent - 2 : event.key === "ArrowRight" ? percent + 2 : null;
         if (value != null) { event.preventDefault(); setSplit(value); } }}
-      onPointerDown={event => { if (event.button !== 0) return; event.preventDefault(); drag.current = { kind: "split", startX: event.clientX, startWidth: 0, total: 0, pixels: 0 }; event.currentTarget.setPointerCapture?.(event.pointerId); move(event.clientX); }}
-      onPointerMove={event => move(event.clientX)} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }} onLostPointerCapture={() => { drag.current = null; }} />
+      onPointerDown={event => { if (event.button !== 0) return; event.preventDefault(); drag.current = true; event.currentTarget.setPointerCapture?.(event.pointerId); move(event.clientX); }}
+      onPointerMove={event => move(event.clientX)} onPointerUp={() => { drag.current = false; }} onPointerCancel={() => { drag.current = false; }} onLostPointerCapture={() => { drag.current = false; }} /></>}
     <div className="operator-tools-pane">
-      <div className="operator-tool-toolbar"><div className="operator-tool-tabs" role="tablist" aria-label="Operator tools">{(["band-maps", "cluster"] as const).map(tab => <button key={tab} type="button" role="tab"
-        id={`${id}-${tab}-tab`} aria-selected={preferences.activeTab === tab} aria-controls={`${id}-${tab}`} tabIndex={preferences.activeTab === tab ? 0 : -1}
-        onClick={() => setPreferences(current => ({ ...current, activeTab: tab }))}
-        onKeyDown={event => { if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault();
-          const next = event.key === "Home" ? "band-maps" : event.key === "End" ? "cluster" : tab === "cluster" ? "band-maps" : "cluster";
-          setPreferences(current => ({ ...current, activeTab: next })); document.getElementById(`${id}-${next}-tab`)?.focus(); }}>{tab === "band-maps" ? "Band maps" : "Cluster"}</button>)}</div>
+      <div className="operator-tool-toolbar"><label className="operator-tools-view" htmlFor={`${id}-view`}>View
+        <select id={`${id}-view`} aria-label="Desk tools view" value={`${preferences.activeTab}${preferences.showAlerts ? "-alerts" : ""}`} onChange={event => {
+          const view = event.currentTarget.value;
+          if (!["band-maps", "cluster", "band-maps-alerts", "cluster-alerts"].includes(view)) return;
+          verticalDrag.current = false;
+          setPreferences(current => ({ ...current, activeTab: view.startsWith("band-maps") ? "band-maps" : "cluster", showAlerts: view.endsWith("-alerts") }));
+        }}><option value="band-maps">Band maps</option><option value="cluster">Cluster</option>
+          <option value="band-maps-alerts">Band maps + Alerts</option><option value="cluster-alerts">Cluster + Alerts</option></select></label>
         <div ref={setBandToolbarHost} className="operator-band-map-toolbar" hidden={preferences.activeTab !== "band-maps"} />
         <div className="operator-cluster-toolbar" hidden={preferences.activeTab !== "cluster"}>
           <div className="operator-cluster-connections" role="status" aria-label="Compact cluster connections">{projection?.snapshot?.connections?.length ? projection.snapshot.connections.map((connection, index) => {
             const phase = connection.phase.toLowerCase(), label = phase.charAt(0).toUpperCase() + phase.slice(1);
             return <span key={`${connection.serverName}-${index}`} className={`operator-cluster-connection ${phase === "connected" ? "is-connected" : ["disconnected", "failed"].includes(phase) ? "is-disconnected" : "is-connecting"}`}>
-              {connection.serverName} · {label}{connection.error && <small> · {connection.error}</small>}</span>;
+              {connection.serverName} · {label}{connection.error && <ErrorNotice when={true}><small> · {connection.error}</small></ErrorNotice>}</span>;
           }) : <span className={`operator-cluster-connection ${projection?.snapshot ? projection.snapshot.connectedClusters ? "is-connected" : "is-disconnected" : "is-connecting"}`}>{projection?.snapshot ? projection.snapshot.connectedClusters ? `${projection.snapshot.connectedClusters} connected` : "Disconnected" : "Awaiting live cluster state"}</span>}</div>
           <button ref={filtersButton} type="button" aria-expanded={filtersOpen} aria-controls={`${id}-filters`}
             disabled={!onRequest || !remoteFilter} onClick={() => { setColumnsOpen(false); setFiltersOpen(true); }}>Filters</button>
+          <PushToPanButton cluster={cluster} onRequest={onRequest} />
           <button type="button" aria-expanded={columnsOpen} aria-controls={`${id}-columns`} onClick={() => { setFiltersOpen(false); setColumnsOpen(value => !value); }}>Columns</button>
         </div>
       </div>
       {filtersOpen && <ClusterFilterDialog dialogID={`${id}-filters`} filter={filter} specialChoices={specialChoices} error={filterError}
         onChange={changeFilter} onClose={closeFilters} />}
-      <div id={`${id}-band-maps`} role="tabpanel" aria-labelledby={`${id}-band-maps-tab`} className="operator-tool-content" hidden={preferences.activeTab !== "band-maps"}><BandMapsToolbarContext.Provider value={bandToolbarHost}>{bandMaps}</BandMapsToolbarContext.Provider></div>
-      <div id={`${id}-cluster`} role="tabpanel" aria-labelledby={`${id}-cluster-tab`} className={`operator-tool-content operator-compact-cluster${classic ? " is-classic" : ""}`} ref={clusterPane} hidden={preferences.activeTab !== "cluster"}>
+      <div ref={toolsStack} className={`operator-tools-stack${preferences.showAlerts ? " has-alerts" : ""}`} style={{ gridTemplateRows: preferences.showAlerts ? `minmax(0, ${toolsPercent}fr) 10px minmax(0, ${100 - toolsPercent}fr)` : "minmax(0, 1fr)" }}>
+      <div className="operator-primary-tools">
+      <div id={`${id}-band-maps`} role="region" aria-label="Band maps" className="operator-tool-content" hidden={preferences.activeTab !== "band-maps"}><BandMapsToolbarContext.Provider value={bandToolbarHost}>{bandMaps}</BandMapsToolbarContext.Provider></div>
+      <div id={`${id}-cluster`} role="region" aria-label="Cluster" className={`operator-tool-content operator-compact-cluster${classic ? " is-classic" : ""}`} ref={clusterPane} hidden={preferences.activeTab !== "cluster"}>
         <div id={`${id}-columns`} className="operator-column-settings" hidden={!columnsOpen}>
           <p>Preferred widths scale to fit. Drag a header edge or use its arrow keys.</p>
           <div>{compactClusterColumns.slice(currentColumnPage * columnPageSize, (currentColumnPage + 1) * columnPageSize).map(([column, label]) => <label key={column}><input type="checkbox" aria-label={`Show ${label} column`} checked={preferences.columns.includes(column)} disabled={preferences.columns.length === 1 && preferences.columns.includes(column)}
@@ -151,22 +135,23 @@ export function OperatorWorkspace({ map, bandMaps, cluster, onSelect, onRequest,
             <span>{currentColumnPage + 1} / {columnPages}</span><button type="button" disabled={currentColumnPage + 1 >= columnPages} aria-label="Next column settings page" onClick={() => setColumnPage(currentColumnPage + 1)}>›</button>
             <button type="button" onClick={() => { const defaults = defaultWorkspacePreferences(); setPreferences(current => ({ ...current, columns: defaults.columns, widths: defaults.widths })); }}>Reset columns and widths</button></nav>
         </div>
-        <div className="operator-compact-table" hidden={columnsOpen}><table aria-label="Compact live cluster"><colgroup>{preferences.columns.map(column => <col key={column} style={{ width: `${preferences.widths[column] / totalWidth * 100}%` }} />)}</colgroup>
-          <thead><tr>{preferences.columns.map(column => { const label = compactClusterColumns.find(([value]) => value === column)![1]; return <th key={column} aria-label={column === "callStatus" || column === "dxccStatus" ? label : undefined}
-            className={column === "callStatus" || column === "dxccStatus" ? "live-cluster-status-column" : undefined}><span title={label}>{compactClusterHeader(column)}</span>
-            <span role="separator" tabIndex={0} aria-orientation="vertical" aria-label={`Resize ${compactClusterColumns.find(([value]) => value === column)![1]} column`} aria-valuemin={48} aria-valuemax={480} aria-valuenow={preferences.widths[column]}
-              onKeyDown={event => { const value = event.key === "Home" ? 48 : event.key === "End" ? 480 : event.key === "ArrowLeft" ? preferences.widths[column] - 8 : event.key === "ArrowRight" ? preferences.widths[column] + 8 : null;
-                if (value != null) { event.preventDefault(); setColumnWidth(column, value); } }}
-              onPointerDown={event => { if (event.button !== 0) return; event.preventDefault(); drag.current = { kind: column, startX: event.clientX, startWidth: preferences.widths[column], total: totalWidth, pixels: event.currentTarget.closest("table")?.getBoundingClientRect().width || 1 }; event.currentTarget.setPointerCapture?.(event.pointerId); }}
-              onPointerMove={event => move(event.clientX)} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }} onLostPointerCapture={() => { drag.current = null; }} /></th>; })}</tr></thead>
-          <tbody>{spots.slice(offset, offset + rows).map(spot => <tr key={spot.id} tabIndex={0} aria-selected={selectedSpotId === spot.id} aria-label={`Select ${spot.callsign} at ${formatSpotFrequency(spot.frequencyKHz * 1000)} MHz`} style={{ backgroundColor: classic || selectedSpotId === spot.id ? undefined : clusterRowTint(spot.dxccStatus, colors?.status) }}
-            onClick={() => onSelect(spot)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(spot); } }}>
-            {preferences.columns.map(column => <td key={column} title={spotText(column, spot, ageClock)} className={column === "frequency" ? "cyan mono" : column === "callsign" ? "live-cluster-call" : column === "callStatus" || column === "dxccStatus" ? "live-cluster-status-column" : ""}>{cell(column, spot, ageClock, colors, classic)}</td>)}</tr>)}</tbody></table>
-          {!spots.length && <p className="operator-cluster-empty">{projection?.snapshot ? "No spots in the current live cluster view." : "Awaiting live cluster state."}</p>}
-        </div>
+        <CompactSpotTable spots={spots.slice(offset, offset + rows)} preferences={preferences} onWidth={setColumnWidth} onSelect={onSelect}
+          selectedSpotId={selectedSpotId} colors={colors} classic={classic} hidden={columnsOpen}
+          emptyMessage={projection?.snapshot ? "No spots in the current live cluster view." : "Awaiting live cluster state."} />
         <footer hidden={columnsOpen}><button type="button" aria-label="Previous spots page" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>‹</button>
           <span>{spots.length ? `${offset + 1}–${Math.min(offset + rows, spots.length)} of ${spots.length}` : "0 spots"}</span>
           <button type="button" aria-label="Next spots page" disabled={currentPage + 1 >= pages} onClick={() => setPage(currentPage + 1)}>›</button></footer>
+      </div>
+      </div>
+      {preferences.showAlerts && <><div className="operator-alerts-divider" role="separator" aria-label="Tools and Alerts height" aria-orientation="horizontal" tabIndex={toolsMinimum === toolsMaximum ? -1 : 0}
+        aria-valuemin={Math.round(toolsMinimum)} aria-valuemax={Math.round(toolsMaximum)} aria-valuenow={Math.round(toolsPercent)} aria-valuetext={`${Math.round(toolsPercent)}% ${preferences.activeTab === "cluster" ? "Cluster" : "Band maps"}`}
+        onKeyDown={event => { const step = event.shiftKey ? 10 : 2;
+          const next = event.key === "Home" ? toolsMinimum : event.key === "End" ? toolsMaximum : event.key === "ArrowUp" ? toolsPercent - step : event.key === "ArrowDown" ? toolsPercent + step : null;
+          if (next !== null) { event.preventDefault(); setToolsSplit(next); } }}
+        onPointerDown={event => { if (event.button !== 0 || toolsMinimum === toolsMaximum) return; event.preventDefault(); event.currentTarget.focus(); event.currentTarget.setPointerCapture?.(event.pointerId); verticalDrag.current = true; }}
+        onPointerMove={event => { if (!verticalDrag.current) return; const box = toolsStack.current?.getBoundingClientRect(); if (box && box.height > 10) setToolsSplit((event.clientY - box.top) / box.height * 100); }}
+        onPointerUp={() => { verticalDrag.current = false; }} onPointerCancel={() => { verticalDrag.current = false; }} onLostPointerCapture={() => { verticalDrag.current = false; }} />
+        <div className="operator-alerts-pane"><ChaseAlertsTable preferences={preferences} onWidth={setColumnWidth} colors={colors} /></div></>}
       </div>
     </div>
   </div>;

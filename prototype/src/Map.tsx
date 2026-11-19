@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./live/ErrorNotice";
 import { formatSpotFrequency } from "./spotFrequency";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
@@ -378,7 +379,7 @@ export default function WorldMap<T extends MapSpot = MapSpot>({
     };
     const hideDetails = () => { popup?.remove(); popup = null; inspectedCall = null; };
     const showDetails = (call: string, refresh = false) => {
-      if (disposed) return;
+      if (disposed || expeditionLabelsRef.current) return;
       const spot = spotsRef.current.find(value => value.call === call);
       if (!spot || overlayRef.current === "DXCC") { hideDetails(); return; }
       if (inspectedCall === call && popup && !refresh) return;
@@ -505,16 +506,23 @@ export default function WorldMap<T extends MapSpot = MapSpot>({
           button.style.width = `${labelWidth}px`;
           const offset = expeditionLabelOffset(position, placed, width, height, labelWidth, spot.locationOnly ? 40 : 52);
           marker.setOffset(offset);
-          // Create DOM text nodes only: publisher text never becomes HTML.
-          const line = document.createElement("span"); line.className = "dxp-pin-leader"; line.setAttribute("aria-hidden", "true");
+          // Keep the pressed label attached between pointerdown and click during map redraws.
+          let line = button.querySelector<HTMLElement>(".dxp-pin-leader");
+          let body = button.querySelector<HTMLElement>(".dxp-pin-body");
+          if (!line || !body) {
+            line = document.createElement("span"); line.className = "dxp-pin-leader"; line.setAttribute("aria-hidden", "true");
+            body = document.createElement("span"); body.className = "dxp-pin-body";
+            body.append(document.createElement("strong"), document.createElement("span"), document.createElement("small"));
+            button.replaceChildren(line, body);
+          }
           line.style.width = `${Math.hypot(...offset)}px`;
           line.style.transform = `rotate(${Math.atan2(-offset[1], -offset[0])}rad)`;
-          const body = document.createElement("span"); body.className = "dxp-pin-body";
-          const call = document.createElement("strong"); call.textContent = spot.call;
-          const status = document.createElement("span"); status.textContent = (spot.callStatus || "on air").replaceAll("_", " ");
-          body.append(call, status);
-          if (!spot.locationOnly) { const frequency = document.createElement("small"); frequency.textContent = `${spot.mhz.toFixed(4)} MHz · ${spot.mode}`; body.append(frequency); }
-          button.replaceChildren(line, body);
+          const labels = [spot.call, (spot.callStatus || "on air").replaceAll("_", " "),
+            spot.locationOnly ? "" : `${spot.mhz.toFixed(4)} MHz · ${spot.mode}`];
+          labels.forEach((label, index) => {
+            const element = body!.children[index];
+            if (element.textContent !== label) element.textContent = label;
+          });
         }
         button.setAttribute("aria-label", `${spot.call} · ${expedition ? `${spot.callStatus} · ` : ""}${mapSpotDetails(spot)[0]}${callback.current ? `. ${actionLabel.current}.` : ". Inspect spot."}`);
         if (!expedition) button.setAttribute("aria-current", selectedCallRef.current === spot.call ? "true" : "false");
@@ -1208,17 +1216,17 @@ export default function WorldMap<T extends MapSpot = MapSpot>({
       {compact && <button className="map-rbn-toggle" type="button" aria-pressed={heardMe} onClick={() => setHeardMe(!heardMe)}>Heard me</button>}
       {heardMe && <aside className="map-rbn-panel" aria-label="Heard me reception reports">
         <label>Heard me · {monitoredCall || "No station call"} <select aria-label="Heard me band scope" value={heardBand} onChange={event => setHeardBand(event.target.value)}><option value="follow">Selected radio band {bandForRadio(frequencyHz) || "unknown"}</option><option value="all">All bands</option>{BAND_ORDER.map(band => <option key={band}>{band}</option>)}</select></label>
-        <p role="status">{rbn.status}{rbn.status === "Unavailable" && receivers.length ? " · stale retained data" : ""} · {locatedReceivers.length} located · {receivers.length - locatedReceivers.length} unlocated · last 10 min</p>
+        <ErrorNotice><p role="status">{rbn.status}{rbn.status === "Unavailable" && receivers.length ? " · stale retained data" : ""} · {locatedReceivers.length} located · {receivers.length - locatedReceivers.length} unlocated · last 10 min</p></ErrorNotice>
         {rbn.status === "Current" && !receivers.length && <p>No reports in this scope.</p>}
         <small>RBN receiver positions; radio and antenna attribution unavailable.</small>
         {!!locatedReceivers.length && !softwareMap && <button type="button" onClick={() => { const points = locatedReceivers.map(row => row.location!); mapRef.current?.fitBounds([[Math.min(...points.map(p => p.lon)), Math.min(...points.map(p => p.lat))], [Math.max(...points.map(p => p.lon)), Math.max(...points.map(p => p.lat))]], { padding: 70, maxZoom: 7 }); }}>Frame receivers</button>}
         {receiver && receivers.some(row => row.key === receiver.key) && <div aria-label="RBN receiver details"><strong>{receiver.spotter} heard {receiver.call}</strong><p>{receiver.band} · {(receiver.frequencyKHz / 1000).toFixed(4)} MHz · {receiver.mode}</p><p>{new Date(receiver.time).toISOString()} · {Math.max(0, Math.floor((rbn.now - receiver.time) / 1000))} s ago · {receiver.updates} reports</p><p>SNR {receiver.snr === null ? "unknown" : `${receiver.snr} dB`} · Speed {receiver.speed ?? "unknown"} · {receiver.location?.provenance}</p><button type="button" onClick={() => setReceiver(null)}>Close receiver details</button></div>}
       </aside>}
-      {imageryUnavailable && appearance !== "Standard" && <p className="map-offline" role="status">Imagery unavailable · showing bundled map</p>}
+      {imageryUnavailable && appearance !== "Standard" && <ErrorNotice><p className="map-offline" role="status">Imagery unavailable · showing bundled map</p></ErrorNotice>}
       {error && (
-        <p className="map-error" role="alert">
+        <ErrorNotice><p className="map-error" role="alert">
           {error}
-        </p>
+        </p></ErrorNotice>
       )}
       {!compact && <div ref={legendRef} className="map-legend">
         {routeSummary ? <strong>{target?.call} · {Math.round(routeSummary.distanceKm).toLocaleString()} km · SP {Math.round(routeSummary.shortBearing).toString().padStart(3, "0")}° · LP {Math.round(routeSummary.longBearing).toString().padStart(3, "0")}°</strong>

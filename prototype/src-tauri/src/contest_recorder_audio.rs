@@ -437,6 +437,12 @@ where
 }
 
 /// Read-only permission state; enumeration/status do not trigger a prompt.
+#[cfg(windows)]
+pub fn permission() -> String {
+    "Windows microphone access is checked when capture starts".into()
+}
+
+#[cfg(target_os = "macos")]
 pub fn permission() -> String {
     use objc2::{msg_send, runtime::AnyClass};
     use objc2_foundation::NSString;

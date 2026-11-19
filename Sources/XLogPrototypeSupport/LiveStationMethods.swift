@@ -1,7 +1,11 @@
 import Foundation
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import XCatIntegrationCore
+#if os(macOS)
 import XLogCore
+#else
+import XLogPortableCore
+#endif
 
 /// A synchronous actor reservation closes the gap between the two providers'
 /// asynchronous attachment checks when connect IPC requests arrive together.
@@ -35,7 +39,7 @@ enum StationOwnerRetirement: Sendable, Equatable { case retired, unconfirmed }
 
 struct StationRadioRegistry: Sendable {
     static let shared = StationRadioRegistry()
-    #if os(macOS)
+    #if os(macOS) || os(Windows)
     let claims: [String: StationProviderClaim]
     let agents: [String: LiveStationSession]
     let flex: [String: LiveFlexSession]
@@ -67,7 +71,7 @@ struct StationRadioRegistry: Sendable {
     #endif
 }
 
-/// The Mac worker talks to the real xCat loopback service. No values are
+/// The desktop worker talks to the real xCat loopback service. No values are
 /// synthesized when that service or its radio is unavailable.
 enum LiveStationMethods {
     static let methods: Set<String> = ["station_snapshot", "station_tune", "station_action", "station_receive_filter",
@@ -105,14 +109,7 @@ enum LiveStationMethods {
         guard methods.contains(method) else {
             throw WorkerFailure("method_not_allowed", "Station method is not available.")
         }
-        #if !os(macOS)
-        if !["station_snapshot", "station_tune", "station_action"].contains(method)
-            || params["provider"] as? String == "direct_agent" {
-            throw WorkerFailure("unsupported_platform", "Live station control is available on macOS only.")
-        }
-        #endif
-        #if os(macOS)
-        guard params["provider"] == nil || params["provider"] is String else { throw invalidParams() }
+        #if os(macOS) || os(Windows)
         // The rotor has its own process-wide transport and lifetime. It is not
         // owned by Radio 1 or Radio 2, so route it before requiring radio_id.
         // Keeping it behind the radio selector made every native rotor request
@@ -122,6 +119,15 @@ enum LiveStationMethods {
             rotorParams.removeValue(forKey: "radio_id")
             return try await LiveRotorSession.shared.handle(method, params: rotorParams)
         }
+        #endif
+        #if !os(macOS) && !os(Windows)
+        if !["station_snapshot", "station_tune", "station_action"].contains(method)
+            || params["provider"] as? String == "direct_agent" {
+            throw WorkerFailure("unsupported_platform", "Live station control is available on macOS only.")
+        }
+        #endif
+        #if os(macOS) || os(Windows)
+        guard params["provider"] == nil || params["provider"] is String else { throw invalidParams() }
         guard let radioID = params["radio_id"] as? String,
               ["radio1", "radio2"].contains(radioID),
               let claim = registry.claims[radioID],
@@ -226,7 +232,9 @@ enum LiveStationMethods {
         }
         guard provider == "xcat_loopback" else { throw invalidParams() }
         #endif
-        let endpoint = try Endpoint(params, allowed: method == "station_tune"
+        var loopbackParams = params
+        loopbackParams.removeValue(forKey: "radio_id")
+        let endpoint = try Endpoint(loopbackParams, allowed: method == "station_tune"
             ? ["frequency_hz", "mode", "provider"] : method == "station_action"
             ? ["action", "bearing", "band", "provider"] : ["provider"])
         let requestedTune: (Int64, String)?
@@ -259,7 +267,7 @@ enum LiveStationMethods {
             actionCommand = (action, command)
         }
 
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         let client = XCatClient(host: endpoint.host, port: endpoint.port)
         do {
             if let (frequency, mode) = requestedTune {
@@ -332,7 +340,7 @@ enum LiveStationMethods {
         return number.doubleValue
     }
 
-    private static func jsonNumber(_ value: Any) -> NSNumber? {
+    static func jsonNumber(_ value: Any) -> NSNumber? {
         // Foundation bridges JSON booleans to NSNumber too. CoreFoundation's
         // type IDs are unavailable in the Windows toolchain; preserve the JSON
         // scalar distinction without guessing NSNumber's platform class/type.
@@ -342,7 +350,7 @@ enum LiveStationMethods {
         return number
     }
 
-    #if os(macOS)
+    #if os(macOS) || os(Windows)
     private static func expectedRadioMode(_ mode: String, frequencyHz: Int64) -> String {
         switch mode {
         case "SSB": frequencyHz < 10_000_000 ? "LSB" : "USB"

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useId, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { contestKeyBindingActions, contestKeyBindingContexts, contestKeyBindingDescriptions, defaultContestKeyBindings,
   encodeContestKeyBindings, readContestKeyBindings, validateContestKeyBindings, n1mmContestKeyBindings, type ContestKeyBinding } from "./contestKeyBindings";
@@ -186,7 +187,7 @@ export function ContestSetupPanel({ value, sessions, activeSessionID, catalog, b
   const check = (section: "preferences" | "network", key: string, label: string) => <label key={key} className="contest-setup-check"><input type="checkbox" checked={draft[section][key] === true} onChange={event => update(section, key, event.target.checked)}/><span>{label}</span></label>;
   const shared = (service: ContestSetupServiceTab, label: string = service) => servicePanels?.[service] ?? (onOpenSettings ? <button type="button" onClick={() => void run(async () => { await onOpenSettings(service); }, "")}>Open xLog {label} settings</button> : null);
   const managed = (service: ContestSetupServiceTab, description: string, label: string = service) => <div className="contest-manual-stack">
-    <p role="status">Managed by xLog {label} settings. {description}</p>
+    <ErrorNotice><p role="status">Managed by xLog {label} settings. {description}</p></ErrorNotice>
     {shared(service, label) ?? <p>Open these settings in the main xLog application.</p>}
     <p>Save here applies contest preferences only. Existing contest service fields are retained without applying them.</p>
   </div>;
@@ -411,7 +412,7 @@ const row = (...items: ReactNode[]) => <div className="contest-manual-row">{item
           <div className="contest-voice-profile-path">{field("preferences", "voiceProfilePath", "Voice WAV profile folder")}
             <button type="button" onClick={chooseVoiceProfile}>Choose folder…</button>
             <button type="button" disabled={!String(draft.preferences.voiceProfilePath ?? "").trim()} onClick={() => void run(() => refreshVoiceProfile(), "Voice profile checked.")}>Check profile</button></div>
-          <p role="status">{audioOutputs === null ? "Finding audio outputs…" : audioOutputError ? `Audio output discovery failed: ${audioOutputError}` : audioOutputs.length ? "Choose the sound output device for the voice keyer." : "No named audio outputs were reported. The system default remains available."}</p>
+          <ErrorNotice when={Boolean(audioOutputError) || undefined}><p role="status">{audioOutputs === null ? "Finding audio outputs…" : audioOutputError ? `Audio output discovery failed: ${audioOutputError}` : audioOutputs.length ? "Choose the sound output device for the voice keyer." : "No named audio outputs were reported. The system default remains available."}</p></ErrorNotice>
           <p>Use a Not1MM-compatible recorded profile: lowercase character files such as <code>c.wav</code>, <code>q.wav</code>, <code>space.wav</code>, and optional whole-message files such as <code>cq.wav</code> for a <code>[cq]</code> macro.</p>
           <p>Record F1–F12 here as bounded mono PCM WAV. Preview never claims contest output and never keys PTT. Replacing a slot requires a second explicit click. Map each recording to Run and/or S&amp;P, then Save. Explicitly select the Sound Output that feeds the radio; use System default only when intentional.</p>
           <div className="contest-voice-slots" role="group" aria-label="Recorded phone slots">{Array.from({length:12},(_,index)=>{
@@ -446,7 +447,7 @@ const row = (...items: ReactNode[]) => <div className="contest-manual-row">{item
         {check("network", "multiEnabled", "Enable Renfield Group Network")}
         {check("network", "multiMaster", "Be the master")}
         {field("network", "stationName", "Unique Station Name")}{field("network", "multicastGroup", "Multicast Group")}{field("network", "multicastPort", "Multicast Port", "number")}{field("network", "interface", "Interface IP")}
-        <p role="status">Group Chat and legacy Renfield contact publication use the shared multicast owner. “Be the master” enables xLog’s contest-fenced authority protocol on an isolated trusted LAN; it is not peer-authenticated across an untrusted network. Legacy acknowledgements remain transport-only.</p>
+        <ErrorNotice><p role="status">Group Chat and legacy Renfield contact publication use the shared multicast owner. “Be the master” enables xLog’s contest-fenced authority protocol on an isolated trusted LAN; it is not peer-authenticated across an untrusted network. Legacy acknowledgements remain transport-only.</p></ErrorNotice>
       </div>; break;
       case "N1MM": content = <div className="contest-manual-stack">
         {check("network", "n1mmEnabled", "Send N1MM packets")}
@@ -508,6 +509,6 @@ const row = (...items: ReactNode[]) => <div className="contest-manual-row">{item
         <fieldset disabled={disabled}><div id={id + "-panel"} role={configuration ? "tabpanel" : undefined} aria-labelledby={configuration ? id + "-tab-" + contestSetupTabs.indexOf(tab) : undefined} className="contest-manual-content">{content}</div></fieldset>
         <footer><button type="button" disabled={disabled} onClick={() => { recorderRef.current?.cancel(); recorderRef.current = null; recordingSlotRef.current = ""; setRecordingSlot(""); setReplaceSlot(""); if (detachedDialog) void onCancel?.(); else close(); }}>Cancel</button><button type="submit" className="contest-primary" disabled={disabled || Boolean(recordingSlot) || (view === "Choose a Contest" && !selectedSession) || (!activeSessionID && ["Edit Current Contest", "Edit Macros", "Edit Keys"].includes(view ?? ""))}>{pending ? "Saving…" : detachedDialog || configuration ? "Save" : "OK"}</button></footer>
       </form>}
-    {(error || message) && <p role={error ? "alert" : "status"}>{error || message}</p>}
+    {(error || message) && <ErrorNotice><p role={error ? "alert" : "status"}>{error || message}</p></ErrorNotice>}
   </section>;
 }

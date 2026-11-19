@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { formatSpotFrequency } from "../spotFrequency";
 import { contestBandMapMultiplierLabel, contestBandMapSpotColor, contestBandMapSpotPending, contestBandMapSpotWorked, contestNeededMultiplierCount } from "./contestSpotPresentation";
 export { contestBandMapMultiplierLabel, contestBandMapSpotColor, contestBandMapSpotPending, contestBandMapSpotWorked, contestNeededMultiplierCount } from "./contestSpotPresentation";
@@ -458,9 +459,9 @@ function BandPanel({ band, spots, onSelect, onRemove, canRemove, compact, fontSc
             aria-current={selectedSpotId === String(spot.id) ? "true" : undefined} onClick={() => onSelect(spot)}
              onContextMenu={event => onSpotContextMenu?.(spot, event)}><strong>{text(spot.callsign)}</strong>{spot.qtcEnabled&&<span className="band-map-qtc-flag" aria-hidden="true">{spot.qtc?.opportunity?"Q":!spot.qtc||spot.qtc.eligibility==="unknown"?"?":"–"}</span>}</button>;
       })}
-      {hidden > 0 && <span className="band-map-overflow" role="status" aria-label={`${hidden} more spots; zoom in to separate labels`} title={`${hidden} more spots; zoom in to separate labels`}>{hidden} more · zoom in</span>}
+      {hidden > 0 && <ErrorNotice><span className="band-map-overflow" role="status" aria-label={`${hidden} more spots; zoom in to separate labels`} title={`${hidden} more spots; zoom in to separate labels`}>{hidden} more · zoom in</span></ErrorNotice>}
     </div>
-    {rangeInfo && <p className="band-map-range-info" role="status">{rangeInfo}<button type="button" onClick={() => setRangeInfo("")}>Close range</button></p>}
+    {rangeInfo && <ErrorNotice><p className="band-map-range-info" role="status">{rangeInfo}<button type="button" onClick={() => setRangeInfo("")}>Close range</button></p></ErrorNotice>}
     <footer className="band-map-panel-foot"><div className="band-map-legend">{guide ? <span title={guide.ranges.map(r => r.label).filter((v,i,a) => a.indexOf(v) === i).join(" · ")}>{guide.name}{!guide.supportedBands.includes(band) ? " · unsupported band" : ""}</span> : <><span>CW</span><span>Data</span><span>Phone</span></>}</div>
       {contestPresentation&&<details className="band-map-filter-details"><summary>Filter details</summary><div aria-label={`${band} filter counts`}>
         <p>Counts start with reports supplied to this view.</p><dl>

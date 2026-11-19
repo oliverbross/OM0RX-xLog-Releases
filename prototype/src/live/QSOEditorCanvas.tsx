@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Grip, MoveDiagonal2, RotateCcw } from "lucide-react";
 import { defaultQSOCanvasLayout, moveQSOCanvasPanel, qsoCanvasHeight, qsoCanvasLayoutKey, qsoCanvasResizeEdges,
@@ -36,7 +37,7 @@ export default function QSOEditorCanvas({ panels, disabled = false }: Props) {
       {arranging && <button type="button" disabled={disabled} onClick={reset}><RotateCcw size={14} aria-hidden="true" />Reset layout</button>}
       <span>{compact ? "Expand this window to arrange panels." : arranging ? "Drag a panel title to move it or drag any edge to resize. Arrow keys also work." : "Panel positions and sizes are saved on this computer."}</span>
     </div>
-    {storageError && <p className="qso-canvas-error" role="alert">{storageError}</p>}
+    {storageError && <ErrorNotice><p className="qso-canvas-error" role="alert">{storageError}</p></ErrorNotice>}
     <div ref={root} className={`qso-canvas${arranging ? " is-arranging" : ""}${compact ? " is-compact" : ""}`} style={compact ? undefined : { aspectRatio: `${qsoCanvasWidth} / ${qsoCanvasHeight}` }}>
       {panels.map(item => {
         const panel = layout.panels.find(candidate => candidate.id === item.id)!;

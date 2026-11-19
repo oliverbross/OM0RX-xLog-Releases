@@ -201,7 +201,9 @@ def dimensions(state):
                           "CountryPrefix" if _own(state).get("continent") == "AS" else "WPXPrefix", "band", criterion="flag1"),)
     if plugin in {"sac_cw", "sac_ssb"}:
         scandinavian = _own(state).get("primary_pfx") in {"LA", "SM", "OZ", "OH", "OH0", "OY", "TF", "JW", "JX", "OX"}
-        return (Dimension("country" if scandinavian else "area", "SAC country / call areas", "CountryPrefix" if scandinavian else "@sacArea", "band"),)
+        # Revised sessions count only scored (non-Scandinavian) countries.
+        return (Dimension("country" if scandinavian else "area", "SAC country / call areas", "CountryPrefix" if scandinavian else "@sacArea", "band",
+                          criterion="positive" if scandinavian and state.get("scoringRevision") == "26.10.26" else "all"),)
     if plugin == "pacc":
         return (Dimension("region", "PACC country / call areas" if _own(state).get("primary_pfx") == "PA" else "Dutch provinces",
             "@pacc" if _own(state).get("primary_pfx") == "PA" and state.get("scoringRevision") == "26.10.26" else

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { Fragment, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { ChevronLeft, ChevronRight, RefreshCw, Search } from "lucide-react";
 import { useLogbookCapacity } from "./logbookCapacity";
@@ -222,14 +223,14 @@ export function SpotHistoryPanel({ request }: { request: Request }) {
       <button type="button" aria-expanded={columnsOpen} aria-controls={`${id}-columns`} onClick={() => setColumnsOpen(open => !open)}>Columns</button>
     </form>
     {columnsOpen && <SpotHistoryColumns id={`${id}-columns`} preferences={columnPreferences} onChange={setColumnPreferences} onDone={() => setColumnsOpen(false)} />}
-    {validation && <p className="spot-history-message error" role="alert">{validation}</p>}
+    {validation && <ErrorNotice><p className="spot-history-message error" role="alert">{validation}</p></ErrorNotice>}
     <div className="spot-history-health" role="status">
-      <span className={unavailable || statusError ? "error" : status?.recording.state === "degraded" || gap ? "warning" : status?.recording.state === "recording" ? "recording" : ""}>
+      <ErrorNotice><span className={unavailable || statusError ? "error" : status?.recording.state === "degraded" || gap ? "warning" : status?.recording.state === "recording" ? "recording" : ""}>
         {statusError ? "Archive status unavailable" : !status ? "Checking archive status…" : unavailable ? "History unavailable" : status.recording.state === "degraded" ? "Recording degraded" : status.recording.state === "recording" ? "Recording" : status.recording.state === "stopped" ? "Recording stopped" : "Recording idle"}
-      </span>
+      </span></ErrorNotice>
       {status?.status && <span>{status.status.total.toLocaleString()} retained{status.recording.queued > 0 ? ` · ${status.recording.queued.toLocaleString()} queued` : ""}</span>}
-      {gap && <span className="warning">{status!.recording.unrecorded > 0 ? `Known archive gap: ${status!.recording.unrecorded.toLocaleString()} unrecorded reports` : "Known archive gap: inspect recorded coverage events"}</span>}
-      {status?.recording.unknownGap && <span className="warning">A recording interruption has an unknown extent.</span>}
+      {gap && <ErrorNotice when={true} title="Please check" noticeKey="live/SpotHistoryPanel.tsx:232"><span className="warning">{status!.recording.unrecorded > 0 ? `Known archive gap: ${status!.recording.unrecorded.toLocaleString()} unrecorded reports` : "Known archive gap: inspect recorded coverage events"}</span></ErrorNotice>}
+      {status?.recording.unknownGap && <ErrorNotice when={true} title="Please check" noticeKey="live/SpotHistoryPanel.tsx:233"><span className="warning">A recording interruption has an unknown extent.</span></ErrorNotice>}
       <span className="spot-history-local-note">Reports received locally; disconnected periods are not backfilled.</span>
       {status && <details><summary>Recording details</summary><div className="spot-history-health-details">
         <span>Started UTC: {spotHistoryUTC(status.recording.startedAt)}</span>
@@ -253,7 +254,7 @@ export function SpotHistoryPanel({ request }: { request: Request }) {
     <p className="spot-history-scope">{scope.from ? `${spotHistoryUTC(String(scope.from))} — ${spotHistoryUTC(String(scope.to))} UTC` : "All retained dates"} · Newest received first{page ? ` · Snapshot ${page.watermark}` : ""}{browse.resized ? " · Layout resized; report position and snapshot retained" : ""}</p>
     {detailOpen && selected && <section id={`${id}-details`} className="spot-history-detail" aria-label={`Report details for ${selected.callsign}`}>
       <div className="spot-history-detail-head"><strong>{selected.callsign} · report details</strong><button onClick={() => { detailVersion.current++; setDetailOpen(false); detailToggle.current?.focus(); }}>Close details</button></div>
-      {detailLoading ? <p role="status">Reading original report…</p> : detailError ? <p className="error" role="alert">{detailError} <button onClick={() => setDetailReload(value => value + 1)}>Retry details</button></p> : detail && <dl>
+      {detailLoading ? <ErrorNotice><p role="status">Reading original report…</p></ErrorNotice> : detailError ? <ErrorNotice><p className="error" role="alert">{detailError} <button onClick={() => setDetailReload(value => value + 1)}>Retry details</button></p></ErrorNotice> : detail && <dl>
         <div><dt>Callsign / Spotter</dt><dd>{detail.callsign} / {detail.spotter}</dd></div><div><dt>Frequency / Band / Mode</dt><dd>{detail.frequencyText || detail.frequencyKHz} kHz · {detail.band || "Unknown"} · {detail.mode || "Unknown"}</dd></div>
         <div><dt>Received UTC</dt><dd>{spotHistoryUTC(detail.arrivedAt)}</dd></div><div><dt>Reported UTC / Time basis</dt><dd>{spotHistoryUTC(detail.reportedAt)} · {detail.timeBasis}</dd></div>
         <div><dt>Cluster / Host / Source</dt><dd>{detail.clusterName} · {detail.clusterHost} · {detail.source}</dd></div><div><dt>Country / ADIF</dt><dd>{detail.country || "Unknown"} · {detail.adif ?? "—"}</dd></div>
@@ -282,9 +283,9 @@ export function SpotHistoryPanel({ request }: { request: Request }) {
           ].sort((a, b) => columnPositions.get(a.key as SpotHistoryColumn)! - columnPositions.get(b.key as SpotHistoryColumn)!)}
         </tr>)}</tbody>
       </table>
-      {(!page?.rows.length || loading || error) && <div className="spot-history-empty" role={error ? "alert" : "status"}>
-        {loading ? <><div className="spot-history-skeleton" aria-hidden="true" /><p>Reading retained reports…</p></> : error ? <><p>{error}</p><button onClick={() => setReload(value => value + 1)}>Retry history</button></> : unavailable ? <><strong>History is unavailable</strong><p>The archive cannot be read. Check recording details, then retry.</p><button onClick={refresh}>Retry history</button></> : status?.status?.total === 0 ? <><strong>No reports retained yet</strong><p>Reports from enabled cluster connections will appear here as they arrive.</p></> : <><strong>No reports match this search</strong><p>Broaden the callsign, spotter or UTC range, then Search.</p></>}
-      </div>}
+      {(!page?.rows.length || loading || error) && <ErrorNotice><div className="spot-history-empty" role={error ? "alert" : "status"}>
+        {loading ? <><div className="spot-history-skeleton" aria-hidden="true" /><p>Reading retained reports…</p></> : error ? <><ErrorNotice when={true}><p>{error}</p></ErrorNotice><button onClick={() => setReload(value => value + 1)}>Retry history</button></> : unavailable ? <><strong>History is unavailable</strong><p>The archive cannot be read. Check recording details, then retry.</p><button onClick={refresh}>Retry history</button></> : status?.status?.total === 0 ? <><strong>No reports retained yet</strong><p>Reports from enabled cluster connections will appear here as they arrive.</p></> : <><strong>No reports match this search</strong><p>Broaden the callsign, spotter or UTC range, then Search.</p></>}
+      </div></ErrorNotice>}
     </div>
     <footer className="spot-history-footer"><span>{page?.rows.length ? `Page ${browse.index + 1} · ${page.rows.length.toLocaleString()} reports shown` : "No reports shown"}{selected?.commentTruncated || selected?.metadataTruncated ? " · Summary shortened; open Details for full stored fields" : ""}</span><div>
       <button ref={detailToggle} disabled={!selected} aria-expanded={detailOpen} aria-controls={`${id}-details`} onClick={() => setDetailOpen(open => !open)}>Details</button>

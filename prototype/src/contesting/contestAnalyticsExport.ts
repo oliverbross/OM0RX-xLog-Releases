@@ -18,8 +18,58 @@ export async function saveTextFile(filename:string,content:string,type="applicat
 export const saveAnalyticsFile=saveTextFile;
 
 export function saveLogbookFile(content:string,format:"adi"|"adx"):Promise<string>{
-  return saveTextFile(`OM0RX-xLog-integrated-${new Date().toISOString().slice(0,10)}.${format}`,content,
+  return saveTextFile(logbookExportFilename(format),content,
     format==="adx"?"application/xml;charset=utf-8":"text/plain;charset=utf-8","logbook_export_file");
+}
+
+/** Where a streamed Logbook export is written: a native file stream chosen up
+ *  front (Tauri), or an in-memory download (browser preview). */
+export interface LogbookExportSink {
+  append(text:string):Promise<void>;
+  finish(header:string,footer:string):Promise<string>;
+  abort():Promise<void>;
+}
+
+export function logbookExportFilename(format:"adi"|"adx"):string{
+  return `OM0RX-xLog-integrated-${new Date().toISOString().slice(0,10)}.${format}`;
+}
+
+/** Opens the destination before any record is read; null when the chooser was cancelled. */
+export async function openLogbookExport(format:"adi"|"adx"):Promise<LogbookExportSink|null>{
+  const filename=logbookExportFilename(format);
+  if(!isTauri()){
+    const parts:string[]=[];
+    return {
+      append:async text=>{parts.push(text);},
+      finish:async(header,footer)=>saveTextFile(filename,header+parts.join("")+footer,
+        format==="adx"?"application/xml;charset=utf-8":"text/plain;charset=utf-8","logbook_export_file"),
+      abort:async()=>{parts.length=0;},
+    };
+  }
+  const opened=await invoke<{cancelled:boolean;handle?:string}>("logbook_export_open",{filename});
+  if(opened?.cancelled===true)return null;
+  const handle=opened?.handle;
+  if(typeof handle!=="string"||!handle)throw new Error("The export could not be started. Please try again.");
+  let open=true;
+  return {
+    append:async text=>{
+      if(!open)throw new Error("The export is no longer open.");
+      // A rejected piece leaves the stream for abort to release at once.
+      await invoke("logbook_export_append",{handle,text});
+    },
+    finish:async(header,footer)=>{
+      if(!open)throw new Error("The export is no longer open.");
+      open=false;
+      const result=await invoke<{saved:boolean;cancelled:boolean}>("logbook_export_finish",{handle,header,footer});
+      if(result?.saved===true&&result.cancelled===false)return "Export saved.";
+      throw new Error("The export did not complete. Please try again.");
+    },
+    abort:async()=>{
+      if(!open)return;
+      open=false;
+      try{await invoke("logbook_export_abort",{handle});}catch{/* the stream also expires on its own */}
+    },
+  };
 }
 
 export function useAnalyticsExport(){

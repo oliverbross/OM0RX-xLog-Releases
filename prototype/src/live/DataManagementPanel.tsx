@@ -1,3 +1,6 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { ServiceHealthPanel } from "./ServiceHealthPanel";
+import { DuplicateContactsPanel } from "./DuplicateContactsPanel";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Archive, CheckCircle2, DatabaseBackup, RefreshCw } from "lucide-react";
@@ -144,20 +147,21 @@ export function DataManagementPanel({ onRequest, onChanged, workspaceGeneration 
   };
   const activationFiles: Record<string, string> = { pota: "pota-parks.csv", sota: "sota-summits.csv", iota: "iota-groups.json", wwff: "wwff-directory.csv", castle: "castle-cache.json" };
   const datasets = [
+    { id: "country_files", name: "CTY.DAT country files", file: "cty.dat", checked: state.sourceMetadata?.["cty.dat"]?.checkedAt, bytes: state.activationBytes?.cty, source: "https://www.country-files.com/cty/cty.dat", group: "country_files" },
     { id: "clublog", name: "Club Log CTY", file: "cty.xml", checked: state.clubLogUpdatedAt, bytes: state.clubLogBytes, source: sourceSettings.clubLogCTYURL, group: "clublog_lotw" },
     { id: "lotw", name: "LoTW activity", file: "lotw-user-activity.csv", checked: state.lotwUpdatedAt, bytes: state.lotwBytes, source: sourceSettings.lotwActivityURL, group: "clublog_lotw" },
     { id: "wavelog", name: "Wavelog catalog", file: "wavelog-catalog.json", checked: state.wavelogCatalogUpdatedAt, bytes: state.wavelogCatalogBytes, source: sourceSettings.wavelogURL, group: "wavelog_catalog" },
     ...["pota", "sota", "iota", "wwff", "castle"].map(id => ({ id, name: id === "castle" ? "Castle / COTA" : id.toUpperCase(), file: activationFiles[id], checked: state.activationUpdatedAt?.[id], bytes: state.activationBytes?.[id], source: activationSources[id], group: id === "castle" ? "unsupported" : "activations" })),
   ];
-  const activeGroup = /^Updating (clublog_lotw|activations|wavelog_catalog)$/.exec(reference?.status ?? "")?.[1];
+  const activeGroup = /^Updating (country_files|clublog_lotw|activations|wavelog_catalog)$/.exec(reference?.status ?? "")?.[1];
   const sourceAvailable = (source: string) => reference !== null &&
     (reference.available_sources === undefined ||
       (Array.isArray(reference.available_sources) && reference.available_sources.includes(source)));
   return <section className="live-data-management" aria-label="Data management">
     <h2><DatabaseBackup size={15} /> {section === "references" ? "Reference data status" : section === "backups" ? "Verified backups" : "Backups and reference data"}</h2>
     <p className="secondary">These tools operate on the integrated working copy. The original xLog database and installed apps remain untouched.</p>
-    {error && <p className="live-data-feedback error" role="alert">{error}</p>}
-    {message && <p className="live-data-feedback" role="status">{message}</p>}
+    {error && <ErrorNotice><p className="live-data-feedback error" role="alert">{error}</p></ErrorNotice>}
+    {message && <ErrorNotice><p className="live-data-feedback" role="status">{message}</p></ErrorNotice>}
 
     <div className="live-data-section" hidden={section === "references"}>
       <div className="live-data-section-title"><h3>Verified backups</h3>
@@ -206,8 +210,8 @@ export function DataManagementPanel({ onRequest, onChanged, workspaceGeneration 
     <div className="live-data-section" hidden={section === "backups"}>
       <div className="live-data-section-title"><h3>Reference data</h3><span className="secondary">CTY: {reference?.cty_source === "workspace_download" ? "updated workspace data" : "bundled data"}</span></div>
       <p>Download, check and attempt dates appear when tracked. Legacy caches may lack separate records. Freshness reflects only the recorded source check, not the presence of a cache file.</p>
-      {referenceError && <p className="live-data-feedback error" role="alert">{referenceError}</p>}
-      <p className="secondary" role="status">{reference?.status || "Checking reference cache…"}</p>
+      {referenceError && <ErrorNotice><p className="live-data-feedback error" role="alert">{referenceError}</p></ErrorNotice>}
+      <ErrorNotice><p className="secondary" role="status">{reference?.status || "Checking reference cache…"}</p></ErrorNotice>
       <div className="live-reference-scroll"><table className="live-reference-table" aria-label="Reference dataset evidence"><thead><tr><th scope="col">Dataset / source</th><th scope="col">Version / dates</th><th scope="col">Records / size</th><th scope="col">Download state / freshness</th></tr></thead><tbody>{datasets.map(dataset => {
         const validator = state.validators?.[dataset.file], metadata = state.sourceMetadata?.[dataset.file];
         const checked = date(metadata?.checkedAt);
@@ -219,7 +223,7 @@ export function DataManagementPanel({ onRequest, onChanged, workspaceGeneration 
           <td><span className={`reference-evidence ${metadata?.status === "failed" ? "failed" : recorded ? "recorded" : "unknown"}`}>{reference?.running && activeGroup === dataset.group ? "Refresh running" : dataset.id === "castle" ? "Bulk source unavailable" : metadata?.status === "failed" ? "Last attempt failed" : metadata?.status === "downloaded" ? "Last result: downloaded" : metadata?.status === "up_to_date" ? "Source unchanged at last check" : recorded ? "Successful check recorded" : "No successful check recorded"}</span><small>{referenceError ? "Status unavailable; freshness unknown" : metadata?.status === "failed" ? "Latest check failed; freshness unknown" : metadata?.status === "downloaded" ? "Updated at the recorded source check" : metadata?.status === "up_to_date" ? "Unchanged at the recorded source check" : "Freshness not assessed"}</small><small>{metadata ? `Last error: ${typeof metadata.lastError === "string" && /^[a-z0-9_]{1,80}$/i.test(metadata.lastError) ? metadata.lastError : metadata.status === "failed" ? "Details not recorded" : "None reported for last attempt"}` : "Per-dataset errors: not recorded"}</small></td></tr>;
       })}</tbody></table></div>
       <div className="live-data-refresh-actions">
-        {[["clublog_lotw", "Club Log + LoTW"], ["activations", "POTA / SOTA / IOTA / WWFF"], ["wavelog_catalog", "Wavelog catalog"]].map(([source, label]) =>
+        {[["country_files", "CTY.DAT"], ["clublog_lotw", "Club Log + LoTW"], ["activations", "POTA / SOTA / IOTA / WWFF"], ["wavelog_catalog", "Wavelog catalog"]].map(([source, label]) =>
           <button key={source} type="button" disabled={busy || reference?.running || !sourceAvailable(source)}
             title={reference && !sourceAvailable(source) ? "This reference source is not available on this platform." : undefined}
             onClick={() => void act(async () => {
@@ -229,6 +233,8 @@ export function DataManagementPanel({ onRequest, onChanged, workspaceGeneration 
           })}><RefreshCw size={13} /> {label}</button>)}
       </div>
     </div>
+    <DuplicateContactsPanel onRequest={onRequest} />
+    <ServiceHealthPanel />
   </section>;
 }
 

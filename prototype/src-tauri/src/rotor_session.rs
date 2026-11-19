@@ -298,7 +298,7 @@ pub(crate) fn resume_after_worker_restart(
         worker_generation,
         crate::rotor::worker_restarted,
         || load_with(loader.as_ref()),
-        |request| crate::rotor::request_startup_with(request, |request| dispatch(request)),
+        |request| crate::rotor::request_startup_with(request, worker_generation, |request| dispatch(request)),
     ).map(|_| ())
 }
 pub fn request(request: Value) -> Result<Value, String> {

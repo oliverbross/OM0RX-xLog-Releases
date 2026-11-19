@@ -14,7 +14,10 @@ actor LiveReferenceMethods {
     static let shared = LiveReferenceMethods()
 
     private let logbook: LiveLogbookMethods
-    private let session: URLSession
+    private let suppliedSession: URLSession?
+    // Creating Foundation's shared session opens its persistent cookie store.
+    // An offline worker can serve logbook requests without ever opening it.
+    private var session: URLSession { suppliedSession ?? .shared }
     private(set) var refreshTask: Task<Void, Never>?
     private var automaticTask: Task<Void, Never>?
     private var nextAutomaticCheck: Date?
@@ -33,35 +36,48 @@ actor LiveReferenceMethods {
         let modified: TimeInterval
         let fileNumber: UInt64
     }
-    private var cachedDirectory: (path: String, files: [ActivationReferenceKind: FileIdentity], value: ActivationReferenceDirectory)?
-    #if os(macOS)
+    typealias DirectoryLoader = @Sendable (URL, Set<ActivationReferenceKind>) async throws -> ActivationReferenceDirectory
+    private let directoryLoader: DirectoryLoader
+    private var directoryGeneration = 0
+    private var directoryLoads: [String: (id: UUID, task: Task<ActivationReferenceDirectory, Error>)] = [:]
+    private var cachedDirectory: (path: String, fingerprint: String, kinds: Set<ActivationReferenceKind>, value: ActivationReferenceDirectory)?
+    #if os(macOS) || os(Windows)
     private let logReviewReferences = LogReviewReferences()
     #endif
 
     static var availableSources: [String] {
-        #if os(macOS)
-        ["clublog_lotw", "activations", "wavelog_catalog"]
+        #if os(macOS) || os(Windows)
+        ["country_files", "clublog_lotw", "activations", "wavelog_catalog"]
         #else
         ["wavelog_catalog"]
         #endif
     }
 
-    private static var allowedScheduledSources: Set<String>? {
-        #if os(macOS)
-        nil
-        #else
-        ["wavelog-catalog.json"]
-        #endif
+    private static var scheduledSources: Set<String>? {
+        availableSources.contains("activations") ? nil : ["wavelog-catalog.json"]
     }
 
-    init(logbook: LiveLogbookMethods = .shared, session: URLSession = .shared,
+    init(logbook: LiveLogbookMethods = .shared, session: URLSession? = nil,
          scheduleOperation: (@Sendable () async throws -> Void)? = nil,
-         credentialLoader: CredentialLoader? = nil) {
+         credentialLoader: CredentialLoader? = nil, directoryLoader: DirectoryLoader? = nil) {
         self.logbook = logbook
-        self.session = session
+        self.suppliedSession = session
         self.scheduleOperation = scheduleOperation
         self.credentialLoader = credentialLoader ?? { service, account, allowInteraction in
             try WorkspaceCredentialStore(service: service).load(account, allowInteraction: allowInteraction)
+        }
+        self.directoryLoader = directoryLoader ?? { directory, kinds in
+            try await Task.detached(priority: .utility) {
+                for kind in kinds {
+                    let path = directory.appendingPathComponent(kind.fileName).path
+                    if FileManager.default.fileExists(atPath: path),
+                       try FileManager.default.attributesOfItem(atPath: path)[.type] as? FileAttributeType != .typeRegular {
+                        throw WorkerFailure("reference_data_invalid", "An installed reference directory is not a regular file.")
+                    }
+                }
+                do { return try ActivationReferenceDirectory(directory: directory, kinds: kinds) }
+                catch { throw WorkerFailure("reference_data_invalid", "An installed reference directory could not be parsed.") }
+            }.value
         }
     }
 
@@ -112,6 +128,7 @@ actor LiveReferenceMethods {
     func suspendForWorkspaceChange() async {
         workspaceTransitions += 1
         workspaceRevision += 1
+        retireDirectoryLoads()
         refreshTask?.cancel()
         await refreshTask?.value
         validatedCache = nil
@@ -126,6 +143,7 @@ actor LiveReferenceMethods {
     func terminate() async {
         stopped = true
         workspaceRevision += 1
+        retireDirectoryLoads()
         automaticTask?.cancel(); automaticTask = nil
         refreshTask?.cancel()
         await refreshTask?.value
@@ -135,12 +153,19 @@ actor LiveReferenceMethods {
         guard !stopped, workspaceTransitions == 0 else {
             throw WorkerFailure("reference_unavailable", "Reference services are stopping or changing workspace.")
         }
-        #if !os(macOS)
+        #if !os(macOS) && !os(Windows)
         guard ["reference_status", "reference_configure", "reference_refresh", "reference_schedule", "reference_country_status",
                "reference_country_import", "reference_country_download", "reference_country_rollback"].contains(method) else {
             throw WorkerFailure("platform_pending", "This reference service is not available on this platform.")
         }
         #endif
+        if method == "reference_resolve" {
+            guard Set(params.keys) == ["comment", "special_tags"],
+                  let comment = params["comment"] as? String, comment.count <= 8_192,
+                  let tags = params["special_tags"] as? [String], tags.count <= 32,
+                  tags.allSatisfy({ $0.count <= 128 }) else { throw invalid() }
+            return try await resolve(comment: comment, tags: tags)
+        }
         let directory = try logbook.referenceDirectoryURL()
         switch method {
         case "reference_country_status":
@@ -174,7 +199,7 @@ actor LiveReferenceMethods {
             result["country_reference_changed"] = result["reference_revision"] as? String != previousRevision
             lastResult = "Country snapshot activated; stored contacts unchanged"
             return result
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         case "reference_log_review":
             return try logReviewReferences.review(params: params, directory: directory)
         #endif
@@ -194,15 +219,9 @@ actor LiveReferenceMethods {
             let updater = try ReferenceDataUpdater(directory: directory, session: session)
             let state = await updater.currentState()
             return try status(state, directory: directory)
-        case "reference_resolve":
-            guard Set(params.keys) == ["comment", "special_tags"],
-                  let comment = params["comment"] as? String, comment.count <= 8_192,
-                  let tags = params["special_tags"] as? [String], tags.count <= 32,
-                  tags.allSatisfy({ $0.count <= 128 }) else { throw invalid() }
-            return try resolve(comment: comment, tags: tags, directory: directory)
         case "reference_refresh":
             guard Set(params.keys) == ["source"], let source = params["source"] as? String,
-                  ["clublog_lotw", "activations", "wavelog_catalog"].contains(source) else { throw invalid() }
+                  ["country_files", "clublog_lotw", "activations", "wavelog_catalog"].contains(source) else { throw invalid() }
             guard Self.availableSources.contains(source) else {
                 throw WorkerFailure("platform_pending", "This reference source is not available on this platform.")
             }
@@ -228,6 +247,8 @@ actor LiveReferenceMethods {
                 defer { lease.release() }
                 do {
                     switch source {
+                    case "country_files":
+                        _ = try await updater.refreshCountryFiles()
                     case "clublog_lotw":
                         _ = try await updater.refresh(clubLogURL: clubURL, clubLogAPIKey: clubKey, lotwURL: lotwURL)
                     case "activations":
@@ -267,7 +288,7 @@ actor LiveReferenceMethods {
             let clubURL = URL(string: settings.clubLogCTYURL)
             let lotwURL = URL(string: settings.lotwActivityURL)
             let wavelogURL = URL(string: settings.wavelogURL)
-            var expectedIdentities: [String: String] = [:]
+            var expectedIdentities: [String: String] = ["cty.dat": ReferenceDataUpdater.sourceIdentity(for: ReferenceDataUpdater.countryFilesURL)]
             if let clubURL, !clubKey.isEmpty,
                let requestURL = ReferenceDataUpdater.clubLogRequestURL(clubURL, apiKey: clubKey) {
                 expectedIdentities["cty.xml"] = ReferenceDataUpdater.sourceIdentity(for: requestURL)
@@ -291,7 +312,7 @@ actor LiveReferenceMethods {
                 clubLogConfigured: expectedIdentities["cty.xml"] != nil,
                 wavelogConfigured: expectedIdentities["wavelog-catalog.json"] != nil,
                 expectedIdentities: expectedIdentities, unavailableSources: unavailable,
-                allowedSources: Self.allowedScheduledSources
+                allowedSources: Self.scheduledSources
             )
             let due = plan.due
             let next = plan.nextCheckAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull() as Any
@@ -306,6 +327,10 @@ actor LiveReferenceMethods {
             refreshTask = Task {
                 defer { lease.release() }
                 var failed = false
+                if due.contains("cty.dat"), self.mayContinueScheduledChecks(revision: revision) {
+                    do { _ = try await updater.refreshCountryFiles() }
+                    catch { failed = true }
+                }
                 let hasCTY = due.contains("cty.xml")
                 let hasLoTW = due.contains("lotw-user-activity.csv")
                 if hasCTY, let clubURL, self.mayContinueScheduledChecks(revision: revision) {
@@ -342,13 +367,8 @@ actor LiveReferenceMethods {
     }
 
     private func unavailableCaches(updater: ReferenceDataUpdater, directory: URL) async throws -> Set<String> {
-        #if !os(macOS)
-        // The only portable source is a small JSON catalogue. Do not parse or
-        // schedule unsupported CTY/activity/activation downloads as a side effect.
-        return await updater.unavailableCachedSources(sources: Self.allowedScheduledSources)
-        #else
         var files: [String: FileIdentity] = [:]
-        for name in ["cty.xml", "lotw-user-activity.csv", "wavelog-catalog.json"]
+        for name in ["cty.dat", "cty.xml", "lotw-user-activity.csv", "wavelog-catalog.json"]
             + [ActivationReferenceKind.pota, .sota, .iota, .wwff].map(\.fileName) {
             let path = directory.appendingPathComponent(name).path
             if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
@@ -359,23 +379,19 @@ actor LiveReferenceMethods {
             }
         }
         if let cached = validatedCache, cached.files == files { return cached.unavailable }
-        let unavailable = await updater.unavailableCachedSources()
+        let unavailable = await updater.unavailableCachedSources(sources: Self.scheduledSources)
         validatedCache = (files, unavailable)
         return unavailable
-        #endif
     }
 
     private func status(_ state: ReferenceDataState, directory: URL) throws -> [String: Any] {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let stateJSON = try JSONSerialization.jsonObject(with: encoder.encode(state))
-        #if os(macOS)
         let downloaded = directory.appendingPathComponent("cty.xml")
         let usingDownloadedCTY = FileManager.default.fileExists(atPath: downloaded.path)
             && (try? CTYResolver(xmlURL: downloaded)) != nil
-        #else
-        let usingDownloadedCTY = false
-        #endif
+
         return ["running": refreshTask != nil, "status": lastResult,
                 "available_sources": Self.availableSources,
                 "automatic_check": try logbook.automaticReferenceChecks() as Any? ?? NSNull(),
@@ -406,7 +422,7 @@ actor LiveReferenceMethods {
         refreshTask = nil
     }
 
-    private func resolve(comment: String, tags: [String], directory: URL) throws -> [String: Any] {
+    private func resolve(comment: String, tags: [String]) async throws -> [String: Any] {
         let parsed = AwardReferenceParser.extract(comment: comment, specialTags: tags)
         let text = ([comment] + tags).joined(separator: " ").uppercased()
         let castleRaw = [parsed.sigInfo].filter { !$0.isEmpty }
@@ -414,7 +430,6 @@ actor LiveReferenceMethods {
         let castle = castleRaw.first.flatMap(castleReference)
         let potaMatches = AwardReferenceParser.potaReferences(comment: comment, specialTags: tags)
         let potaPrimary = potaMatches.first ?? ""
-        let directoryData = try activationDirectory(at: directory)
         let fields: [String: String] = [
             "potaReference": potaPrimary, "sotaReference": parsed.sota,
             "iota": parsed.iota, "wwffReference": parsed.wwff,
@@ -443,6 +458,10 @@ actor LiveReferenceMethods {
         for raw in castleRaw {
             if let value = castleReference(raw) { add(.castle, value.reference, raw) }
         }
+        // Ordinary QSO comments need no installed activation catalogue at all.
+        guard !candidates.isEmpty else { return ["fields": fields, "references": [[String: String]]()] }
+        let directory = try logbook.referenceDirectoryURL()
+        let directoryData = try await activationDirectory(at: directory, kinds: Set(candidates.map { $0.0 }))
         let references: [[String: String]] = candidates.compactMap { kind, reference, original in
             let match = directoryData.exactMatch(reference, kind: kind)
                 ?? original.flatMap { directoryData.exactMatch($0, kind: kind) }
@@ -474,29 +493,39 @@ actor LiveReferenceMethods {
         }
     }
 
-    private func activationDirectory(at directory: URL) throws -> ActivationReferenceDirectory {
-        let manager = FileManager.default
-        var files: [ActivationReferenceKind: FileIdentity] = [:]
-        for kind in ActivationReferenceKind.allCases {
-            let file = directory.appendingPathComponent(kind.fileName)
-            guard manager.fileExists(atPath: file.path) else { continue }
-            let attributes = try manager.attributesOfItem(atPath: file.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular else {
-                throw WorkerFailure("reference_data_invalid", "An installed reference directory is not a regular file.")
-            }
-            files[kind] = FileIdentity(
-                size: (attributes[.size] as? NSNumber)?.int64Value ?? -1,
-                modified: (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1,
-                fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-            )
-        }
-        if let cachedDirectory, cachedDirectory.path == directory.path, cachedDirectory.files == files {
+    private func retireDirectoryLoads() {
+        directoryGeneration += 1
+        for load in directoryLoads.values { load.task.cancel() }
+        directoryLoads.removeAll()
+        cachedDirectory = nil
+    }
+
+    private func activationDirectory(at directory: URL, kinds: Set<ActivationReferenceKind>) async throws -> ActivationReferenceDirectory {
+        let fingerprint = try ActivationReferenceDirectory.fingerprint(directory: directory)
+        if let cachedDirectory, cachedDirectory.path == directory.path, cachedDirectory.fingerprint == fingerprint,
+           cachedDirectory.kinds.isSuperset(of: kinds) {
             return cachedDirectory.value
         }
-        let loaded: ActivationReferenceDirectory
-        do { loaded = try ActivationReferenceDirectory(directory: directory) }
-        catch { throw WorkerFailure("reference_data_invalid", "An installed reference directory could not be parsed.") }
-        cachedDirectory = (directory.path, files, loaded)
+        let generation = directoryGeneration
+        let key = "\(generation)|\(directory.path)|\(fingerprint)|\(kinds.map(\.rawValue).sorted().joined(separator: ","))"
+        let task: Task<ActivationReferenceDirectory, Error>
+        let loadID: UUID
+        if let existing = directoryLoads[key] { task = existing.task; loadID = existing.id }
+        else {
+            let loader = directoryLoader
+            loadID = UUID()
+            task = Task { try await loader(directory, kinds) }
+            directoryLoads[key] = (loadID, task)
+        }
+        defer { if directoryLoads[key]?.id == loadID { directoryLoads.removeValue(forKey: key) } }
+        // Parsing large CSVs must not monopolize this actor: startup preference
+        // acknowledgements and workspace retirement remain immediately available.
+        let loaded = try await task.value
+        guard !stopped, workspaceTransitions == 0, generation == directoryGeneration,
+              fingerprint == (try ActivationReferenceDirectory.fingerprint(directory: directory)) else {
+            throw WorkerFailure("reference_changed", "Reference data changed during lookup. Retry the lookup.")
+        }
+        cachedDirectory = (directory.path, fingerprint, kinds, loaded)
         return loaded
     }
 

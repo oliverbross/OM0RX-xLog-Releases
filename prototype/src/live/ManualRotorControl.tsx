@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import { manualRotorGotoSession, type ManualRotorGotoSession } from "./manualRotorGoto";
 import { nativeRotorStop } from "./nativeRotorStop";
@@ -18,8 +19,8 @@ export function ManualRotorStatus({ session = manualRotorGotoSession(), onResolv
   };
   return <>{state.pending && <div className="live-actions"><button disabled={state.busy} onClick={() => void recover(() => session.check(), "Manual rotor receipt unavailable.")}>Check rotor receipt</button>
     {state.reviewable && <button disabled={state.busy} onClick={() => void recover(() => session.review(), "Manual rotor review could not be retained.")}>Acknowledge unknown turn</button>}</div>}
-    {showMessages && error && <p className="live-station-error" role="alert">{error}</p>}
-    {showMessages && state.message && <p role="status">{state.message}</p>}</>;
+    {showMessages && error && <ErrorNotice><p className="live-station-error" role="alert">{error}</p></ErrorNotice>}
+    {showMessages && state.message && <ErrorNotice><p role="status">{state.message}</p></ErrorNotice>}</>;
 }
 
 type RotorObservation = { available: boolean; snapshot: RotorSnapshot | null };
@@ -98,8 +99,8 @@ export function ManualRotorControl({ context, observation, session = manualRotor
       {stopButton}
       {rotor?.owner === "hamlib" && onPark && <button type="button" aria-label="Park rotor" disabled={!connected || parking}
         onClick={() => void park()}>{parking ? "Parking…" : "Park"}</button>}</form>}
-    {feedback && (!contestLayout || !onFeedback) && <p className={feedback.error ? "live-station-error" : undefined}
-      role={feedback.error ? "alert" : "status"}>{feedback.message}</p>}
+    {feedback && (!contestLayout || !onFeedback) && <ErrorNotice><p className={feedback.error ? "live-station-error" : undefined}
+      role={feedback.error ? "alert" : "status"}>{feedback.message}</p></ErrorNotice>}
     <ManualRotorStatus session={session} onResolved={operation => setFeedback(current => current?.gotoOperation === operation ? null : current)}
       showMessages={!contestLayout || !onFeedback} onMessage={onFeedback} />
   </section>;

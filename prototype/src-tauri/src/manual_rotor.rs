@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX: u64 = 9_007_199_254_740_991;
 
 pub fn validate_surface(label: &str, isolated: bool, exiting: bool, action: &str) -> Result<(), String> {
-    if isolated || exiting || !matches!(label, "main" | "station-control" | "monitor")
+    if isolated || exiting || !matches!(label, "main" | "station-control" | "monitor" | "rotor")
         || !matches!(action, "snapshot" | "receipt" | "review" | "manual_rotor_goto")
     {
         return Err("This window cannot perform that manual rotor operation.".into());
@@ -109,8 +109,8 @@ mod tests {
     }
     #[test]
     fn only_live_control_surfaces_can_use_the_owner() {
-        for label in ["main", "station-control", "monitor"] { for action in ["manual_rotor_goto", "review"] { assert!(validate_surface(label, false, false, action).is_ok()); } }
-        for label in ["rotor", "settings", "log-qso", "unknown"] { assert!(validate_surface(label, false, false, "manual_rotor_goto").is_err()); }
+        for label in ["main", "station-control", "monitor", "rotor"] { for action in ["manual_rotor_goto", "review"] { assert!(validate_surface(label, false, false, action).is_ok()); } }
+        for label in ["settings", "log-qso", "unknown"] { assert!(validate_surface(label, false, false, "manual_rotor_goto").is_err()); }
         assert!(validate_surface("main", true, false, "manual_rotor_goto").is_err()); assert!(validate_surface("main", false, true, "manual_rotor_goto").is_err());
     }
 }

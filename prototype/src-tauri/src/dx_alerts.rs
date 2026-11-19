@@ -40,6 +40,7 @@ pub struct Rule {
     #[serde(default = "cluster_source")]
     sources: Vec<String>,
     callsign_glob: String,
+    #[serde(default)] chase_modes: Vec<String>,
     #[serde(default)]
     comment_contains: String,
     bands: Vec<String>,
@@ -111,9 +112,14 @@ struct Entry {
     test: bool,
     source: String,
     callsign: String,
+    #[serde(rename = "frequencyKHz")]
     frequency_khz: f64,
     band: String,
     mode: String,
+    country: String,
+    score: Option<i64>,
+    worked_before: Option<f64>,
+    spotter: String,
     comment: String,
     call_status: String,
     dxcc_status: String,
@@ -136,6 +142,10 @@ struct Spot {
     frequency_khz: f64,
     band: String,
     mode: String,
+    country: String,
+    score: Option<i64>,
+    worked_before: Option<f64>,
+    spotter: String,
     comment: String,
     mode_group: String,
     call_status: String,
@@ -157,6 +167,8 @@ struct State {
     seen: HashSet<String>,
     seen_order: VecDeque<String>,
     entries: VecDeque<Entry>,
+    completed: HashSet<String>,
+    progress_ready: bool,
     delivery_error: Option<String>,
     delivery_suppressed: u64,
     delivery_times: VecDeque<u64>,
@@ -233,6 +245,8 @@ impl Rule {
             || self.sources.iter().collect::<HashSet<_>>().len() != self.sources.len()
             || !visible_text(&self.name, 80)
             || self.callsign_glob.len() > 32
+            || !choices(&self.chase_modes, 12, |m| ["CW","SSB","AM","FM","RTTY","FT8","FT4","PSK","DATA"].contains(&m.as_str()))
+            || !self.chase_modes.is_empty() && (self.callsign_glob.len() < 2 || self.callsign_glob.len() > 24 || self.callsign_glob.contains(['*','?']) || self.bands.is_empty())
             || !self.comment_contains.is_empty() && !visible_text(&self.comment_contains, 80)
             || !self.callsign_glob.bytes().all(|byte| {
                 byte.is_ascii_uppercase()
@@ -295,6 +309,7 @@ impl Rule {
             && criterion(&self.dx_itu_zones, &spot.geography.dx_itu_zone)
             && criterion(&self.spotter_entities, &spot.geography.spotter_entity)
             && criterion(&self.spotter_continents, &spot.geography.spotter_continent)
+            && (self.chase_modes.is_empty() || self.chase_modes.iter().any(|m| m == chase_mode(&spot.mode)))
             && self.enabled
             && self.sources.contains(&spot.source)
             && (self.callsign_glob.is_empty() || glob_matches(&self.callsign_glob, &spot.callsign))
@@ -355,6 +370,7 @@ impl Configuration {
                 enabled: true,
                 sources: cluster_source(),
                 callsign_glob: String::new(),
+                chase_modes: vec![],
                 comment_contains: String::new(),
                 bands: vec![],
                 modes: vec![],
@@ -403,6 +419,9 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
     current[value.len()]
 }
 
+fn chase_mode(mode: &str) -> &str {
+    match mode { "USB" | "LSB" => "SSB", "CWR" | "CWL" | "CWU" => "CW", "DIGU" | "DIGL" | "DIGI" => "DATA", value => value }
+}
 fn mode_group(mode: &str) -> &'static str {
     match mode.trim().to_ascii_uppercase().as_str() {
         "CW" | "CWR" => "cw",
@@ -472,6 +491,10 @@ fn spot(value: &Value) -> Option<Spot> {
         frequency_khz,
         band,
         mode: mode.clone(),
+        score: value["score"].as_i64().filter(|v| (0..=10000).contains(v)),
+        worked_before: value["workedBefore"].as_f64().filter(|v| v.is_finite()),
+        country: value["country"].as_str().unwrap_or("").chars().take(120).collect(),
+        spotter: value["spotter"].as_str().unwrap_or("").chars().take(32).collect(),
         comment: value["comment"]
             .as_str()
             .filter(|text| text.len() <= 512 && !text.chars().any(char::is_control))
@@ -607,6 +630,8 @@ impl State {
                 "receivedAtMs": self.activity.received_at_ms,
             },
             "entries": self.entries,
+            "completed": self.completed,
+            "progressReady": self.progress_ready,
             "delivery": {
                 "error": self.delivery_error,
                 "suppressed": self.delivery_suppressed,
@@ -640,6 +665,7 @@ impl Owner {
                 seen: HashSet::new(),
                 seen_order: VecDeque::new(),
                 entries: VecDeque::new(),
+                completed: HashSet::new(), progress_ready: false,
                 delivery_error: None,
                 delivery_suppressed: 0,
                 delivery_times: VecDeque::new(),
@@ -723,6 +749,9 @@ impl Owner {
         };
         persist(&self.path, &next)?;
         state.configuration = next;
+        state.progress_ready = false;
+        state.completed.clear();
+        state.entries.retain(|entry| entry.test);
         state.activity = ActivitySource::default();
         state.storage_error = None;
         state.baseline_next = true;
@@ -779,6 +808,7 @@ impl Owner {
             call_status: "New Call".into(),
             dxcc_status: "ATNO".into(),
             special_tags: vec![],
+            country: String::new(), spotter: String::new(), score: None, worked_before: None,
             rule_names: vec!["Test alert".into()],
             geography:Geography::default(), observation:None,
             count: 1,
@@ -837,7 +867,54 @@ impl Owner {
         Ok(snapshot)
     }
 
+    /// Recompute completion from the current saved logbook, including edits,
+    /// deletes and sync. Never trust a renderer acknowledgement as a worked QSO.
+    pub fn refresh_chases(&self) {
+        let (generation, revision, targets) = match self.state.lock() {
+            Ok(s) => (s.configuration.generation.clone(), s.configuration.revision,
+                s.configuration.rules.iter().filter(|r| !r.chase_modes.is_empty()).map(|r|
+                    json!({"id":r.id,"call":r.callsign_glob,"bands":r.bands,"modes":r.chase_modes})).collect::<Vec<_>>()),
+            Err(_) => return,
+        };
+        if targets.is_empty() { return; }
+        let worker_generation = crate::worker::generation();
+        let reply = crate::worker::request_existing_generation(json!({"id":uuid::Uuid::new_v4().to_string(),
+            "method":"logbook_chase_progress","params":{"targets":targets}}), worker_generation);
+        let completed = reply.ok().filter(|_| crate::worker::require_existing_generation(worker_generation).is_ok())
+            .and_then(|r| r["result"]["completed"].as_array().cloned())
+            .map(|rows| rows.into_iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<HashSet<_>>());
+        self.apply_chase_progress(&generation, revision, completed);
+    }
+
+    fn apply_chase_progress(&self, generation: &str, revision: u64, completed: Option<HashSet<String>>) {
+        if let Ok(mut s) = self.state.lock() {
+            if s.configuration.generation != generation || s.configuration.revision != revision { return; }
+            let ready = completed.is_some();
+            // Temporary worker unavailability must not erase completed targets
+            // or turn retained spots into a new burst of notifications.
+            let completed = completed.unwrap_or_else(|| s.completed.clone());
+            if s.progress_ready == ready && s.completed == completed { return; }
+            if ready && !s.progress_ready { s.baseline_next = true; }
+            s.progress_ready = ready; s.completed = completed;
+            let rules = s.configuration.rules.clone(); let done = s.completed.clone();
+            if ready { s.entries.retain(|e| e.test || rules.iter().any(|r| e.rule_names.contains(&r.name) &&
+                (r.chase_modes.is_empty() || r.callsign_glob == e.callsign && r.bands.contains(&e.band) && r.chase_modes.iter().any(|mode| mode == chase_mode(&e.mode)) && !done.contains(&format!("{}|{}|{}",r.id,e.band,chase_mode(&e.mode)))))); }
+            s.revision = s.revision.saturating_add(1).min(MAX_REVISION);
+            drop(s); (self.publish)();
+        }
+    }
+
     pub fn observe(&self, projection: &Value) -> Result<bool, String> {
+        self.observe_cluster(projection, false)
+    }
+
+    /// Seed the table after saving, using only the native retained projection.
+    /// Historical reports never replay desktop/popup delivery or general rules.
+    pub fn populate_retained_chases(&self, projection: &Value) -> Result<bool, String> {
+        self.observe_cluster(projection, true)
+    }
+
+    fn observe_cluster(&self, projection: &Value, retained_chases: bool) -> Result<bool, String> {
         if self.stopped.load(Ordering::Acquire) {
             return Ok(false);
         }
@@ -863,6 +940,9 @@ impl Owner {
             .state
             .lock()
             .map_err(|_| "DX alert state is unavailable")?;
+        if retained_chases && (!state.baseline_next || !state.progress_ready) {
+            return Ok(false);
+        }
         let availability_changed = state.source_available != available;
         let source_changed = availability_changed || state.source_revision != revision
             || state.source_received_at_ms != received_at_ms;
@@ -879,12 +959,11 @@ impl Owner {
             return self.evaluate(state, vec![], source_changed);
         }
         if state.baseline_next {
-            for spot in parsed {
-                state.remember(spot.source_key);
-            }
+            let chases: Vec<_> = parsed.iter().filter(|spot| state.configuration.rules.iter().any(|r| !r.chase_modes.is_empty() && r.matches(spot))).cloned().collect();
+            for spot in parsed { state.remember(spot.source_key); }
             state.baseline_next = false;
             state.baselined = true;
-            return self.evaluate(state, vec![], true);
+            return self.evaluate_reports(state, chases, true, true, false);
         }
         let parsed = parsed.into_iter().filter(|spot| state.remember(spot.source_key.clone())).collect();
         self.evaluate(state, parsed, source_changed)
@@ -931,7 +1010,11 @@ impl Owner {
         }
     }
 
-    fn evaluate(&self, mut state: std::sync::MutexGuard<'_, State>, parsed: Vec<Spot>, mut changed: bool) -> Result<bool, String> {
+    fn evaluate(&self, state: std::sync::MutexGuard<'_, State>, parsed: Vec<Spot>, changed: bool) -> Result<bool, String> {
+        self.evaluate_reports(state, parsed, changed, false, true)
+    }
+
+    fn evaluate_reports(&self, mut state: std::sync::MutexGuard<'_, State>, parsed: Vec<Spot>, mut changed: bool, chases_only: bool, notify: bool) -> Result<bool, String> {
         let now = now_ms();
         let mut deliveries = Vec::new();
         for spot in parsed {
@@ -942,7 +1025,7 @@ impl Owner {
                 .configuration
                 .rules
                 .iter()
-                .filter(|rule| rule.matches(&spot))
+                .filter(|rule| (!chases_only || !rule.chase_modes.is_empty()) && rule.matches(&spot) && (rule.chase_modes.is_empty() || state.progress_ready && !state.completed.contains(&format!("{}|{}|{}",rule.id,spot.band,chase_mode(&spot.mode)))))
                 .collect();
             if rules.is_empty() {
                 continue;
@@ -955,7 +1038,7 @@ impl Owner {
                 spot.source,
                 spot.callsign,
                 spot.band,
-                spot.mode_group,
+                chase_mode(&spot.mode),
                 rule_names.join("\u{1e}")
             );
             let dedup_ms = state.configuration.dedup_seconds.saturating_mul(1_000);
@@ -966,7 +1049,7 @@ impl Owner {
                         entry.source,
                         entry.callsign,
                         entry.band,
-                        mode_group(&entry.mode),
+                        chase_mode(&entry.mode),
                         entry.rule_names.join("\u{1e}")
                     ) == semantic
                     && now.saturating_sub(entry.last_seen_ms) <= dedup_ms
@@ -975,6 +1058,7 @@ impl Owner {
                 entry.last_seen_ms = now;
                 entry.frequency_khz = spot.frequency_khz;
                 entry.mode = spot.mode;
+                entry.country = spot.country; entry.spotter = spot.spotter; entry.score = spot.score; entry.worked_before = spot.worked_before;
                 entry.comment = spot.comment;
                 entry.call_status = spot.call_status;
                 entry.dxcc_status = spot.dxcc_status;
@@ -991,6 +1075,7 @@ impl Owner {
                 frequency_khz: spot.frequency_khz,
                 band: spot.band,
                 mode: spot.mode,
+                country: spot.country, spotter: spot.spotter, score: spot.score, worked_before: spot.worked_before,
                 comment: spot.comment,
                 call_status: spot.call_status,
                 dxcc_status: spot.dxcc_status,
@@ -1001,7 +1086,7 @@ impl Owner {
                 first_seen_ms: now,
                 last_seen_ms: now,
             };
-            if let Some(delivery) = state.delivery(&entry, now) {
+            if let Some(delivery) = notify.then(|| state.delivery(&entry, now)).flatten() {
                 deliveries.push(delivery);
             }
             state.entries.push_front(entry);
@@ -1039,9 +1124,10 @@ pub fn install(app: &tauri::AppHandle) -> Result<Arc<Owner>, String> {
             Arc::new(Owner::new(
                 path,
                 Arc::new(move || {
-                    let _ = publisher.emit_to("alerts", "xlog:dx-alerts", ());
+                    for label in ["alerts", "settings", "main"] { let _ = publisher.emit_to(label, "xlog:dx-alerts", ()); }
                 }),
                 Arc::new(move |entry, sound| {
+                    let _ = notifier.emit_to("main", "xlog:dx-alert-popup", entry);
                     let body = format!(
                         "{} · {:.3} MHz · {}",
                         entry.rule_names.join(", "),
@@ -1083,7 +1169,7 @@ pub fn shutdown() {
     }
 }
 pub fn validate(label: &str, isolated: bool, exiting: bool) -> Result<(), String> {
-    if crate::workspace_windows::surface_role(label) != "alerts" || isolated || exiting {
+    if !matches!(crate::workspace_windows::surface_role(label), "alerts" | "settings" | "main") || isolated || exiting {
         return Err("DX alerts are unavailable in this window.".into());
     }
     Ok(())
@@ -1121,6 +1207,7 @@ mod tests {
             name: name.into(),
             enabled: true,
             callsign_glob: String::new(),
+            chase_modes: vec![],
             comment_contains: String::new(),
             bands: vec![],
             modes: vec![],
@@ -1140,6 +1227,103 @@ mod tests {
     fn projection(revision: u64, spots: Vec<Value>) -> Value {
         json!({"revision":revision,"available":true,
         "received_at_ms":revision * 1000,"response":{"snapshot":{"spots":spots}}})
+    }
+
+    #[test]
+    fn chase_completion_removes_only_the_worked_cell_and_survives_owner_restart() {
+        let dir = tempfile::tempdir().unwrap(); let owner = owner(dir.path());
+        let mut target = rule("vk8rx", "VK8RX", &[]); target.callsign_glob="VK8RX".into();
+        target.bands=vec!["40m".into(),"30m".into(),"20m".into()]; target.chase_modes=vec!["CW".into(),"SSB".into()];
+        let config=owner.snapshot().unwrap()["configuration"].clone();
+        let mut other = target.clone(); other.id="second-vk8rx".into(); other.bands=vec!["20m".into()]; other.chase_modes=vec!["CW".into()];
+        owner.save(config["generation"].as_str().unwrap(),0,editable(true,vec![target,other])).unwrap();
+        let generation=config["generation"].as_str().unwrap();
+        owner.apply_chase_progress(generation,1,Some(HashSet::new()));
+        let mut reports=Vec::new();
+        for band in ["40m","30m","20m"] { for mode in ["CW","SSB"] {
+            let mut v=spot(&uuid::Uuid::new_v4().to_string(),"VK8RX","ATNO");v["band"]=json!(band);v["mode"]=json!(mode);reports.push(v);
+        }}
+        owner.observe(&projection(1,reports.clone())).unwrap();assert_eq!(owner.snapshot().unwrap()["entries"].as_array().unwrap().len(),6);
+        owner.apply_chase_progress(generation,1,Some(HashSet::from(["vk8rx|40m|SSB".into()])));
+        let current=owner.snapshot().unwrap();assert_eq!(current["entries"].as_array().unwrap().len(),5);
+        assert!(!current["entries"].as_array().unwrap().iter().any(|e|e["band"]=="40m"&&e["mode"]=="SSB"));
+        let mut repeat=reports[1].clone();repeat["id"]=json!(uuid::Uuid::new_v4().to_string());owner.observe(&projection(2,vec![repeat])).unwrap();
+        assert_eq!(owner.snapshot().unwrap()["entries"].as_array().unwrap().len(),5);
+        // Stale settings/editor results cannot complete cells in a replacement target.
+        owner.apply_chase_progress(generation,0,Some(HashSet::new()));assert_eq!(owner.snapshot().unwrap()["completed"],json!(["vk8rx|40m|SSB"]));
+        let restarted=Owner::new(dir.path().join("dx-alert-rules.json"),Arc::new(||{}),Arc::new(|_,_|Ok(())));
+        assert_eq!(restarted.snapshot().unwrap()["configuration"]["rules"][0]["chaseModes"],json!(["CW","SSB"]));
+        assert_eq!(restarted.snapshot().unwrap()["progressReady"],false);
+    }
+
+    #[test]
+    fn chase_modes_do_not_conflate_ssb_am_or_digital_modes() {
+        let mut r=rule("call","Call",&[]);r.callsign_glob="VK8RX".into();r.bands=vec!["40m".into()];r.chase_modes=vec!["SSB".into()];
+        r.validate().unwrap();let mut v=spot("mode","VK8RX","ATNO");v["band"]=json!("40m");
+        for mode in ["USB","LSB","SSB"] {v["mode"]=json!(mode);assert!(r.matches(&super::spot(&v).unwrap()));}
+        for mode in ["FM","AM","CW","FT8"] {v["mode"]=json!(mode);assert!(!r.matches(&super::spot(&v).unwrap()));}
+        r.callsign_glob="VK*".into();assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn saving_a_chase_populates_the_unchanged_retained_projection_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delivered = deliveries.clone();
+        let owner = Owner::new(dir.path().join("rules.json"), Arc::new(|| {}), Arc::new(move |_, _| {
+            delivered.fetch_add(1, Ordering::SeqCst); Ok(())
+        }));
+        let mut retained = spot("00000000-0000-4000-8000-000000000009", "Z34BET", "ATNO");
+        retained["mode"] = json!("USB");
+        let frame = projection(1, vec![retained.clone(), spot("other", "K1ABC", "ATNO")]);
+        owner.observe(&frame).unwrap();
+        let initial = owner.snapshot().unwrap();
+        let generation = initial["configuration"]["generation"].as_str().unwrap();
+        let mut target = rule("z34bet", "Z34BET", &[]);
+        target.callsign_glob = "Z34BET".into(); target.bands = vec!["20m".into()]; target.chase_modes = vec!["SSB".into()];
+        let mut config = editable(true, vec![target, rule("new-dxcc", "New DXCC", &["ATNO"])]);
+        config["nativePopup"] = json!(true); config["notificationSound"] = json!(true);
+        owner.save(generation, 0, config).unwrap();
+        // Completion must be checked before a retained target may be shown.
+        assert!(!owner.populate_retained_chases(&frame).unwrap());
+        owner.apply_chase_progress(generation, 1, Some(HashSet::new()));
+        assert!(owner.populate_retained_chases(&frame).unwrap());
+        let saved = owner.snapshot().unwrap();
+        let entries = saved["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["callsign"], "Z34BET");
+        assert_eq!(entries[0]["frequencyKHz"], retained["frequencyKHz"]);
+        assert!(entries[0].get("frequencyKhz").is_none());
+        assert_eq!(entries[0]["ruleNames"], json!(["Z34BET"]));
+        assert_eq!(entries[0]["observation"]["id"], retained["id"]);
+        assert_eq!(entries[0]["observation"]["activation"], retained["activation"]);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+        assert!(!owner.populate_retained_chases(&frame).unwrap());
+        owner.observe(&frame).unwrap();
+        assert_eq!(owner.snapshot().unwrap()["entries"][0]["count"], 1);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+        // A genuinely new report still follows the existing delivery path.
+        owner.observe(&projection(2, vec![spot("new", "NEW1", "ATNO")])).unwrap();
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retained_chases_exclude_completed_cells_and_unavailable_cluster_data() {
+        let dir = tempfile::tempdir().unwrap(); let owner = owner(dir.path());
+        let initial = owner.snapshot().unwrap();
+        let generation = initial["configuration"]["generation"].as_str().unwrap();
+        let mut target = rule("target", "Target", &[]);
+        target.callsign_glob = "Z34BET".into(); target.bands = vec!["20m".into()]; target.chase_modes = vec!["FT8".into()];
+        owner.save(generation, 0, editable(true, vec![target])).unwrap();
+        owner.apply_chase_progress(generation, 1, Some(HashSet::from(["target|20m|FT8".into()])));
+        owner.populate_retained_chases(&projection(1, vec![spot("old", "Z34BET", "ATNO")])).unwrap();
+        assert_eq!(owner.snapshot().unwrap()["entries"], json!([]));
+        owner.apply_chase_progress(generation, 1, None);
+        owner.apply_chase_progress(generation, 1, Some(HashSet::new()));
+        owner.populate_retained_chases(&json!({"revision":2,"available":false,"received_at_ms":0})).unwrap();
+        assert_eq!(owner.snapshot().unwrap()["entries"], json!([]));
+        owner.populate_retained_chases(&projection(3, vec![spot("retained", "Z34BET", "ATNO")])).unwrap();
+        assert_eq!(owner.snapshot().unwrap()["entries"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1575,6 +1759,7 @@ mod tests {
             name: "Everything".into(),
             enabled: true,
             callsign_glob: String::new(),
+            chase_modes: vec![],
             comment_contains: String::new(),
             bands: vec![],
             modes: vec![],
@@ -1827,7 +2012,9 @@ mod tests {
         assert!(glob_matches("?M0RX", "OM0RX"));
         assert!(!glob_matches("VP2?", "VP2MUW"));
         assert!(validate("alerts", false, false).is_ok());
-        assert!(validate("main", false, false).is_err());
+        assert!(validate("main", false, false).is_ok());
+        assert!(validate("settings", false, false).is_ok());
+        assert!(validate("monitor", false, false).is_err());
         assert!(validate("alerts", true, false).is_err());
         assert!(validate("alerts", false, true).is_err());
     }

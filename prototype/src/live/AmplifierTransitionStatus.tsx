@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect,useState,useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { amplifierTransitionSession,type AmplifierTransitionSession } from "./amplifierTransition";
@@ -8,5 +9,5 @@ export function AmplifierTransitionStatus({session=amplifierTransitionSession()}
     const refresh=()=>{void session.refresh().catch(e=>{if(active)setError(String(e));});};refresh();
     void listen("xlog:amplifier-transition",refresh).then(fn=>{if(active)stop=fn;else fn();}).catch(()=>{});return()=>{active=false;stop?.();};},[session]);
   if(!state.message&&!error)return null;
-  return <section aria-label="Amplifier status">{state.message&&<p role="status">{state.message}</p>}{error&&<p role="alert">{error}</p>}</section>;
+  return <section aria-label="Amplifier status">{state.message&&<ErrorNotice><p role="status">{state.message}</p></ErrorNotice>}{error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}</section>;
 }

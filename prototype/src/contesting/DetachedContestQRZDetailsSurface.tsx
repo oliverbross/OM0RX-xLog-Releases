@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
@@ -126,10 +127,10 @@ export function ContestQRZDetailsSurface({ search = window.location.search,
 
   return <main className="contest-qrz-details" aria-label="Contest Callsign Details">
     <header><div><p>Callsign</p><h1>{call || "Callsign Details"}</h1></div></header>
-    {!projection && !error && <p role="status">Loading the current contest callsign…</p>}
-    {projection && !validCall.test(call) && <p role="status">Enter a complete callsign in the contest logging window.</p>}
-    {loading && <p role="status">Looking up {call}…</p>}
-    {error && <p className="contest-qrz-error" role="alert">{error}</p>}
+    {!projection && !error && <ErrorNotice><p role="status">Loading the current contest callsign…</p></ErrorNotice>}
+    {projection && !validCall.test(call) && <ErrorNotice><p role="status">Enter a complete callsign in the contest logging window.</p></ErrorNotice>}
+    {loading && <ErrorNotice><p role="status">Looking up {call}…</p></ErrorNotice>}
+    {error && <ErrorNotice><p className="contest-qrz-error" role="alert">{error}</p></ErrorNotice>}
     {value && <section aria-label={`${call} callsign profile`}>
       <dl>{fields.map(([label, detail, field]) => <div key={label} data-field={field}><dt>{label}</dt><dd>{detail ?? "—"}{fallbackFields.has(field)&&<small> CTY</small>}</dd></div>)}</dl>
     </section>}

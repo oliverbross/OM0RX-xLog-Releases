@@ -32,7 +32,7 @@ export function firstRunError(values: FirstRunValues, step = 3): string {
   if (step >= 1) {
     if (values.radio === "hamlib" && (!Number.isInteger(values.radioModel) || values.radioModel! < 1 || values.radioModel !== 1 && !values.radioPath.trim() || values.radioBaud < 300 || values.radioBaud > 921600)) return "Choose a CAT radio model and enter its serial device or network address and baud rate.";
     if (values.radio === "direct_flex_lan" && (!values.radioHost.trim() || !port(values.radioPort))) return "Enter the FLEX radio address and a port between 1 and 65535.";
-    if (values.radio === "direct_agent" && !url(values.agentURL, ["https:"])) return "Enter the Remote Station Agent HTTPS address.";
+    if (values.radio === "direct_agent" && !url(values.agentURL, ["https:"]) && values.agentURL.trim().replace(/\/$/, "") !== "http://127.0.0.1:8840") return "Enter the Remote Station Agent HTTPS address.";
     if (values.radio === "direct_tci" && !url(values.tciEndpoint, ["ws:", "wss:"])) return "Enter the ExpertSDR TCI WebSocket address.";
   }
   if (step >= 2) {
@@ -84,7 +84,7 @@ export async function completeFirstRunSetup(values: FirstRunValues, dependencies
     const action = values.radio === "direct_agent" ? "save" : `save_${values.radio === "direct_flex_lan" ? "flex" : values.radio === "direct_tci" ? "tci" : "hamlib"}`;
     const profile: RadioProfile = { manufacturer: "", model: "", nickname: values.radioName.trim(), provider: values.radio, enabled: true };
     const configuration = values.radio === "hamlib" ? { mode: "managed", model: values.radioModel, path: values.radioPath.trim(), baud: values.radioBaud }
-      : values.radio === "direct_flex_lan" ? { host: values.radioHost.trim(), port: values.radioPort, station_name: "OM0RX-xLog" }
+      : values.radio === "direct_flex_lan" ? { host: values.radioHost.trim(), port: values.radioPort, station_name: "" }
       : { endpoint: values.tciEndpoint.trim(), trx: 0, channel: 0 };
     storage?.setItem(key, operationID);
     const receipt = await station<StationReceipt>("radio1", { action, operation_id: operationID, generation: base.generation, revision: base.revision, profile,

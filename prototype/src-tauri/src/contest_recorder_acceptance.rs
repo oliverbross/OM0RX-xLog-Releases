@@ -50,11 +50,11 @@ fn bounded_output(command: &mut Command) -> Result<Vec<u8>> {
 pub fn run() -> Result<Value> {
     let began = Instant::now();
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let macos = executable
+    let directory = executable
         .parent()
         .ok_or("Candidate directory unavailable")?;
     let bytes = bounded_output(
-        Command::new(macos.join("xlog-prototype-worker")).arg("--recorder-acceptance"),
+        Command::new(directory.join(format!("xlog-prototype-worker{}", std::env::consts::EXE_SUFFIX))).arg("--recorder-acceptance"),
     )?;
     let frame: Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("Fixture response: {e}"))?;
@@ -132,7 +132,10 @@ pub fn run() -> Result<Value> {
     )?;
     let inventory = serde_json::to_value(&a.manifest.segments).map_err(|e| e.to_string())?;
     let export = a.snapshot().export(&root, false)?;
-    let python = macos
+    #[cfg(windows)]
+    let python = directory.join("Python/python.exe");
+    #[cfg(target_os = "macos")]
+    let python = directory
         .parent()
         .ok_or("Candidate Contents unavailable")?
         .join("Frameworks/Python.framework/Versions/3.12/bin/python3.12");

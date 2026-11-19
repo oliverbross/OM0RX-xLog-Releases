@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { loadHamlibCatalogue, type HamlibModel } from "./hamlibCatalogue";
 import { HamlibModelPicker } from "./HamlibModelPicker";
@@ -20,7 +21,7 @@ export function HamlibDevice({ device, request, state, configurationOnly = false
     connectionSelectionAllowed?: boolean; configuration?: Data; onConfigurationChange?: (value: Data) => void;
     onBeforeConnection?: (value: Data) => Promise<void>; connectionControls?: boolean; configurationBusy?: boolean; hideSetup?: boolean }) {
   const key = `xlog.hamlib.${device}`;
-  const [localConfig, setLocalConfig] = useState<Data>(() => { if (hideSetup) return { mode: "managed" }; try { return device === "radio" ? JSON.parse(localStorage.getItem(key) || "null") || { mode: "managed", path: "", baud: 9600, host: "127.0.0.1", port: 4532 } : { mode: "managed", path: "", baud: 9600, host: "127.0.0.1", port: 4533, serial: {} }; } catch { return { mode: "managed" }; } });
+  const [localConfig, setLocalConfig] = useState<Data>(() => { if (hideSetup) return { mode: "managed" }; try { return device === "radio" ? JSON.parse(localStorage.getItem(key) || "null") || { mode: "managed", path: "", host: "127.0.0.1", port: 4532 } : { mode: "managed", path: "", host: "127.0.0.1", port: 4533, serial: {} }; } catch { return { mode: "managed" }; } });
   const config = configuration ?? localConfig;
   const [models, setModels] = useState<HamlibModel[]>([]);
   const [catalogueLoading, setCatalogueLoading] = useState(true);
@@ -82,7 +83,7 @@ export function HamlibDevice({ device, request, state, configurationOnly = false
         {!catalogueLoading && !!config.model && !selectedModel && <p className="amber">Choose a model from the current bundled catalogue before connecting.</p>}
         <label>Serial device or device TCP address<input required={config.model !== 1} value={config.path || ""} onChange={e => update("path", e.target.value)} placeholder="/dev/cu.usbserial, COM3, or host:port" /></label>
         <div className="live-actions"><button type="button" disabled={busy} onClick={() => void act("hamlib_serial_ports", {}, "Device scan").then(result => result && setPorts(result.ports || []))}>Scan serial devices</button>{ports.length > 0 && <label>Detected device<select value="" onChange={e => update("path", e.target.value)}><option value="">Choose detected device…</option>{ports.map(p => <option key={p.path} value={p.path}>{p.label || p.path}</option>)}</select></label>}</div>
-        <label>Serial baud<input type="number" min="300" max="921600" value={config.baud || 9600} onChange={e => update("baud", Number(e.target.value))} /></label>
+        <label>Serial baud<input type="number" min="300" max="921600" placeholder="Model default" value={config.baud || ""} onChange={e => update("baud", e.target.value ? Number(e.target.value) : undefined)} /></label>
         <details><summary>Serial framing and control lines</summary><div className="live-station-inline">{[
           ["data_bits", "Data bits", [7, 8]], ["stop_bits", "Stop bits", [1, 2]],
           ["parity", "Parity", ["None", "Even", "Odd"]], ["handshake", "Handshake", ["None", "XONXOFF", "Hardware"]],
@@ -91,8 +92,8 @@ export function HamlibDevice({ device, request, state, configurationOnly = false
       {device === "radio" && <label><input type="checkbox" checked={tx} onChange={e => setTX(e.target.checked)} />Enable transmit commands for this connection</label>}
       {connectionControls && <div className="live-actions"><button disabled={busy || configurationBusy || connected || connectionOwned || !modelReady || !connectionSelectionAllowed}>Connect {device}</button><button type="button" disabled={busy || configurationBusy || !modelReady || !connectionSelectionAllowed} onClick={() => void connect("hamlib_reconnect", "Reconnect")}>Reconnect {device}</button><button type="button" disabled={busy || (!connected && !connectionOwned) || !connectionSelectionAllowed} onClick={() => void act("hamlib_disconnect", {}, "Disconnect")}>Disconnect</button><button type="button" disabled={busy || (!connected && !selectedModel)} onClick={() => void act("hamlib_capabilities", connected ? {} : { model: Number(config.model) }, "Capabilities").then(result => result && setCapabilities(result))}>Read capabilities</button></div>}
     </form>}
-    {error && <p className="live-station-error" role="alert">{error}</p>}{message && <p role="status">{message}</p>}
-    {health?.reconnect_required && <p className="amber" role="status">The {device} connection needs attention. Check its cable, power and connection settings, then reconnect. No previous control command will be replayed.</p>}
+    {error && <ErrorNotice><p className="live-station-error" role="alert">{error}</p></ErrorNotice>}{message && <ErrorNotice><p role="status">{message}</p></ErrorNotice>}
+    {health?.reconnect_required && <ErrorNotice><p className="amber" role="status">The {device} connection needs attention. Check its cable, power and connection settings, then reconnect. No previous control command will be replayed.</p></ErrorNotice>}
     {capabilities && <details><summary>Reported Hamlib capabilities</summary><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{typeof capabilities.text === "string" ? capabilities.text : JSON.stringify(capabilities, null, 2)}</pre></details>}
     {!configurationOnly && <>{device === "radio" ? <><div className="live-station-inline"><label>Frequency MHz<input inputMode="decimal" value={hz} onChange={e => setHz(e.target.value)} /></label><button disabled={busy || !connected || !hz || !Number.isFinite(Number(hz))} onClick={() => void control("frequency", { hz: Math.round(Number(hz) * 1e6) })}>Set frequency</button></div>
       <div className="live-station-inline"><label>Mode<select value={mode} onChange={e => setMode(e.target.value)}>{["USB", "LSB", "CW", "CWR", "AM", "FM", "RTTY", "RTTYR", "PKTUSB", "PKTLSB", "PKTFM"].map(m => <option key={m}>{m}</option>)}</select></label><button disabled={busy || !connected} onClick={() => void control("mode", { mode, passband_hz: 0 })}>Set mode</button></div>

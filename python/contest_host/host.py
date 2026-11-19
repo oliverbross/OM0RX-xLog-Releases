@@ -45,7 +45,7 @@ from .upstream import (CQWS_UF_LIMITATION, adapt_cw_template, cqws_multiplier_co
                        split_macro_template, verify_source)
 
 PLUGIN_ID = "cq_ww_cw"
-SCORING_REVISION_PLUGINS = frozenset({"hadx", "pacc", "rsgb_iota", "ref_cw", "ref_ssb", "es_open", "cqws", "jidx_cw", "jidx_ph"})
+SCORING_REVISION_PLUGINS = frozenset({"hadx", "pacc", "rsgb_iota", "ref_cw", "ref_ssb", "es_open", "cqws", "jidx_cw", "jidx_ph", "sac_cw", "sac_ssb"})
 _NEW_SCORING_REVISION = object()
 SOURCE_REVISION = "7c8b499225a73f7f8f792246881bd7aefc05452f"
 INPUTS = ("callsign", "sent", "receive", "other_1", "other_2")
@@ -5047,18 +5047,7 @@ class Host:
                 require(callable(writer),
                         f"This original plugin does not provide {export_format.upper()} export",
                         "export_unsupported")
-                # Original Not1MM ADIF and EDI writers target Path.home(). The host is a
-                # serialized helper process, so redirect HOME only for this one
-                # synchronous plugin call and restore it before inspecting output.
-                previous_home = os.environ.get("HOME")
-                os.environ["HOME"] = directory
-                try:
-                    writer(desk)
-                finally:
-                    if previous_home is None:
-                        os.environ.pop("HOME", None)
-                    else:
-                        os.environ["HOME"] = previous_home
+                writer(desk)
                 files = list(Path(directory).glob("*.adi" if export_format == "adif" else "*.edi"))
             require(len(files) == 1, "Plugin export failed", "export_failed")
             if (export_format == "cabrillo" and desk.state["pluginID"] == "cqws"

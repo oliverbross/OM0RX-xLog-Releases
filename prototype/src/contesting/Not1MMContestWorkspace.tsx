@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { BookOpen, Download, Radio, Trophy } from "lucide-react";
 import { flushUnfinishedEditors, UnfinishedEditorWarning } from "./unfinishedEditors";
@@ -4098,7 +4099,7 @@ export function Not1MMContestWorkspace({ request, serviceRequest, stationTune: s
   const fldigiPanelReady = Boolean(projection?.fldigiTransmitAvailable && fldigiSnapshot?.configuration.transmit_enabled);
   const fldigiPanelOwned = fldigiPanelReady || fldigiReleaseBlocking || Boolean(fldigiSnapshot?.configuration_error);
   const cwPanel = () => {
-    if(projection?.practice&&!fldigiPanelOwned)return <p role="status">Practice · native keyer, voice, modem and station output disabled. Manual logging is available.</p>;
+    if(projection?.practice&&!fldigiPanelOwned)return <ErrorNotice><p role="status">Practice · native keyer, voice, modem and station output disabled. Manual logging is available.</p></ErrorNotice>;
     if (!projection || projection.mode === "SSB" && !phoneOutputAvailable&&!fldigiPanelOwned) return null;
     if(!["CW","SSB"].includes(projection.mode)&&!fldigiPanelOwned)return <section className="contest-operator" aria-label="fldigi controls"><strong>ESM and fldigi</strong>
       <p>fldigi macro output is unavailable. Enable the supported fldigi transmit path in Digital Logging Setup before sending. Manual logging and received-text selection remain separate.</p>
@@ -4119,8 +4120,8 @@ export function Not1MMContestWorkspace({ request, serviceRequest, stationTune: s
       <header><div><strong>{title}</strong><p>{description}</p></div><span>{fldigiStopPending ? "fldigi release pending" : fldigiPanelOwned ? fldigiSnapshot?.status : phoneReleaseUncertain ? "Phone PTT release uncertain" : phoneReleaseBlocking ? "Phone PTT release pending" : phone ? phoneSimulationPending ? "Phone output pending" : armed ? "Phone output armed" : "Phone output disarmed" : cw.state.message}</span></header>
       <div className="contest-operator-controls">{!fldigiPanelOwned&&<button type="button" disabled={busy || phoneSimulationPending || !phone&&cw.state.pending} onClick={() => phoneReleaseBlocking ? void stopPhoneOutput() : phone ? armed ? void stopPhoneOutput() : setPhoneSimulationArmed(true) : void cw.controller.arm(undefined,"setup")}>{phoneReleaseUncertain ? "Retry phone disarm" : phoneReleaseBlocking ? "Phone disarm pending" : phone ? armed ? "Disarm phone" : phoneSimulationAvailable ? "Arm phone simulation" : "Arm recorded phone" : cw.state.canonical?.provider === "test-simulation" ? "Arm simulation" : "Arm CW"}</button>}
         <button type="button" className="contest-danger-secondary" disabled={fldigiStopPending} onClick={() => void stopAutoCQ().catch(cause=>setError(errorMessage(cause)))}>{fldigiReleaseBlocking ? "Retry fldigi release" : "Stop"}</button>
-        <span className={armed ? "is-armed" : ""}>{armed ? "Armed" : "Disarmed"}</span>{autoCQDeadlineMs !== null&&<span role="status">Auto CQ · {Math.max(0, Math.ceil((autoCQDeadlineMs-autoCQNowMs)/1000))}s</span>}
-      </div>{fldigiSnapshot?.configuration_error && <p className="contest-alert is-error">{fldigiSnapshot.configuration_error}</p>}{!phone && cw.state.error && <p className="contest-alert is-error">{cw.state.error}</p>}
+        <span className={armed ? "is-armed" : ""}>{armed ? "Armed" : "Disarmed"}</span>{autoCQDeadlineMs !== null&&<ErrorNotice><span role="status">Auto CQ · {Math.max(0, Math.ceil((autoCQDeadlineMs-autoCQNowMs)/1000))}s</span></ErrorNotice>}
+      </div>{fldigiSnapshot?.configuration_error && <ErrorNotice><p className="contest-alert is-error">{fldigiSnapshot.configuration_error}</p></ErrorNotice>}{!phone && cw.state.error && <ErrorNotice><p className="contest-alert is-error">{cw.state.error}</p></ErrorNotice>}
       {projection.mode==="CW"&&!fldigiPanelOwned&&<fieldset><legend>CW call options</legend>
         <label><input type="checkbox" checked={earlyCWEnabled} disabled={busy||!projection.run||!cw.state.capabilities?.streaming||dualContestLanes(projection)} onChange={event=>{if(!event.target.checked&&earlyCWRef.current)void stopAutoCQ();else{earlyCWFaultRef.current="";earlyCWRef.current=null;setEarlyCWEnabled(event.target.checked);}}}/> Early start from deliberate typing</label>
         <label>Start after characters<input aria-label="Early CW threshold" type="number" min={2} max={8} value={earlyCWThreshold} disabled={!!earlyCWRef.current} onChange={event=>setEarlyCWThreshold(Math.max(2,Math.min(8,Number(event.target.value)||3)))}/></label>
@@ -4214,14 +4215,14 @@ export function Not1MMContestWorkspace({ request, serviceRequest, stationTune: s
       aria-pressed={!productivityOpen} onClick={()=>setProductivityOpen(false)}>Contest setup</button><button type="button" disabled={busy||retiring}
       aria-pressed={productivityOpen} onClick={()=>setProductivityOpen(true)}>Productivity desk</button>
       {projection.practice&&<strong role="status">Practice · station output and posting disabled</strong>}</nav>}
-    {productivityOpen&&error&&<p className="contest-alert is-error" role="alert">{error}</p>}
-    {productivityOpen&&notice&&<p className="contest-alert" role="status">{notice}</p>}
-    {setupOnly && !projection && startupOpenError && <section className="contest-alert is-error" role="alert">
-      <p>{startupOpenError}</p>
+    {productivityOpen&&error&&<ErrorNotice><p className="contest-alert is-error" role="alert">{error}</p></ErrorNotice>}
+    {productivityOpen&&notice&&<ErrorNotice when={true} title="Message"><p className="contest-alert" role="status">{notice}</p></ErrorNotice>}
+    {setupOnly && !projection && startupOpenError && <ErrorNotice><section className="contest-alert is-error" role="alert">
+      <ErrorNotice when={true}><p>{startupOpenError}</p></ErrorNotice>
       <button type="button" disabled={busy || retiring} onClick={() => setCatalogLoadAttempt(attempt => attempt + 1)}>
         Retry opening contest
       </button>
-    </section>}
+    </section></ErrorNotice>}
     {!setupOnly && <header className="contest-header"><div><h1>Contest Manager / Desk</h1><p>{projection
       ? `${sessions.find(session => session.sessionID === projection.sessionID)?.name ?? projection.pluginID} · actual Not1MM Python plugin · xLog station services`
       : "Actual Not1MM Python plugins · xLog station services"}</p></div><div className="contest-header-actions">{projection && <button type="button" disabled={busy} onClick={() => {

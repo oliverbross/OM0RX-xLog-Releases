@@ -288,7 +288,13 @@ function xmlText(value: string): string {
     .replace(/"/g, "&quot;").replace(/'/g, "&apos;").replace(/\r/g, "&#13;");
 }
 
-/** One bounded document assembled only from frozen native export frames. */
+/** The ceiling of a streamed export, matching the native stream's sanity bound. */
+export const maximumStreamedExportBytes = 1024 * 1024 * 1024;
+
+/** One bounded document assembled only from frozen native export frames. In
+ *  memory (`append` + `finish`) it is bounded at 32 MiB; streamed (`convert` +
+ *  `envelope`) it keeps only the ADX header state, and each converted page is
+ *  written to disk by the native export stream. */
 export class ADIFExportDocument {
   private parts: string[] = [];
   private customFields = new Set<string>();
@@ -299,6 +305,11 @@ export class ADIFExportDocument {
   constructor(readonly format: ADIFExportFormat, private readonly maximumBytes = maximumFileBytes) {}
 
   append(text: string, expectedRecords: number, fieldMetadata?: (ADIFFieldMetadata | null)[]): void {
+    this.parts.push(this.convert(text, expectedRecords, fieldMetadata));
+  }
+
+  /** Validates and converts one frozen frame, returning its body text without retaining it. */
+  convert(text: string, expectedRecords: number, fieldMetadata?: (ADIFFieldMetadata | null)[]): string {
     if (this.failed) throw new Error("Export has already stopped.");
     try {
       if (!Number.isSafeInteger(expectedRecords) || expectedRecords <= 0) throw new Error("Frozen export record count could not be verified.");
@@ -307,7 +318,7 @@ export class ADIFExportDocument {
       if (this.format === "adi" && fieldMetadata?.some(Boolean)) throw new Error("ADX extension metadata requires ADX export for lossless preservation.");
       if (this.format === "adx") validateXMLText(text);
       const input = utf8.encode(text);
-      if (input.length > this.maximumBytes) throw new Error("Export exceeds the 32 MiB file limit.");
+      if (input.length > this.maximumBytes) throw new Error(this.limitMessage());
       let body = text;
       if (this.format === "adx") {
         let cursor = 0, count = 0, headerEnded = false;
@@ -374,12 +385,23 @@ export class ADIFExportDocument {
         body = output.join("");
       }
       this.bytes += utf8.encode(body).length;
-      if (this.bytes > this.maximumBytes) throw new Error("Export exceeds the 32 MiB file limit.");
-      this.parts.push(body); this.records += expectedRecords;
+      if (this.bytes > this.maximumBytes) throw new Error(this.limitMessage());
+      this.records += expectedRecords;
+      return body;
     } catch (error) { this.failed = true; throw error; }
   }
 
+  private limitMessage(): string {
+    return this.maximumBytes === maximumFileBytes ? "Export exceeds the 32 MiB file limit." : "Export exceeds the 1 GiB file limit.";
+  }
+
   finish(): string {
+    const { header, footer } = this.envelope();
+    return header + this.parts.join("") + footer;
+  }
+
+  /** The ADX header (with every USERDEF declaration the records needed) and footer; empty for ADI. */
+  envelope(): { header: string; footer: string } {
     if (this.failed || !this.records) throw new Error("Export is incomplete.");
     const declarations = [...this.declarations.values()];
     const usedIDs = new Set(declarations.map(item => item.attributes.FIELDID));
@@ -393,9 +415,28 @@ export class ADIFExportDocument {
     const header = this.format === "adx" ? '<?xml version="1.0" encoding="UTF-8"?>\r\n<ADX><HEADER><ADIF_VER>3.1.7</ADIF_VER><PROGRAMID>OM0RX-xLog</PROGRAMID>' +
       declarations.map(item => `<USERDEF${Object.entries(item.attributes).map(([key, value]) => ` ${key}="${xmlText(value)}"`).join("")}>${xmlText(item.name)}</USERDEF>`).join("") + '</HEADER><RECORDS>\r\n' : "";
     const footer = this.format === "adx" ? "</RECORDS></ADX>\r\n" : "";
-    if (this.bytes + utf8.encode(header + footer).length > this.maximumBytes) throw new Error("Export exceeds the 32 MiB file limit.");
-    return header + this.parts.join("") + footer;
+    if (this.bytes + utf8.encode(header + footer).length > this.maximumBytes) throw new Error(this.limitMessage());
+    return { header, footer };
   }
+}
+
+/** Largest piece handed to the native export stream: 512 Ki UTF-16 units is
+ *  at most 1.5 MiB of UTF-8, under the stream's 2 MiB per-append bound. */
+export const exportPieceUnits = 512 * 1024;
+
+/** Adds converted text to the pending buffer and returns the pieces ready to
+ *  write. A cut never separates a surrogate pair, so no piece encodes a lone
+ *  surrogate as U+FFFD. */
+export function exportPieces(pending: string, text: string, unitsPerPiece = exportPieceUnits): { ready: string[]; pending: string } {
+  let buffer = pending + text;
+  const ready: string[] = [];
+  while (buffer.length >= unitsPerPiece) {
+    let cut = unitsPerPiece;
+    const last = buffer.charCodeAt(cut - 1);
+    if (last >= 0xd800 && last <= 0xdbff) cut--;
+    ready.push(buffer.slice(0, cut)); buffer = buffer.slice(cut);
+  }
+  return { ready, pending: buffer };
 }
 
 export function decodeADIFDocument(bytes: ArrayBuffer, encoding: ADIFImportEncoding = "utf-8"): { text: string; fieldMetadata: (ADIFFieldMetadata | null)[] } {

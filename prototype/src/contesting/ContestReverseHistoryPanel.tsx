@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestRequest } from "./types";
 import { assistanceCoordinates, assistanceKey, reverseHistory, type AssistanceScope, type ReverseResult } from "./contestReverseAssistance";
@@ -28,12 +29,12 @@ export function ContestReverseHistoryPanel({request,scope,disabled=false,onSelec
     <label>Match<select value={matchMode} disabled={disabled} onChange={e=>{setMatchMode(e.target.value as "prefix"|"contains");setOffset(0);}}><option value="prefix">Starts with</option><option value="contains">Contains</option></select></label>
     <label>Reverse lookup<input value={query} maxLength={64} disabled={disabled} onChange={e=>{setQuery(e.target.value);setOffset(0);}} placeholder="At least two characters"/></label>
     <button type="button" disabled={disabled} onClick={()=>setRefresh(v=>v+1)}>Refresh lookup</button>
-    {busy&&<><span role="status">Searching…</span><button type="button" onClick={()=>{ticket.current+=1;setBusy(false);setResult(null);}}>Cancel lookup</button></>}
+    {busy&&<><ErrorNotice><span role="status">Searching…</span></ErrorNotice><button type="button" onClick={()=>{ticket.current+=1;setBusy(false);setResult(null);}}>Cancel lookup</button></>}
     {value?.dataset&&<p><small>History generation {value.dataset.generation} · SHA-256 {value.dataset.digest.slice(0,12)}</small></p>}
-    {value?.unsupportedReason&&<p role="status">{value.unsupportedReason}</p>}
+    {value?.unsupportedReason&&<ErrorNotice><p role="status">{value.unsupportedReason}</p></ErrorNotice>}
     {value&&!value.unsupportedReason&&value.rows.length===0&&<p>No matching calls in this source.</p>}
     {value&&value.rows.length>0&&<table><caption>{value.matchMode==="prefix"?"Starts with":"Contains"} “{value.query}” · {value.fields.find(f=>f.id===value.fieldID)?.label}</caption><thead><tr><th>Call</th><th>Source / date</th><th>Compared fields</th>{onSelect&&<th>Action</th>}</tr></thead><tbody>{value.rows.map(row=><tr key={row.candidateID}><td><strong>{row.callsign}</strong></td><td>{row.sourceLabel}<br/>{row.sourceDate||"Source date unavailable"}</td><td>{row.comparedFields.map(field=><div key={field.id}>{field.label}: {field.value||"—"}</div>)}</td>{onSelect&&<td><button type="button" disabled={disabled} onClick={()=>{if(current.current===key&&!disabled)onSelect(row.callsign,{...scope});}}>Load {row.callsign}</button></td>}</tr>)}</tbody></table>}
     {value&&<nav aria-label="Reverse history pages"><button type="button" disabled={disabled||busy||offset===0} onClick={()=>setOffset(v=>Math.max(0,v-50))}>Previous candidates</button><button type="button" disabled={disabled||busy||value.nextOffset===null} onClick={()=>setOffset(value.nextOffset??0)}>More candidates</button></nav>}
-    {error&&<p role="alert">{error}</p>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section>;
 }

@@ -15,10 +15,15 @@ static TRANSITION_BLOCKING_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MODULE_TRANSITION_SEALED: usize = 1 << (usize::BITS - 1);
 const MAX_IN_FLIGHT: usize = 16;
 const MAX_ABANDONED: usize = MAX_IN_FLIGHT;
+// Routing slots only station-state requests (PTT off, tune, rotor stop) may
+// take. Timed-out passive reads keep their slots until Swift replies, so
+// without this headroom a long logbook-lane operation could starve Stop.
+const CONTROL_RESERVED_SLOTS: usize = 4;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 const BACKUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 const ADIF_PREVIEW_TIMEOUT: Duration = Duration::from_secs(300);
 const MAP_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const OPPORTUNITY_METADATA_TIMEOUT: Duration = Duration::from_secs(90);
 const PASSIVE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Explicit local diagnosis only. Never record request parameters, replies,
@@ -63,8 +68,9 @@ impl DiagnosticReceiver {
 }
 
 fn diagnostic(event: &str, generation: u64, details: impl FnOnce() -> Value) {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("XLOG_WORKER_DIAGNOSTICS").as_deref() == Ok("1")) {
+    // Settings ▸ Data management switches this on (a flag file), as does the
+    // XLOG_WORKER_DIAGNOSTICS=1 environment variable; off by default.
+    if !crate::worker_health::diagnostics_enabled() && std::env::var("XLOG_WORKER_DIAGNOSTICS").as_deref() != Ok("1") {
         return;
     }
     // Diagnostic stderr may be slow or blocked (including redirected Windows
@@ -79,6 +85,7 @@ fn diagnostic(event: &str, generation: u64, details: impl FnOnce() -> Value) {
         std::thread::Builder::new().name("xlog-worker-diagnostics".into()).spawn(move || {
             while let Some(value) = receive.recv() {
                 let _ = writeln!(std::io::stderr().lock(), "xlog-worker-diagnostic {value}");
+                crate::worker_health::log_line(&value.to_string());
             }
         }).ok().map(|_| send)
     });
@@ -97,8 +104,12 @@ fn diagnostic(event: &str, generation: u64, details: impl FnOnce() -> Value) {
 }
 
 pub fn validate_surface(label: &str, request: &Value) -> Result<(), String> {
+    if request["method"].as_str().is_some_and(|method| method.starts_with("logbook_companion_")) {
+        return Err("Companion mutations require the paired native bridge.".into());
+    }
     let label = crate::workspace_windows::surface_role(label);
     validate_request(request)?;
+    if request["method"] == "logbook_chase_progress" { return Err("Chase completion is read by the native Alerts owner.".into()); }
     if request["method"]=="station_transmit_permission" {return Err("Use the native TCI permission/Stop coordinator.".into());}
     if request["method"].as_str().is_some_and(|m| m.starts_with("logbook_country_")) {
         return if matches!(label,"main"|"logbook") || request["method"] == "logbook_country_facts" && matches!(label,"callsign-intelligence"|"log-qso") {
@@ -109,6 +120,7 @@ pub fn validate_surface(label: &str, request: &Value) -> Result<(), String> {
         return if matches!(label,"main"|"settings") { Ok(()) }
         else { Err("Country snapshots are managed through Reference data settings.".into()) };
     }
+    if label == "elecraft" { return Err("Use the dedicated serial instrument controller.".into()); }
     if label == "about" { return Err("About OM0RX-xLog has no worker access.".into()); }
     if label == "hm-control" { return Err("HM Control can only use its non-secret read-only display projection.".into()); }
     if request["method"].as_str().is_some_and(|method| method.starts_with("contest_multi_")) {
@@ -139,11 +151,20 @@ pub fn validate_surface(label: &str, request: &Value) -> Result<(), String> {
         } else { Err("Contest Setup can only read shared station context and own contest sessions.".into()) };
     }
     if label == "cw" { return Err("CW can only use the typed shared CW session.".into()); }
-    if label == "rotor" { return Err("Rotor can only read retained native rotor telemetry.".into()); }
+    // The Rotor window's Park button; Stop and Goto have their own typed owners.
+    if label == "rotor" {
+        return if request["method"] == "rotor_park" { Ok(()) }
+        else { Err("Rotor can only read retained native rotor telemetry and park the rotor.".into()) };
+    }
     if label == "station-status" { return Err("Station Status can only read retained native station observations.".into()); }
     if label == "propagation" { return Err("Propagation can only use the typed shared public-conditions session.".into()); }
     if matches!(label, "station-identity" | "alerts" | "antenna") { return Err("This display can only read its retained non-secret projection.".into()); }
-    if request["method"].as_str().is_some_and(|method| method.starts_with("spot_draft_") || matches!(method, "logbook_operator_draft_antenna_proposal" | "logbook_operator_draft_antenna_follow" | "logbook_operator_draft_nearby_call" | "logbook_operator_draft_qsy_clear" | "logbook_operator_draft_radio_read" | "logbook_operator_draft_radio_follow")) {
+    if label == "special" {
+        return if matches!(request["method"].as_str(), Some("cluster_snapshot" | "opportunities_special_snapshot")) && request["params"].as_object().is_some_and(|params| params.is_empty()) {
+            Ok(())
+        } else { Err("Special can only read the shared cluster and local reference progress.".into()) };
+    }
+    if request["method"].as_str().is_some_and(|method| method.starts_with("spot_draft_") || matches!(method, "logbook_operator_draft_antenna_proposal" | "logbook_operator_draft_antenna_follow" | "logbook_operator_draft_nearby_call" | "logbook_operator_draft_follow_call" | "logbook_operator_draft_qsy_clear" | "logbook_operator_draft_radio_read" | "logbook_operator_draft_radio_follow")) {
         return Err("Only the native transaction owner can use this method.".into());
     }
     if request["method"] == "workspace_layout_load" {
@@ -161,18 +182,22 @@ pub fn validate_surface(label: &str, request: &Value) -> Result<(), String> {
         return Err("Only the native radio owner can publish power selection.".into());
     }
     if label == "settings" {
+        if cfg!(target_os = "macos") && matches!(request["method"].as_str(), Some("station_configuration" | "station_configuration_save")) {
+            return Ok(());
+        }
         return if matches!(request["method"].as_str(), Some(
             "settings_load" | "settings_receipt" | "settings_save" | "workspace_preferences_load" | "workspace_commands_apply"
             | "workspace_rotor_configuration_load" | "workspace_rotor_configuration_receipt" | "workspace_rotor_configuration_save"
-            | "secret_status" | "secret_save" | "online_log_status" | "online_log_configure"
+            | "secret_status" | "secret_save" | "online_log_status" | "online_log_configure" | "online_log_reconcile" | "lookup_call"
             | "sync_status" | "sync_summary" | "sync_mutation" | "sync_receipt"
             | "reference_status" | "reference_resolve" | "reference_refresh" | "reference_schedule" | "reference_configure"
             | "reference_country_status" | "reference_country_import" | "reference_country_download" | "reference_country_rollback"
             | "backup_create" | "backup_list" | "backup_inspect" | "backup_import" | "backup_restore"
+            | "logbook_duplicates"
             | "remote_backup_request"
             | "wsjtx_snapshot" | "wsjtx_configure" | "wsjtx_start" | "wsjtx_stop"
              | "spot_bridge_snapshot" | "spot_bridge_configure"
-            | "cluster_snapshot" | "cluster_radio_spots_configure"
+            | "cluster_snapshot" | "cluster_radio_spots_configure" | "cluster_configure" | "cluster_connect" | "cluster_disconnect" | "cluster_password_set"
             | "workspace_layout_load" | "workspace_layout_apply"
         )) { Ok(()) } else { Err("Settings can only manage scoped configuration, synchronization, reference data, layouts and backups.".into()) };
     }
@@ -229,7 +254,7 @@ pub fn validate_surface(label: &str, request: &Value) -> Result<(), String> {
     if label == "logbook" {
         return if matches!(request["method"].as_str(), Some("workspace_preferences_load" | "logbook_list" | "logbook_contact"
             | "logbook_contact_apply" | "logbook_contact_receipt" | "logbook_matrix" | "logbook_previous"
-            | "logbook_import_adif" | "logbook_export_adif" | "logbook_cty_preview" | "logbook_follow_up" | "logbook_data_quality" | "lookup_call" | "cluster_history")) {
+            | "logbook_import_adif" | "logbook_export_adif" | "logbook_cty_preview" | "logbook_correction_preview" | "workspace_status" | "logbook_follow_up" | "logbook_data_quality" | "lookup_call" | "cluster_history")) {
             Ok(())
         } else { Err("This window can only read and edit the local logbook.".into()) };
     }
@@ -463,6 +488,7 @@ pub fn validate_request(request: &Value) -> Result<(), String> {
         "reference_schedule",
         "reference_configure",
         "opportunities_snapshot",
+        "opportunities_special_snapshot",
         "opportunities_refresh",
         "opportunities_dxpedition_snapshot",
         "opportunities_dxpedition_refresh",
@@ -473,6 +499,7 @@ pub fn validate_request(request: &Value) -> Result<(), String> {
         "logbook_operator_draft_qsy_clear",
         "logbook_operator_draft_radio_read",
         "logbook_operator_draft_nearby_call",
+        "logbook_operator_draft_follow_call",
         "logbook_operator_draft_antenna_proposal",
         "logbook_operator_draft_antenna_follow",
         "logbook_operator_draft_radio_follow",
@@ -480,12 +507,21 @@ pub fn validate_request(request: &Value) -> Result<(), String> {
         "logbook_contact",
         "logbook_contact_apply",
         "logbook_contact_receipt",
+        "logbook_companion_apply",
+        "logbook_companion_receipt",
+        "logbook_companion_history",
+        "logbook_companion_recent",
+        "logbook_companion_contact_detail",
+        "logbook_companion_bearing",
         "logbook_catalog",
         "logbook_list",
         "logbook_cty_preview",
+        "logbook_correction_preview",
         "logbook_alert_entities",
+        "logbook_chase_progress",
         "logbook_follow_up",
         "logbook_data_quality",
+        "logbook_duplicates",
         "logbook_country_facts",
         "logbook_country_review",
         "logbook_country_review_cancel",
@@ -571,6 +607,7 @@ pub fn validate_request(request: &Value) -> Result<(), String> {
         "cluster_filter",
         "cluster_password_set",
         "cluster_console_clear",
+        "cluster_push_spots",
         "cluster_history",
         "spot_history_status",
         "spot_history_query",
@@ -584,6 +621,7 @@ pub fn validate_request(request: &Value) -> Result<(), String> {
         "secret_status",
         "online_log_status",
         "online_log_configure",
+        "online_log_reconcile",
         "sync_status",
         "sync_summary",
         "sync_run",
@@ -630,6 +668,7 @@ struct Session {
     retirement_failed: AtomicBool,
     output_finished: AtomicBool,
     writes_pending: AtomicUsize,
+    needs: Mutex<crate::companion_needs::Mailbox>,
 }
 
 impl Session {
@@ -654,6 +693,7 @@ impl Session {
             retirement_failed: AtomicBool::new(false),
             output_finished: AtomicBool::new(false),
             writes_pending: AtomicUsize::new(0),
+            needs: Mutex::new(crate::companion_needs::Mailbox::default()),
         });
         diagnostic("spawn", session.generation, || serde_json::json!({"worker_pid": worker_pid}));
         let weak = Arc::downgrade(&session);
@@ -662,6 +702,12 @@ impl Session {
     }
 
     fn register(&self, id: &str) -> Result<mpsc::Receiver<Reply>, String> {
+        self.register_with(id, true)
+    }
+
+    /// `control` requests may use the [`CONTROL_RESERVED_SLOTS`]; other
+    /// requests are refused once only that reserve remains.
+    fn register_with(&self, id: &str, control: bool) -> Result<mpsc::Receiver<Reply>, String> {
         let abandoned = self.abandoned.lock()
             .map_err(|_| "Station service routing failed")?;
         let mut pending = self
@@ -677,7 +723,8 @@ impl Session {
         // A timed-out passive read is still running in Swift. Its reserved
         // routing slot lasts until the late reply arrives; admitting replacements
         // here used to evict live IDs and turn valid replies into protocol faults.
-        if pending.len() + abandoned.len() >= MAX_IN_FLIGHT {
+        let limit = if control { MAX_IN_FLIGHT } else { MAX_IN_FLIGHT - CONTROL_RESERVED_SLOTS };
+        if pending.len() + abandoned.len() >= limit {
             return Err("Prototype worker is busy; try again".into());
         }
         let (sender, receiver) = mpsc::channel();
@@ -686,19 +733,22 @@ impl Session {
         Ok(receiver)
     }
 
-    fn dispatch(&self, response: Value) -> Result<(), String> {
+    fn dispatch(&self, mut response: Value) -> Result<(), String> {
         let id = response["id"]
             .as_str()
-            .ok_or("Station service returned an uncorrelated response")?;
+            .ok_or("Station service returned an uncorrelated response")?.to_owned();
         if !response["ok"].is_boolean() {
             return Err("Station service returned an invalid response".into());
         }
         let mut abandoned = self.abandoned.lock()
             .map_err(|_| "Station service routing failed")?;
         let sender = self.pending.lock()
-            .map_err(|_| "Station service routing failed")?.remove(id);
+            .map_err(|_| "Station service routing failed")?.remove(&id);
+        // Optional reads never alter normal routing or retire the worker. They
+        // retain one slot across HTTP timeout and consume late poll replies too.
+        if let Ok(mut needs) = self.needs.lock() { needs.complete(&mut response); }
         let Some(sender) = sender else {
-            if let Some(index) = abandoned.iter().position(|value| value == id) {
+            if let Some(index) = abandoned.iter().position(|value| value == &id) {
                 abandoned.remove(index);
                 return Ok(());
             }
@@ -738,6 +788,7 @@ impl Session {
         if !self.alive.swap(false, Ordering::AcqRel) {
             return;
         }
+        crate::worker_health::record_restart(reason, request.map(|(_, method, _)| method), request.map(|(_, _, phase)| phase));
         diagnostic("retire", self.generation, || serde_json::json!({
             "reason": reason,
             "initiating_request": request.map(|(trace, method, phase)| serde_json::json!({"trace": trace, "method": method, "phase": phase})),
@@ -772,6 +823,7 @@ impl Session {
                     "exit_code": waited.as_ref().ok().and_then(|status| status.code()),
                 }));
                 if waited.is_ok() {
+                    if let Ok(mut needs) = self.needs.lock() { needs.retired(); }
                     if let Ok(mut retired) = RETIRED_GENERATIONS.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
                         retired.insert((process_epoch().to_owned(),self.generation));
                     }
@@ -825,6 +877,7 @@ impl Session {
                 Ok(mut child) => match child.as_mut() {
                     Some(process) => match process.try_wait() {
                         Ok(Some(status)) => {
+                            if let Ok(mut needs) = self.needs.lock() { needs.retired(); }
                             diagnostic("shutdown_exit", self.generation, || serde_json::json!({"worker_pid": process.id(), "exit_code": status.code(), "success": status.success()}));
                             if !status.success() { failure = Some(worker_retirement_exit_message(status.code())); }
                             *child = None;
@@ -1190,6 +1243,31 @@ pub fn shutdown_for_module_transition() -> Result<(), String> {
 pub fn request(request: Value) -> Result<Value, String> {
     request_using(request, active_session)
 }
+
+/// Only the native cluster owner's existing poll transport calls this. No
+/// companion HTTP request invokes it or creates/wakes a poller.
+pub(crate) fn request_cluster_poll(request: Value) -> Result<Value, String> {
+    let attach = request["method"] == "cluster_snapshot" && request["params"] == serde_json::json!({"needs_only":true});
+    request_using_kind(request, active_session, attach)
+}
+
+pub(crate) fn enqueue_needs(batch: crate::companion_needs::Batch, workspace: String, expected: u64)
+    -> Result<mpsc::Receiver<Result<Value,String>>,String> {
+    let session = needs_session(expected)?;
+    let result = session.needs.lock().map_err(|_| "Needs lookup unavailable.")?.enqueue(batch, workspace);
+    result
+}
+fn needs_session(expected: u64) -> Result<Arc<Session>, String> {
+    // Unlike existing_session(), this read cannot announce/start replacement
+    // services as a side effect of obtaining an already-running process.
+    let registry = SESSION.get().ok_or("Needs worker unavailable.")?;
+    let session = registry.try_lock().map_err(|_| "Needs worker busy.")?
+        .as_ref().cloned().ok_or("Needs worker unavailable.")?;
+    if session.generation != expected || !session.alive.load(Ordering::Acquire)
+        || !session.accepting.load(Ordering::Acquire) { return Err("Needs worker changed.".into()); }
+    Ok(session)
+}
+pub(crate) fn require_needs_generation(expected: u64) -> Result<(), String> { needs_session(expected).map(|_| ()) }
 /// Return the generation of the actual request session, never a later global
 /// sample which could relabel a reply after a concurrent worker replacement.
 pub(crate) fn request_with_generation(request: Value) -> Result<(u64, Value), String> {
@@ -1283,6 +1361,9 @@ fn retry_layout_admission<T>(mut read: impl FnMut() -> Result<T, String>,
 }
 
 fn request_using(request: Value, session: impl FnOnce() -> Result<Arc<Session>, String>) -> Result<Value, String> {
+    request_using_kind(request, session, false)
+}
+fn request_using_kind(request: Value, session: impl FnOnce() -> Result<Arc<Session>, String>, needs_poll: bool) -> Result<Value, String> {
     validate_request(&request)?;
     let blocks_module_transition = request_blocks_module_transition(&request);
     if blocks_module_transition && !admit_transition_blocker(&TRANSITION_BLOCKING_IN_FLIGHT) {
@@ -1307,7 +1388,9 @@ fn request_using(request: Value, session: impl FnOnce() -> Result<Arc<Session>, 
     crate::contest_recorder::admission(&request);
     let recorder_request = crate::contest_recorder::observes(&request).then(|| request.clone());
     let timeout = request_timeout(&request);
-    let response = request_in_session(&session, request, timeout);
+    let companion_fence = crate::companion_host::before_worker_request(&request);
+    let response = request_in_session_kind(&session, request, timeout, needs_poll);
+    crate::companion_host::after_worker_request(companion_fence, &response);
     crate::station_identity::finish(identity, &response);
     if let Some(request) = recorder_request { crate::contest_recorder::confirmed(&request, &response); }
     response
@@ -1319,7 +1402,7 @@ fn request_blocks_module_transition(request: &Value) -> bool {
         "station_snapshot" | "station_rotor_snapshot" | "rotor_snapshot" |
         "spot_bridge_snapshot" | "wsjtx_snapshot" | "fldigi_snapshot" |
         "cluster_snapshot" | "cluster_history" |
-        "opportunities_snapshot" | "opportunities_refresh" |
+        "opportunities_snapshot" | "opportunities_special_snapshot" | "opportunities_refresh" |
         "opportunities_dxpedition_snapshot" | "opportunities_dxpedition_refresh" |
         "spot_history_status" | "spot_history_query" | "spot_history_detail" | "reference_log_review" |
         "contest_catalog" | "contest_sessions" | "contest_draft_get" |
@@ -1340,14 +1423,24 @@ fn request_in_session(
     request: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
+    request_in_session_kind(session, request, timeout, false)
+}
+fn request_in_session_kind(
+    session: &Arc<Session>, mut request: Value, timeout: Duration, needs_poll: bool,
+) -> Result<Value, String> {
     let control_request = request_can_change_station_state(&request);
     let id = request["id"]
         .as_str()
         .ok_or("Request ID is required")?
         .to_owned();
-    let mut payload = serde_json::to_vec(&request).map_err(|_| "Invalid request")?;
+    let receiver = session.register_with(&id, control_request)?;
+    if needs_poll {
+        if let Ok(mut needs) = session.needs.lock() { needs.attach(&mut request); }
+    }
+    // Value serialization is infallible for this already validated JSON tree;
+    // the optional batch was capped at 16 KiB before mailbox admission.
+    let mut payload = serde_json::to_vec(&request).expect("JSON worker request");
     payload.push(b'\n');
-    let receiver = session.register(&id)?;
     static TRACE: AtomicU64 = AtomicU64::new(0);
     let trace = TRACE.fetch_add(1, Ordering::Relaxed);
     let method = request["method"].as_str().unwrap_or("");
@@ -1458,18 +1551,40 @@ fn request_is_non_retiring_read(request: &Value) -> bool {
     // These projections can wait for a backup/restore's shared logbook lane.
     // Their local deadline cannot cancel accepted file, QSO or station work.
     if request_is_profile_read(request) || request_is_public_service_read(request) { return true; }
+    // Companion reads share the logbook owner with imports and backups. Their
+    // local deadline abandons only the read, never the existing radio/rotor
+    // session. Keep this exact allowlist separate from companion mutations.
+    if matches!(request["method"].as_str(), Some(
+        "logbook_companion_history" | "logbook_companion_recent" |
+        "logbook_companion_receipt" | "logbook_companion_contact_detail" | "logbook_companion_bearing"
+    )) { return true; }
     // Review and release affect only the ephemeral preview session. A delayed
     // review or its cleanup must not cancel an unrelated contact/backup operation.
     if request["method"] == "logbook_import_adif"
         && matches!(request["params"]["action"].as_str(), Some("preview" | "retire")) {
         return true;
     }
+    // Every export action only snapshots, pages or releases a read-only export
+    // session; a late one abandons that export, never the shared worker.
+    if request["method"] == "logbook_export_adif"
+        && matches!(request["params"]["action"].as_str(), Some(
+            "begin" | "read" | "retire" | "pota_preview" | "pota_files" | "pota_issues" | "pota_read")) {
+        return true;
+    }
+    // Aggregate and workspace reads compute or load views only. A late award
+    // catalogue on a large log restarted the worker three times in 50 minutes
+    // on 2026-11-19 (each restart dropping radio and rotor sessions); a late
+    // read now abandons only itself.
+    if matches!(request["method"].as_str(), Some(
+        "logbook_catalog" | "logbook_stats" | "logbook_award_progress" | "logbook_duplicates" |
+        "workspace_layout_load" | "workspace_rotor_configuration_load" | "workspace_preferences_load"
+    )) { return true; }
     matches!(request["method"].as_str(), Some(
         "settings_load" | "workspace_status" | "logbook_list" |
         "station_snapshot" | "station_rotor_snapshot" | "rotor_snapshot" |
         "workspace_map_context" | "hm_control_logbook" | "lookup_call" | "logbook_previous" | "logbook_duplicate" |
-        "logbook_matrix" | "cluster_history" | "cluster_snapshot" | "sync_summary" | "logbook_operator_draft" |
-        "opportunities_snapshot" | "opportunities_refresh" |
+        "logbook_matrix" | "logbook_chase_progress" | "cluster_history" | "cluster_snapshot" | "sync_summary" | "logbook_operator_draft" |
+        "opportunities_snapshot" | "opportunities_special_snapshot" | "opportunities_refresh" |
         "opportunities_dxpedition_snapshot" | "opportunities_dxpedition_refresh" |
         "wsjtx_snapshot" | "fldigi_snapshot" | "reference_resolve" | "contest_qso_get" | "contest_log_transfer_status" | "contest_network_pending" |
         "contest_export_prepare" | "contest_export_read" | "contest_export_release" | "contest_spot_points_preview" |
@@ -1483,7 +1598,13 @@ fn request_is_non_retiring_read(request: &Value) -> bool {
     ))
 }
 fn request_keeps_worker_on_timeout(request: &Value) -> bool {
-    request_is_non_retiring_read(request)
+    // This idempotent preference save cannot change a contact or station state.
+    // If it waits behind cache work, retain its unconfirmed result without
+    // terminating the shared worker and disconnecting radio/rotor sessions.
+    // Native cluster resume is attempted only once per worker generation and
+    // may wait on cold metadata. Its late acknowledgement must not kill an
+    // unrelated radio/rotor session; an explicit Connect keeps its policy.
+    request_is_non_retiring_read(request) || matches!(request["method"].as_str(), Some("reference_configure" | "cluster_resume"))
 }
 
 fn request_is_public_service_read(request: &Value) -> bool {
@@ -1493,10 +1614,25 @@ fn request_is_public_service_read(request: &Value) -> bool {
 }
 
 fn request_timeout(request: &Value) -> Duration {
+    // A live cluster can introduce SOTA/WWFF/POTA references absent from the
+    // retained calendar cache. The first projection then parses and indexes
+    // several hundred thousand catalogue records alongside logbook startup.
+    // The Windows live acceptance exceeded 30s despite uninterrupted hardware
+    // polls. Give this cold, cacheable work its own bounded budget, including
+    // refresh's bounded downloads, without widening station/control deadlines.
+    if matches!(request["method"].as_str(), Some("opportunities_snapshot" |
+        "opportunities_dxpedition_snapshot" | "opportunities_refresh" | "opportunities_dxpedition_refresh")) {
+        return OPPORTUNITY_METADATA_TIMEOUT;
+    }
     // Cold workspace/CTY/DXCC preparation took 16.6s in the retained Windows
     // profile; warm metadata and history reads were below 400ms. Preserve the
     // initial metadata reply without widening fast reads or mutation deadlines.
-    if request["method"] == "workspace_map_context" {
+    // Cluster/opportunity snapshots also prepare CTY and complete contact
+    // classifications on a cold workspace. They are metadata projections,
+    // not five-second hardware polls; the warm cache does not remove that
+    // initial work. Keep a bounded metadata budget and late-reply routing.
+    if matches!(request["method"].as_str(), Some("workspace_map_context" |
+        "cluster_snapshot" | "reference_resolve")) {
         return MAP_METADATA_TIMEOUT;
     }
     // The initial duplicate review reads the complete logbook. A retained 69k
@@ -1506,6 +1642,17 @@ fn request_timeout(request: &Value) -> Duration {
         return ADIF_PREVIEW_TIMEOUT;
     }
     if request["method"] == "logbook_import_adif" && request["params"]["action"] == "retire" {
+        return RESPONSE_TIMEOUT;
+    }
+    // Exporting begins by snapshotting the complete logbook; on a 69k Windows log
+    // under a running Wavelog sync that exceeded the generic deadline and retired
+    // the worker. It is read-only, like the import review, so it gets the same budget.
+    if request["method"] == "logbook_export_adif" && request["params"]["action"] == "begin" {
+        return ADIF_PREVIEW_TIMEOUT;
+    }
+    // Its page reads keep their existing budget although they no longer retire
+    // the worker (non-retiring reads otherwise get the five-second passive deadline).
+    if request["method"] == "logbook_export_adif" && request_is_non_retiring_read(request) {
         return RESPONSE_TIMEOUT;
     }
     // A verified backup hashes and validates the complete SQLite payload more
@@ -1559,6 +1706,158 @@ fn service_request_failure(phase: &str, control_request: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_chase_progress_is_admitted_without_renderer_or_timeout_retirement() {
+        use super::*;
+        let request = serde_json::json!({"id":"chase-progress","method":"logbook_chase_progress",
+            "params":{"targets":[{"id":"target","call":"Z34BET","bands":["20m"],"modes":["SSB"]}]}});
+        validate_request(&request).unwrap();
+        assert!(request_is_non_retiring_read(&request));
+        assert!(request_keeps_worker_on_timeout(&request));
+        assert!(!request_can_change_station_state(&request));
+        assert_eq!(request_timeout(&request), PASSIVE_READ_TIMEOUT);
+        for label in ["main", "settings", "alerts", "logbook", "log-qso", "monitor", "world-map", "band-maps", "dx-cluster", "unknown"] {
+            assert!(validate_surface(label, &request).is_err(), "{label}");
+        }
+    }
+
+    #[test]
+    fn companion_passive_read_deadlines_do_not_widen_control_policy() {
+        use super::*;
+        for method in ["logbook_companion_history", "logbook_companion_recent",
+            "logbook_companion_receipt", "logbook_companion_contact_detail", "logbook_companion_bearing"] {
+            let request = json!({"method":method});
+            assert!(request_is_non_retiring_read(&request), "{method}");
+            assert!(request_keeps_worker_on_timeout(&request), "{method}");
+            assert_eq!(request_timeout(&request), Duration::from_secs(5), "{method}");
+        }
+        for method in ["logbook_companion_apply", "logbook_companion_history_apply",
+            "logbook_companion_contact_detail_apply", "logbook_companion_bearing_apply", "station_tune", "station_action",
+            "station_radio_control", "station_connect", "rotor_goto", "rotor_stop"] {
+            let request = json!({"method":method});
+            assert!(!request_keeps_worker_on_timeout(&request), "{method}");
+            assert_eq!(request_timeout(&request), RESPONSE_TIMEOUT, "{method}");
+        }
+    }
+
+    #[test]
+    fn companion_bearing_is_native_only_on_every_renderer_surface() {
+        let request = serde_json::json!({"id":"bearing","method":"logbook_companion_bearing",
+            "params":{"callsign":"VK8RX","originGrid":"JN88","generation":"00000000-0000-4000-8000-000000000001"}});
+        super::validate_request(&request).unwrap();
+        for label in ["main","settings","monitor","station-control","rotor","log-qso","logbook",
+            "world-map","band-maps","dx-cluster","callsign-intelligence","unknown"] {
+            assert!(super::validate_surface(label, &request).is_err(), "{label}");
+        }
+    }
+
+    // Hold the first response until the second request arrives: deterministic
+    // late-reply routing without a sleep race or any station service process.
+    #[cfg(any(unix, windows))]
+    fn companion_passive_fixture() -> Arc<Session> {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", concat!(
+                "IFS= read -r warmup; printf '%s\\n' '{\"id\":\"warmup\",\"ok\":true,\"result\":{}}'; ",
+                "IFS= read -r stale; IFS= read -r health; ",
+                "printf '%s\\n' '{\"id\":\"stale\",\"ok\":true,\"result\":{}}'; ",
+                "printf '%s\\n' '{\"id\":\"health\",\"ok\":true,\"result\":{}}'; ",
+                "while IFS= read -r extra; do :; done")]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            command.args(["/D", "/Q", "/C", concat!(
+                "set /p warmup= & echo %XLOG_PASSIVE_WARMUP% & ",
+                "set /p stale= & set /p health= & ",
+                "echo %XLOG_PASSIVE_STALE% & echo %XLOG_PASSIVE_HEALTH% & ",
+                "for /L %i in (1,1,2147483647) do @(set /p extra= || exit /b 0)")]);
+            command.env("XLOG_PASSIVE_WARMUP", r#"{"id":"warmup","ok":true,"result":{}}"#)
+                .env("XLOG_PASSIVE_STALE", r#"{"id":"stale","ok":true,"result":{}}"#)
+                .env("XLOG_PASSIVE_HEALTH", r#"{"id":"health","ok":true,"result":{}}"#);
+            command
+        };
+        let session = Session::from_child(command.stdin(Stdio::piped()).stdout(Stdio::piped())
+            .stderr(Stdio::null()).spawn().expect("passive fixture child"))
+            .expect("passive fixture session");
+        request_in_session(&session, serde_json::json!({"id":"warmup","method":"health","params":{}}),
+            Duration::from_secs(5)).expect("fixture startup handshake");
+        session
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn companion_passive_read_timeouts_keep_exact_child_and_route_late_replies() {
+        use super::*;
+        for method in ["logbook_companion_history", "logbook_companion_recent",
+            "logbook_companion_receipt", "logbook_companion_contact_detail", "logbook_companion_bearing"] {
+            let session = companion_passive_fixture();
+            let generation = session.generation;
+            let pid = session.child.lock().unwrap().as_ref().unwrap().id();
+            let result = request_in_session(&session,
+                json!({"id":"stale","method":method,"params":{}}), Duration::from_secs(1));
+            let error = result.unwrap_err();
+            assert!(error.contains("not responding"), "{method}: {error}");
+            assert!(session.alive.load(Ordering::Acquire), "{method} retired the child");
+            assert!(!session.pending.lock().unwrap().contains_key("stale"));
+            let response = request_in_session(&session,
+                json!({"id":"health","method":"health","params":{}}), Duration::from_secs(5)).unwrap();
+            assert_eq!(response["id"], "health");
+            assert_eq!(session.generation, generation);
+            assert_eq!(session.child.lock().unwrap().as_ref().unwrap().id(), pid);
+            assert!(session.alive.load(Ordering::Acquire));
+            session.retire("passive fixture complete");
+        }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn companion_passive_policy_still_retires_unconfirmed_mutations() {
+        use super::*;
+        for method in ["logbook_companion_apply", "station_tune", "rotor_goto"] {
+            let session = companion_passive_fixture();
+            assert!(request_in_session(&session,
+                json!({"id":"stale","method":method,"params":{}}), Duration::from_secs(1)).is_err());
+            assert!(!session.alive.load(Ordering::Acquire), "{method}");
+            assert!(session.child.lock().unwrap().is_none(), "{method} was not reaped");
+        }
+    }
+
+    #[test]
+    fn cold_background_metadata_has_a_bounded_budget_without_changing_station_deadlines() {
+        use super::*;
+        for method in ["cluster_snapshot", "reference_resolve"] {
+            let request = serde_json::json!({"method":method});
+            assert_eq!(request_timeout(&request), Duration::from_secs(30));
+            assert!(request_is_non_retiring_read(&request));
+        }
+        for method in ["opportunities_snapshot", "opportunities_dxpedition_snapshot", "opportunities_refresh", "opportunities_dxpedition_refresh"] {
+            let request = serde_json::json!({"method":method});
+            assert_eq!(request_timeout(&request), Duration::from_secs(90));
+            assert!(request_is_non_retiring_read(&request));
+        }
+        for method in ["station_snapshot", "rotor_snapshot", "station_rotor_snapshot"] {
+            assert_eq!(request_timeout(&serde_json::json!({"method":method})), PASSIVE_READ_TIMEOUT);
+        }
+        for method in ["station_tune", "rotor_goto", "settings_save"] {
+            let request = serde_json::json!({"method":method});
+            assert_eq!(request_timeout(&request), RESPONSE_TIMEOUT);
+            assert!(!request_keeps_worker_on_timeout(&request));
+        }
+        // Read-only aggregate and workspace loads abandon only themselves.
+        for method in ["logbook_catalog", "logbook_stats", "logbook_award_progress",
+                       "workspace_layout_load", "workspace_rotor_configuration_load", "workspace_preferences_load"] {
+            assert!(request_keeps_worker_on_timeout(&serde_json::json!({"method":method})), "{method}");
+        }
+        // Their saves still retire on an unknown outcome.
+        for method in ["workspace_layout_apply", "workspace_rotor_configuration_save", "workspace_preferences_save"] {
+            assert!(!request_keeps_worker_on_timeout(&serde_json::json!({"method":method})), "{method}");
+        }
+    }
     #[test]
     fn retired_decoder_rpcs_are_not_in_the_product_allowlist() {
         for method in ["cw_decode_snapshot", "cw_decode_start", "cw_decode_stop", "cw_decode_listener_start",
@@ -1652,6 +1951,7 @@ mod tests {
             "cluster_resume",
             "cluster_command",
             "cluster_console_clear",
+            "cluster_push_spots",
             "spot_bridge_start",
             "spot_bridge_stop",
             "contest_export_prepare",
@@ -1787,8 +2087,12 @@ mod tests {
     }
     #[test]
     fn rotor_observation_child_has_no_raw_worker_or_motion_authority() {
+        // The Rotor window's Park button is its only raw rotor method; the
+        // rotor owner still checks owner, generation and active state. Goto
+        // and Stop go through their own typed owners.
+        assert!(validate_surface("rotor", &json!({"id":"rotor","method":"rotor_park","params":{}})).is_ok());
         for method in ["workspace_layout_load", "settings_load", "settings_save", "secret_save", "secret_status", "logbook_operator_draft",
-            "rotor_snapshot", "rotor_connect", "rotor_disconnect", "rotor_goto", "rotor_stop", "rotor_park",
+            "rotor_snapshot", "rotor_connect", "rotor_disconnect", "rotor_goto", "rotor_stop",
             "station_rotor_snapshot", "station_rotor_connect", "station_rotor_goto", "station_rotor_stop",
             "hamlib_snapshot", "hamlib_connect", "hamlib_control", "station_action", "station_connect", "sync_run", "health"] {
             assert!(validate_surface("rotor", &json!({"id":"rotor","method":method,"params":{}})).is_err(), "{method}");
@@ -1832,6 +2136,21 @@ mod tests {
             "station_connect", "station_configuration", "station_radio_control", "rotor_stop", "hamlib_snapshot", "hamlib_control", "winkeyer_snapshot", "sync_run", "health"] {
             assert!(validate_surface("station-identity", &json!({"id":"identity","method":method,"params":{}})).is_err(), "{method}");
         }
+    }
+    #[test]
+    fn special_window_reads_only_current_cluster_and_reference_history() {
+        for method in ["cluster_snapshot", "opportunities_special_snapshot"] {
+            let request = json!({"id":"special-read","method":method,"params":{}});
+            assert!(validate_request(&request).is_ok());
+            assert!(validate_surface("special", &request).is_ok());
+            assert!(request_is_non_retiring_read(&request));
+        }
+        for method in ["station_tune", "settings_load", "settings_save", "opportunities_refresh", "secret_status", "logbook_save", "cluster_connect", "cluster_command"] {
+            assert!(validate_surface("special", &json!({"id":"special-read","method":method,"params":{}})).is_err());
+        }
+        assert!(validate_surface("special", &json!({"id":"special-read","method":"opportunities_special_snapshot","params":{"spots":[]}})).is_err());
+        assert!(crate::spot_editor_barrier::activation_role("special"));
+        assert!(!crate::spot_editor_barrier::editor_role("special"));
     }
     #[test]
     fn alerts_child_cannot_read_or_control_worker_services() {
@@ -1923,19 +2242,30 @@ mod tests {
     }
 
     #[test]
-    fn detached_settings_has_only_radio_spot_cluster_authority() {
+    fn mac_instrument_settings_use_existing_agent_configuration_authority() {
+        for method in ["station_configuration", "station_configuration_save"] {
+            let request = json!({"id":"instrument-settings","method":method,"params":{"provider":"direct_agent"}});
+            assert_eq!(validate_surface("settings", &request).is_ok(), cfg!(target_os = "macos"));
+            for label in ["monitor", "elecraft", "logbook"] {
+                assert!(validate_surface(label, &request).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn detached_settings_supports_cluster_configuration_and_connection() {
         for method in ["settings_load", "settings_receipt", "settings_save", "secret_status", "secret_save", "online_log_status", "online_log_configure",
             "workspace_rotor_configuration_load", "workspace_rotor_configuration_receipt", "workspace_rotor_configuration_save",
             "sync_status", "sync_summary", "sync_mutation", "sync_receipt",
             "reference_status", "reference_resolve", "reference_refresh", "reference_schedule", "reference_configure",
             "backup_create", "backup_list", "backup_inspect", "backup_import", "backup_restore",
             "workspace_layout_load", "workspace_layout_apply", "spot_bridge_snapshot", "spot_bridge_configure",
-            "cluster_snapshot", "cluster_radio_spots_configure"] {
+            "cluster_snapshot", "cluster_radio_spots_configure", "cluster_connect", "cluster_disconnect", "cluster_configure", "cluster_password_set"] {
             assert!(validate_surface("settings", &json!({"id":"settings","method":method,"params":{}})).is_ok(), "{method}");
         }
         for method in ["logbook_operator_draft", "logbook_contact", "logbook_save", "station_snapshot", "station_connect",
             "station_tune", "station_action", "station_power_selection", "rotor_snapshot", "rotor_goto",
-            "cluster_connect", "winkeyer_snapshot", "spot_bridge_start", "spot_bridge_stop", "workspace_create", "workspace_preferences_save",
+            "cluster_command", "winkeyer_snapshot", "spot_bridge_start", "spot_bridge_stop", "workspace_create", "workspace_preferences_save",
             "sync_run", "sync_configure", "sync_resolve", "sync_retry"] {
             assert!(validate_surface("settings", &json!({"id":"settings","method":method,"params":{}})).is_err(), "{method}");
         }
@@ -2461,6 +2791,13 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    /// Deadline for a fixture request that must time out. It is not what these
+    /// tests measure, so it is long enough for the writer thread to be scheduled
+    /// on a fully loaded machine; 30-50 ms made the outcome depend on CPU load.
+    const FIXTURE_REPLY_DEADLINE: Duration = Duration::from_millis(750);
+    /// Wait for a reply the test has just dispatched itself.
+    const FIXTURE_DELIVERY_WAIT: Duration = Duration::from_secs(2);
+
     fn shutdown_fixture_session(fixture: ShutdownFixture) -> Arc<Session> {
         #[cfg(unix)]
         let child = {
@@ -2518,8 +2855,10 @@ mod tests {
                 ShutdownFixture::ContestSpotFailure => "set /p request= & exit /b 71",
                 ShutdownFixture::StationReleaseFailure => "set /p request= & exit /b 74",
                 ShutdownFixture::UnsolicitedEof => "exit /b 0",
+                // Receive every queued request until the parent closes stdin.
+                // A two-read fixture exited while the accepted preview was still pending.
                 ShutdownFixture::MissingReply => {
-                    "set /p request= & set /p extra= & exit /b 0"
+                    "for /L %i in (1,1,2147483647) do @(set /p request= || exit /b 0)"
                 }
                 ShutdownFixture::MalformedReply => concat!(
                     "set /p request= & set /p extra= & ",
@@ -2889,7 +3228,8 @@ mod tests {
         ] {
             assert!(request_is_non_retiring_read(&json!({"method":method})), "{method}");
             assert_eq!(request_timeout(&json!({"method":method})),
-                if method == "workspace_map_context" { Duration::from_secs(30) }
+                if matches!(method, "opportunities_snapshot" | "opportunities_dxpedition_snapshot" | "opportunities_refresh" | "opportunities_dxpedition_refresh") { Duration::from_secs(90) }
+                else if matches!(method, "workspace_map_context" | "cluster_snapshot" | "reference_resolve") { Duration::from_secs(30) }
                 else if matches!(method, "lookup_call" | "opportunities_refresh" | "opportunities_dxpedition_refresh" | "sync_summary" | "logbook_operator_draft") { RESPONSE_TIMEOUT } else { PASSIVE_READ_TIMEOUT }, "{method}");
         }
         for method in [
@@ -2938,6 +3278,24 @@ mod tests {
         assert_eq!(request_timeout(&json!({"method":"station_tune"})), RESPONSE_TIMEOUT);
     }
 
+    #[test]
+    fn a_slow_full_logbook_export_abandons_only_itself_never_the_worker() {
+        let begin = json!({"method":"logbook_export_adif","params":{"action":"begin","scope":"all"}});
+        assert_eq!(request_timeout(&begin), ADIF_PREVIEW_TIMEOUT);
+        assert!(request_keeps_worker_on_timeout(&begin));
+        for action in ["read", "retire", "pota_preview", "pota_files", "pota_issues", "pota_read"] {
+            let request = json!({"method":"logbook_export_adif","params":{"action":action}});
+            assert!(request_keeps_worker_on_timeout(&request), "{action}");
+            assert_eq!(request_timeout(&request), RESPONSE_TIMEOUT, "{action}");
+        }
+        // An unknown or malformed action keeps the ordinary retiring deadline.
+        for params in [json!({}), json!({"action":"Begin"}), json!({"action":true})] {
+            let request = json!({"method":"logbook_export_adif","params":params});
+            assert_eq!(request_timeout(&request), RESPONSE_TIMEOUT);
+            assert!(!request_keeps_worker_on_timeout(&request));
+        }
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn delayed_adif_review_keeps_the_worker_and_correlates_its_late_reply() {
@@ -2945,7 +3303,7 @@ mod tests {
             let session = shutdown_fixture_session(ShutdownFixture::MissingReply);
             let review = request_in_session(&session,
                 json!({"id":"adif-review","method":"logbook_import_adif","params":{"action":action}}),
-                Duration::from_millis(50));
+                FIXTURE_REPLY_DEADLINE);
             let alive = session.alive.load(Ordering::Acquire);
             let late = session.dispatch(json!({"id":"adif-review","ok":true,"result":{"records":1}}));
             session.retire("test complete");
@@ -2963,14 +3321,14 @@ mod tests {
             let active = Arc::clone(&session);
             let preview = std::thread::spawn(move || request_in_session(&active,
                 json!({"id":"preview","method":"logbook_import_adif","params":{"action":"preview"}}),
-                Duration::from_secs(2)));
-            let deadline = Instant::now() + Duration::from_secs(1);
+                Duration::from_secs(20)));
+            let deadline = Instant::now() + Duration::from_secs(10);
             while !session.pending.lock().unwrap().contains_key("preview") {
                 assert!(Instant::now() < deadline, "preview was not admitted");
                 std::thread::yield_now();
             }
             let focused = request_in_session(&session,
-                json!({"id":"focus","method":method,"params":{}}), Duration::from_millis(50));
+                json!({"id":"focus","method":method,"params":{}}), FIXTURE_REPLY_DEADLINE);
             let alive = session.alive.load(Ordering::Acquire);
             let delivered = session.dispatch(json!({"id":"preview","ok":true,"result":{"records":1}}));
             let late = session.dispatch(json!({"id":"focus","ok":true,"result":{}}));
@@ -3004,6 +3362,78 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn needs_late_poll_reply_releases_one_slot_without_restarting_worker() {
+        let session = shutdown_fixture_session(ShutdownFixture::MissingReply);
+        let batch = crate::companion_needs::parse(br#"{"queries":[{"query_id":"q","callsign":"K1ABC","dial_frequency_hz":14074000,"mode":"FT8"}]}"#).unwrap();
+        let rx = session.needs.lock().unwrap().enqueue(batch.clone(), "workspace-a".into()).unwrap();
+        // Failed normal routing admission occurs before mailbox attachment.
+        // The queued job remains eligible for a later real scheduled poll.
+        for n in 0..MAX_IN_FLIGHT {
+            let _ = session.register(&format!("occupied-{n}")).unwrap();
+            session.writes_pending.fetch_sub(1,Ordering::AcqRel);
+        }
+        assert!(request_in_session_kind(&session,
+            json!({"id":"not-admitted","method":"cluster_snapshot","params":{"needs_only":true}}),FIXTURE_REPLY_DEADLINE,true).is_err());
+        assert!(rx.try_recv().is_err());
+        for n in 0..MAX_IN_FLIGHT {
+            session.dispatch(json!({"id":format!("occupied-{n}"),"ok":true,"result":{}})).unwrap();
+        }
+        let response = request_in_session_kind(&session,
+            json!({"id":"needs-poll","method":"cluster_snapshot","params":{"needs_only":true}}), FIXTURE_REPLY_DEADLINE, true);
+        assert!(response.is_err());
+        drop(rx); // HTTP timeout/re-pair cannot release the worker's job.
+        for _ in 0..50 { assert!(session.needs.lock().unwrap().enqueue(batch.clone(),"workspace-b".into()).is_err()); }
+        assert!(session.alive.load(Ordering::Acquire));
+        assert_eq!(session.abandoned.lock().unwrap().len(),1);
+        assert_eq!(session.writes_pending.load(Ordering::Acquire),0);
+        // This is the actual stdout dispatcher used for late abandoned replies.
+        session.dispatch(json!({"id":"needs-poll","ok":true,"result":{"snapshot":{"spots":[]}}})).unwrap();
+        assert!(session.abandoned.lock().unwrap().is_empty());
+        assert!(session.needs.lock().unwrap().enqueue(batch,"workspace-b".into()).is_ok());
+        assert!(session.alive.load(Ordering::Acquire));
+        session.retire("needs fixture complete");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn needs_mailbox_never_writes_or_waits_for_a_blocked_shared_pipe() {
+        let session = shutdown_fixture_session(ShutdownFixture::IgnoreEof);
+        struct Cleanup(Arc<Session>);
+        impl Drop for Cleanup { fn drop(&mut self) { self.0.retire("blocked pipe fixture cleanup"); } }
+        let _cleanup = Cleanup(session.clone());
+        session.input.lock().unwrap().as_mut().unwrap().write_all(b"start\n").unwrap();
+        let (started, start) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let writer_session = session.clone();
+        let writer = std::thread::spawn(move || {
+            let mut pipe = writer_session.input.lock().unwrap();
+            started.send(()).unwrap();
+            let outcome = pipe.as_mut().unwrap().write_all(&vec![b'x'; 1024 * 1024]);
+            let _ = done.send(outcome);
+        });
+        start.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(finished.recv_timeout(Duration::from_millis(30)).is_err(),"Fixture must block its ordinary writer");
+        let batch = crate::companion_needs::parse(br#"{"queries":[{"query_id":"q","callsign":"K1ABC","dial_frequency_hz":14074000,"mode":"FT8"}]}"#).unwrap();
+        let began = Instant::now();
+        let rx = session.needs.lock().unwrap().enqueue(batch.clone(),"a".into()).unwrap();
+        let poll_rx = session.register("already-admitted-poll").unwrap();
+        session.writes_pending.fetch_sub(1,Ordering::AcqRel);
+        session.needs.lock().unwrap().attach(&mut json!({"id":"already-admitted-poll","method":"cluster_snapshot","params":{"needs_only":true}}));
+        drop(rx);
+        for _ in 0..100 { assert!(session.needs.lock().unwrap().enqueue(batch.clone(),"repaired".into()).is_err()); }
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(session.alive.load(Ordering::Acquire));
+        assert!(session.input.try_lock().is_err());
+        assert!(finished.try_recv().is_err());
+        assert_eq!(session.pending.lock().unwrap().len(),1,"No lookup request was added to the worker pipe");
+        assert_eq!(session.writes_pending.load(Ordering::Acquire),0);
+        // Explicit fixture teardown, never a lookup timeout retirement.
+        session.retire("blocked pipe fixture complete");
+        let _ = writer.join(); drop(poll_rx);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn abandoned_reads_keep_their_routing_slots_until_the_oldest_reply_arrives() {
         let session = shutdown_fixture_session(ShutdownFixture::MissingReply);
         for index in 0..MAX_ABANDONED {
@@ -3030,6 +3460,53 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn abandoned_reads_never_take_the_slots_reserved_for_station_control() {
+        let session = shutdown_fixture_session(ShutdownFixture::MissingReply);
+        for index in 0..MAX_IN_FLIGHT - CONTROL_RESERVED_SLOTS {
+            let id = format!("slow-read-{index}");
+            let _receiver = session.register_with(&id, false).unwrap();
+            session.writes_pending.fetch_sub(1, Ordering::AcqRel);
+            session.abandon(&id).unwrap();
+        }
+        let read = session.register_with("another-read", false);
+        let control = session.register_with("ptt-off", true);
+        if control.is_ok() { session.writes_pending.fetch_sub(1, Ordering::AcqRel); }
+        session.retire("test complete");
+        assert_eq!(read.err().as_deref(), Some("Prototype worker is busy; try again"));
+        assert!(control.is_ok(), "A station control request must keep admission headroom");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_reference_and_cluster_resume_timeouts_preserve_station_routing() {
+      for request in [json!({"id":"reference-pref","method":"reference_configure",
+            "params":{"enabled":true,"only_if_unset":true}}),
+            json!({"id":"reference-pref","method":"cluster_resume","params":{}})] {
+        assert_eq!(request_timeout(&request), RESPONSE_TIMEOUT);
+        let session = shutdown_fixture_session(ShutdownFixture::MissingReply);
+        let radio = session.register("radio-poll").unwrap();
+        let rotor = session.register("rotor-poll").unwrap();
+        session.writes_pending.fetch_sub(2, Ordering::AcqRel);
+        let result = request_in_session(&session, request, FIXTURE_REPLY_DEADLINE);
+        let alive = session.alive.load(Ordering::Acquire);
+        let late = session.dispatch(json!({"id":"reference-pref","ok":true,"result":{"automatic_check":true}}));
+        let radio_result = session.dispatch(json!({"id":"radio-poll","ok":true,"result":{"connected":true}}));
+        let rotor_result = session.dispatch(json!({"id":"rotor-poll","ok":true,"result":{"connected":true}}));
+        let radio_reply = radio.recv_timeout(FIXTURE_DELIVERY_WAIT);
+        let rotor_reply = rotor.recv_timeout(FIXTURE_DELIVERY_WAIT);
+        session.retire("test complete");
+        assert!(result.unwrap_err().contains("not responding"));
+        assert!(alive && late.is_ok() && radio_result.is_ok() && rotor_result.is_ok());
+        assert_eq!(radio_reply.unwrap().unwrap()["result"]["connected"], true);
+        assert_eq!(rotor_reply.unwrap().unwrap()["result"]["connected"], true);
+        for method in ["station_tune", "rotor_goto", "settings_save", "reference_refresh", "cluster_connect"] {
+            assert!(!request_keeps_worker_on_timeout(&json!({"method":method})), "{method}");
+        }
+      }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn sync_completion_read_timeout_cannot_cancel_an_accepted_restore() {
         let session = shutdown_fixture_session(ShutdownFixture::MissingReply);
         // Reserve the in-flight restore exactly as the shared response router
@@ -3039,13 +3516,13 @@ mod tests {
         let summary = request_in_session(
             &session,
             json!({"id":"summary","method":"sync_summary","params":{}}),
-            Duration::from_millis(50),
+            FIXTURE_REPLY_DEADLINE,
         );
         let alive = session.alive.load(Ordering::Acquire);
         let waiting = restore.try_recv();
         let late_summary = session.dispatch(json!({"id":"summary","ok":true,"result":{"running":false}}));
         let restore_dispatch = session.dispatch(json!({"id":"restore","ok":true,"result":{"restored":true,"qso_count":2}}));
-        let restored = restore.recv_timeout(Duration::from_millis(100));
+        let restored = restore.recv_timeout(FIXTURE_DELIVERY_WAIT);
         session.retire("test complete");
         assert!(summary.unwrap_err().contains("not responding"));
         assert!(alive && matches!(waiting, Err(mpsc::TryRecvError::Empty)),
@@ -3064,12 +3541,12 @@ mod tests {
             let restore = session.register("accepted-restore").unwrap();
             session.writes_pending.fetch_sub(1, Ordering::AcqRel);
             let read = request_in_session(&session,
-                json!({"id":"public-read","method":method,"params":{}}), Duration::from_millis(50));
+                json!({"id":"public-read","method":method,"params":{}}), FIXTURE_REPLY_DEADLINE);
             let alive = session.alive.load(Ordering::Acquire);
             let waiting = restore.try_recv();
             let late = session.dispatch(json!({"id":"public-read","ok":true,"result":{}}));
             let delivered = session.dispatch(json!({"id":"accepted-restore","ok":true,"result":{"restored":true}}));
-            let result = restore.recv_timeout(Duration::from_millis(100));
+            let result = restore.recv_timeout(FIXTURE_DELIVERY_WAIT);
             session.retire("test complete");
             assert!(read.is_err());
             assert!(alive && matches!(waiting, Err(mpsc::TryRecvError::Empty)) && late.is_ok()
@@ -3091,12 +3568,12 @@ mod tests {
             let backup = session.register("accepted-backup").unwrap();
             session.writes_pending.fetch_sub(1, Ordering::AcqRel);
             let read = request_in_session(&session,
-                json!({"id":"profile-read","method":method,"params":{}}), Duration::from_millis(50));
+                json!({"id":"profile-read","method":method,"params":{}}), FIXTURE_REPLY_DEADLINE);
             let alive = session.alive.load(Ordering::Acquire);
             let waiting = backup.try_recv();
             let late = session.dispatch(json!({"id":"profile-read","ok":true,"result":{}}));
             let delivered = session.dispatch(json!({"id":"accepted-backup","ok":true,"result":{"name":"verified.xlogbackup"}}));
-            let result = backup.recv_timeout(Duration::from_millis(100));
+            let result = backup.recv_timeout(FIXTURE_DELIVERY_WAIT);
             session.retire("test complete");
             assert!(read.is_err());
             assert!(alive && matches!(waiting, Err(mpsc::TryRecvError::Empty)) && late.is_ok()
@@ -3120,13 +3597,13 @@ mod tests {
         let draft = request_in_session(
             &session,
             json!({"id":"draft-poll","method":"logbook_operator_draft","params":{}}),
-            Duration::from_millis(50),
+            FIXTURE_REPLY_DEADLINE,
         );
         let alive = session.alive.load(Ordering::Acquire);
         let waiting = preview.try_recv();
         let late_draft = session.dispatch(json!({"id":"draft-poll","ok":true,"result":{"draft":{}}}));
         let preview_dispatch = session.dispatch(json!({"id":"preview","ok":true,"result":{"name":"baseline.xlogbackup"}}));
-        let inspected = preview.recv_timeout(Duration::from_millis(100));
+        let inspected = preview.recv_timeout(FIXTURE_DELIVERY_WAIT);
         session.retire("test complete");
         assert!(draft.unwrap_err().contains("not responding"));
         assert!(alive && matches!(waiting, Err(mpsc::TryRecvError::Empty)),

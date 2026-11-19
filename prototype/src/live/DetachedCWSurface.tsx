@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { TauriEvent } from "@tauri-apps/api/event";
@@ -43,6 +44,6 @@ export function DetachedCWSurface() {
   return <div className="app live detached-task-app detached-cw-app"><main aria-label="Detached CW"><section className="detached-cw-controls" aria-label="CW session">
     <CWDesk profile={profile} context={context} controller={controls}
       state={{ ...state, pending: state.pending || transitioning || !state.canonical }} radioProvider={provider} />
-    {error && <p role="alert">{error}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section></main></div>;
 }

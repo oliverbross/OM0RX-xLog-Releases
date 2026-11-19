@@ -1,6 +1,8 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
+#if os(macOS)
 import CoreFoundation
+#endif
 import XCatIntegrationCore
 
 protocol SpotDatagramReceiving: AnyObject {
@@ -65,6 +67,29 @@ actor SpotForwardBroker {
         var lifetimeSeconds: Int?
         var attemptCount: Int?
         var lastAttemptID: UUID?
+    }
+
+    #if os(Windows)
+    static let flexProvider = "direct_flex_lan"
+    static let destinationName = "direct FLEX radio"
+    #else
+    static let flexProvider = "direct_agent"
+    static let destinationName = "Remote Station Agent"
+    #endif
+
+    func reserveFlexSpot(identity: String, lifetime: Int?) throws -> (source: String, prior: Bool) {
+        guard let store = try durableInventory() else { throw WorkerFailure("spot_inventory_unavailable", "Missing FLEX publisher identity.") }
+        return try (store.flexSource(), store.reserveFlexSpot(identity: identity, lifetime: lifetime))
+    }
+
+    func refreshFlexSpot(identity: String, lifetime: Int) throws {
+        guard let store = try durableInventory() else { throw WorkerFailure("spot_inventory_unavailable", "Missing FLEX inventory.") }
+        try store.refreshFlexSpot(identity: identity, lifetime: lifetime)
+    }
+
+    func finishFlexRemoval(identity: String) throws {
+        guard let store = try durableInventory() else { throw WorkerFailure("spot_inventory_unavailable", "Missing FLEX inventory.") }
+        try store.finishFlexRemoval(identity: identity)
     }
 
     private static let defaultInventoryURL = AppRuntimeProfile.current.spotInventoryURL(
@@ -135,7 +160,7 @@ actor SpotForwardBroker {
     }
 
     /// Returns false for a duplicate or an already-pending matching spot.
-    func forward(_ spot: FlexSpot, provider: String = "direct_agent", now: Date = Date(),
+    func forward(_ spot: FlexSpot, provider: String = SpotForwardBroker.flexProvider, now: Date = Date(),
                  replacingExisting: Bool = false) async throws -> Bool {
         let owner = spot.source == "xLog Contest" ? "contesting" : "normal_logging"
         guard !retiringOwners.contains(owner) else {
@@ -242,7 +267,7 @@ actor SpotForwardBroker {
         return true
     }
 
-    func remove(_ spot: FlexSpot, provider: String = "direct_agent") async throws -> Bool {
+    func remove(_ spot: FlexSpot, provider: String = SpotForwardBroker.flexProvider) async throws -> Bool {
         let key = "\(provider)|\(spot.callsign)|\(spot.frequencyHz)"
         let pendingKey = reservationKey(provider: provider, callsign: spot.callsign, frequencyHz: spot.frequencyHz)
         try await awaitPending(pendingKey)
@@ -463,7 +488,7 @@ actor SpotForwardBroker {
         var result: [UUID: PendingDelivery] = store == nil ? unresolvedDeliveries : [:]
         for payload in try store?.pendingDeliveries() ?? [] {
             let value = try JSONDecoder().decode(PendingDelivery.self, from: payload)
-            guard ["direct_agent", "direct_tci"].contains(value.provider),
+            guard ["direct_agent", "direct_flex_lan", "direct_tci"].contains(value.provider),
                   ["normal_logging", "contesting"].contains(value.owner),
                   value.radioID == nil || ["radio1", "radio2"].contains(value.radioID!),
                   !value.callsign.isEmpty, value.callsign.utf8.count <= 32,
@@ -526,7 +551,7 @@ actor SpotForwardBroker {
         guard data.count <= 1_048_576,
               let document = try? JSONDecoder().decode(InventoryDocument.self, from: data),
               document.version == 1, document.spots.count <= 4_096,
-              document.spots.allSatisfy({ ["direct_agent", "direct_tci"].contains($0.provider)
+              document.spots.allSatisfy({ ["direct_agent", "direct_flex_lan", "direct_tci"].contains($0.provider)
                   && ["radio1", "radio2"].contains($0.radioID)
                   && !$0.callsign.isEmpty && $0.callsign.utf8.count <= 32
                   && (100_000...60_000_000).contains($0.frequencyHz)
@@ -674,7 +699,7 @@ public actor LiveSpotBridge {
             if try await broker.forward(spot) {
                 guard receiverGeneration == generation else { return }
                 acceptedCount += 1
-                status = "Accepted by Remote Station Agent; FLEX display is not verified."
+                status = "Accepted by \(SpotForwardBroker.destinationName); FLEX display is not verified."
             } else {
                 guard receiverGeneration == generation else { return }
                 duplicateCount += 1
@@ -753,7 +778,7 @@ public actor LiveSpotBridge {
                                      "logbookPort": Int(config.logbookPort),
                                      "contestPort": Int(config.contestPort),
                                      "styles": styles]
-        return ["configuration": object, "running": logbookReceiver != nil && contestReceiver != nil,
+        return ["flex_provider": SpotForwardBroker.flexProvider, "configuration": object, "running": logbookReceiver != nil && contestReceiver != nil,
                 "received_count": receivedCount, "accepted_count": acceptedCount,
                 "rejected_count": rejectedCount, "duplicate_count": duplicateCount,
                 "dropped_count": ingress.droppedCount,
@@ -818,7 +843,7 @@ public actor LiveSpotBridge {
     private func decodeConfiguration(_ object: [String: Any]) throws -> SpotBridgeConfiguration {
         guard Set(object.keys) == ["enabled", "logbookPort", "contestPort", "styles"],
               let enabledNumber = object["enabled"] as? NSNumber,
-              CFGetTypeID(enabledNumber) == CFBooleanGetTypeID(),
+              LiveStationMethods.jsonNumber(enabledNumber) == nil && enabledNumber.doubleValue.isFinite,
               let logbookPort = exactInteger(object["logbookPort"]),
               let contestPort = exactInteger(object["contestPort"]),
               (1_024...65_535).contains(logbookPort), (1_024...65_535).contains(contestPort),
@@ -845,7 +870,7 @@ public actor LiveSpotBridge {
 
     private func exactInteger(_ value: Any?) -> Int? {
         guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              LiveStationMethods.jsonNumber(number) != nil,
               number.doubleValue.isFinite,
               number.doubleValue.rounded(.towardZero) == number.doubleValue,
               number.doubleValue >= Double(Int.min),

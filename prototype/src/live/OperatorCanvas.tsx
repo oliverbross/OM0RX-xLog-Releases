@@ -1,6 +1,7 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Grip, X } from "lucide-react";
-import { adjustPanel, customDeskPreset, fitPanelHeight, resizeEdges, resizePanel, type ResizeEdge } from "./canvasGeometry";
+import { adjustPanel, tileDeskPanels, customDeskPreset, fitPanelHeight, resizeEdges, resizePanel, type ResizeEdge } from "./canvasGeometry";
 import { panelMinimum, type LayoutPreset, type LayoutSnapshot, type LayoutState, type PanelLayout, type WorkspacePanelID, type WorkspaceLayoutSession } from "./workspaceLayoutSession";
 import "./OperatorCanvas.css";
 import { beginWorkspacePresentation } from "./workspaceLayoutTransport";
@@ -53,7 +54,7 @@ export default function OperatorCanvas({ panels, traditional, state, session, su
     let base = admitted;
     if (id === "custom" && !base.document.presets.some(preset => preset.id === id)) {
       const original = base.document.presets.find(preset => preset.id === "traditional") ?? base.document.presets[0];
-      await session.applyAtBase({ action: "savePreset", presetID: id, preset: customDeskPreset(original, size.height, equipment) }, base, ticket);
+      await session.applyAtBase({ action: "savePreset", presetID: id, preset: tileDeskPanels(customDeskPreset(original, size.height, equipment), available.width, Math.max(480, available.height - 48)) }, base, ticket);
       const saved = session.getSnapshot();
       if (saved.pending || saved.error) return;
       if (!saved.snapshot || saved.snapshot.generation !== base.generation || saved.snapshot.revision !== base.revision + 1)
@@ -77,8 +78,16 @@ export default function OperatorCanvas({ panels, traditional, state, session, su
     const [minWidth, minHeight] = panelMinimum(id);
     const width = Math.min(active!.width, Math.max(minWidth, panel.rect.width)), height = Math.min(active!.height, Math.max(minHeight, panel.rect.height));
     const rect = { x: Math.max(0, Math.min(active!.width - width, panel.rect.x)), y: Math.max(0, Math.min(active!.height - height, panel.rect.y)), width, height };
-    void performChange((ticket, base) => session.applyAtBase({ action: "placePanel", presetID: active!.id, panel: { ...panel, placement: show ? "canvas" : "hidden",
-      rect: show ? rect : panel.rect, z: Math.min(10000, Math.max(...active!.panels.map(item => item.z)) + 1) } }, base, ticket));
+    const placed: PanelLayout = { ...panel, placement: show ? "canvas" : "hidden", rect: show ? rect : panel.rect,
+      z: Math.min(10000, Math.max(...active!.panels.map(item => item.z)) + 1) };
+    const overlaps = visible.some(other => rect.x < other.rect.x + other.rect.width && other.rect.x < rect.x + width
+      && rect.y < other.rect.y + other.rect.height && other.rect.y < rect.y + height);
+    if (show && overlaps) {
+      savePreset(tileDeskPanels({ ...active!, panels: active!.panels.map(other => other.id === id ? placed : other) },
+        available.width, Math.max(480, available.height - 48)));
+    } else {
+      void performChange((ticket, base) => session.applyAtBase({ action: "placePanel", presetID: active!.id, panel: placed }, base, ticket));
+    }
     if (show) setCurrentPanel(id);
   };
   return <div ref={desk} className="configurable-desk">
@@ -90,20 +99,21 @@ export default function OperatorCanvas({ panels, traditional, state, session, su
       </select></label>
       {custom && <><button type="button" disabled={blocked} aria-pressed={!active.locked} onClick={() => savePreset({ ...active, locked: !active.locked })}>{active.locked ? "Arrange panels" : "Lock layout"}</button>
         <button type="button" disabled={blocked} aria-expanded={showPanels} onClick={() => setShowPanels(value => !value)}>Panels</button>
+        <button type="button" disabled={blocked || !visible.length} onClick={() => savePreset(tileDeskPanels(active, available.width, Math.max(480, available.height - 48)))}>Tile panels</button>
         {!active.locked && <label><input type="checkbox" disabled={blocked} checked={active.snap} onChange={event => savePreset({ ...active, snap: event.target.checked })} />Snap</label>}
         {compact && visible.length > 0 && <label>Panel <select aria-label="Visible desk panel" value={selected} onChange={event => setCurrentPanel(event.target.value as WorkspacePanelID)}>{visible.map(panel => <option key={panel.id} value={panel.id}>{panels[panel.id]!.title}</option>)}</select></label>}
       </>}
-      <span role="status">{state.saving || working ? "Saving layout…" : !state.snapshot ? "Loading layout…" : custom && !active.locked ? compact ? "Expand the window to arrange panels." : "Drag a panel title to move it · Drag any edge or corner to resize · Arrow keys adjust the focused control" : ""}</span>
+      <ErrorNotice><span role="status">{state.saving || working ? "Saving layout…" : !state.snapshot ? "Loading layout…" : custom && !active.locked ? compact ? "Expand the window to arrange panels." : "Drag a panel title to move it · Drag any edge or corner to resize · Arrow keys adjust the focused control" : ""}</span></ErrorNotice>
       {custom && Object.entries(panels).filter(([, panel]) => panel?.required && panel.safetyAction).map(([id, panel]) => <span className="canvas-safety-action" key={id}>{panel!.safetyAction}</span>)}
     </div>
-    {(error || state.error || subscriptionError) && <div className="canvas-recovery" role="alert"><span>{error || state.error || subscriptionError}</span>
+    {(error || state.error || subscriptionError) && <ErrorNotice><div className="canvas-recovery" role="alert"><span>{error || state.error || subscriptionError}</span>
       <button type="button" disabled={working || state.saving} onClick={() => void perform(() => session.refresh())}>Reload layout</button>
       {state.pending && <><button type="button" disabled={working || state.saving || !!state.conflict || state.workspaceChanged} onClick={() => void retryChange()}>Retry change</button>
         <button type="button" disabled={working || state.saving} onClick={() => void perform(() => session.discard())}>Use saved layout</button></>}
-    </div>}
+    </div></ErrorNotice>}
     {custom && showPanels && <fieldset className="canvas-panel-picker" disabled={blocked}><legend>Panels on this desk</legend>{Object.entries(panels).map(([id, panel]) => <label key={id}>
       <input type="checkbox" checked={visible.some(item => item.id === id) || !!panel?.required} disabled={panel?.required} onChange={event => changeVisibility(id as WorkspacePanelID, event.target.checked)} />{panel!.title}{panel?.required ? " · active device" : ""}</label>)}</fieldset>}
-    <div ref={root} className={`canvas-work-area${custom ? " is-canvas" : ""}${compact ? " is-compact" : ""}`}>
+    <div ref={root} style={custom && !compact && available.width > 0 ? { minHeight: Math.ceil(active.height * Math.min(1, available.width / active.width)) } : undefined} className={`canvas-work-area${custom ? " is-canvas" : ""}${compact ? " is-compact" : ""}`}>
       {!custom ? traditional : !visible.length ? <p className="canvas-empty">No panels shown. Choose Panels to add your working tools, or return to Traditional.</p> : visible.filter(panel => !required.some(([id]) => id === panel.id)).map(panel => <PanelFrame key={panel.id} panel={panel} preset={active} item={panels[panel.id]!} compact={compact} hidden={compact && panel.id !== selected}
         disabled={blocked} revision={`${state.snapshot!.generation}:${state.snapshot!.revision}`} onChange={value => void performChange((ticket, base) => session.applyAtBase({ action: "placePanel", presetID: active.id, panel: value }, base, ticket))}
         onHide={() => { changeVisibility(panel.id, false); toolbar.current?.focus(); }} />)}

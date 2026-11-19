@@ -92,6 +92,33 @@ public enum LocalFilePermissions {
         #endif
     }
 
+    /// Publish a validated cache staged in the destination directory.
+    public static func publishCache(at source: URL, to destination: URL) throws {
+        #if os(Windows)
+        guard let from = LocalFilePath.nativeFileSystemPath(for: source),
+              let to = LocalFilePath.nativeFileSystemPath(for: destination) else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        let error = from.withCString(encodedAs: UTF16.self) { sourcePointer in
+            to.withCString(encodedAs: UTF16.self) { destinationPointer -> DWORD? in
+                if MoveFileExW(sourcePointer, destinationPointer,
+                               DWORD(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { return nil }
+                return GetLastError()
+            }
+        }
+        if let error {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: destination.path,
+                NSUnderlyingErrorKey: NSError(domain: "Win32Error", code: Int(error))])
+        }
+        #else
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: source)
+        } else {
+            try FileManager.default.moveItem(at: source, to: destination)
+        }
+        #endif
+    }
+
     /// Restore callers retain their workspace/link checks. Native long-path
     /// renames never replace a destination or fall back to copying across volumes.
     /// Short paths retain the supplied FileManager dispatch, including failures.

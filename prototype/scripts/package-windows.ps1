@@ -394,6 +394,9 @@ try {
         }
         $noticeEvidence += [pscustomobject]@{ path = "notices/$name"; source = $noticeSources[$name]; sha256 = Hash $destination }
     }
+    $zlibPrefix = if ($env:XLOG_ZLIB_PREFIX) { $env:XLOG_ZLIB_PREFIX } else { $env:XLOG_SQLITE_PREFIX }
+    Copy-Item (Join-Path $zlibPrefix 'share/curl/copyright') (Join-Path $notices.FullName 'vcpkg-curl-copyright.txt') -ErrorAction Stop
+    Copy-Item (Join-Path $zlibPrefix 'share/zlib/copyright') (Join-Path $notices.FullName 'vcpkg-zlib-copyright.txt') -ErrorAction Stop
     $sqliteCopyright = Join-Path $env:XLOG_SQLITE_PREFIX 'share/sqlite3/copyright'
     if (-not (Test-Path $sqliteCopyright)) { throw 'Exact selected vcpkg SQLite copyright file is missing.' }
     Copy-Item $sqliteCopyright (Join-Path $notices.FullName 'vcpkg-sqlite3-copyright.txt')
@@ -401,6 +404,7 @@ try {
     foreach ($name in @('Package.resolved', 'prototype/package-lock.json', 'prototype/src-tauri/Cargo.lock')) {
         if (Test-Path (Join-Path $repoRoot $name)) { Copy-Item (Join-Path $repoRoot $name) (Join-Path $package "evidence/$(Split-Path $name -Leaf)") }
     }
+    Copy-Item (Join-Path $PSScriptRoot 'Start-xCat.cmd') (Join-Path $package 'Start-xCat.cmd')
     Copy-Item (Join-Path $PSScriptRoot 'accept-windows.ps1') (Join-Path $package 'accept-windows.ps1')
     Copy-Item (Join-Path $PSScriptRoot 'verify-python-runtime.py') (Join-Path $package 'verify-python-runtime.py')
     @"

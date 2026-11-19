@@ -1,10 +1,16 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
+#if os(Windows)
+import FoundationNetworking
+import Crypto
+import XLogPortableCore
+#else
 import CryptoKit
+import XLogCore
+#endif
 #if canImport(FoundationXML)
 import FoundationXML
 #endif
-import XLogCore
 
 protocol FldigiXMLRPCCalling: Sendable {
     func call(method: String, string: String?) async throws
@@ -137,7 +143,10 @@ public actor LiveFldigiBridge {
     public func suspendForWorkspaceChange() async {
         stopReceiver(); retireDestination(); transmitGeneration = UUID()
         let stopped = FldigiConfiguration(receiveEnabled: false, transmitEnabled: false)
-        try? save(stopped); configuration = stopped
+        if FileManager.default.fileExists(atPath: configurationURL.path) {
+            try? save(stopped)
+        }
+        configuration = stopped
         status = "Workspace changed; fldigi receive and transmit were stopped."
         await returnToReceive()
     }
@@ -341,7 +350,7 @@ public actor LiveFldigiBridge {
         let path=configurationURL.appendingPathExtension("completed.json")
         if FileManager.default.fileExists(atPath:path.path),try path.resourceValues(forKeys:[.isSymbolicLinkKey]).isSymbolicLink==true{throw WorkerFailure("unsafe_configuration","Completed-event recovery cannot use a symbolic link.")}
         try JSONEncoder().encode(completed).write(to:path,options:.atomic)
-        try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:path.path)
+        try LocalFilePermissions.protectFile(path)
     }
     private func returnToReceive(duty: UUID? = nil, retiringSend: Bool = false, emergency: Bool = false) async {
         let expected = duty ?? transmitDuty
@@ -412,9 +421,9 @@ public actor LiveFldigiBridge {
     private func save(_ value: FldigiConfiguration) throws {
         do {
             let directory = configurationURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: LocalFilePermissions.directoryAttributes)
             try JSONEncoder().encode(value).write(to: configurationURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configurationURL.path)
+            try LocalFilePermissions.protectFile(configurationURL)
             configurationPersistenceError = nil
         } catch {
             configurationPersistenceError = "Could not persist fldigi settings. Changes may be lost on restart; check storage."

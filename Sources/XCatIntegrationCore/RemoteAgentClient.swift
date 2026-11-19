@@ -1,4 +1,10 @@
 import Foundation
+#if os(Windows)
+import CClusterSocket
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 struct PendingRadioWrites: Sendable {
     private struct Value<T: Equatable & Sendable>: Sendable {
@@ -397,7 +403,7 @@ public actor RemoteAgentClient: RadioControlling {
 
     public func fetchConfiguration() async throws -> RemoteStationConfiguration {
         let request = endpoint.httpRequest(path: "/api/v1/config", token: token)
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport(request)
         try Self.validate(response: response, data: data)
         let decoded = try JSONDecoder().decode(RemoteConfigResponse.self, from: data)
         guard decoded.success else { throw XCatError.server("Remote Agent rejected the configuration request.") }
@@ -408,7 +414,7 @@ public actor RemoteAgentClient: RadioControlling {
         var request = endpoint.httpRequest(path: "/api/v1/config", token: token, method: "PUT")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(RemoteConfigUpdateRequest(config: configuration))
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport(request)
         try Self.validate(response: response, data: data)
         let decoded = try JSONDecoder().decode(RemoteConfigResponse.self, from: data)
         guard decoded.success else { throw XCatError.server("Remote Agent rejected the configuration update.") }
@@ -441,7 +447,7 @@ public actor RemoteAgentClient: RadioControlling {
 
     public func fetchConfigurationData() async throws -> Data {
         let request = endpoint.httpRequest(path: "/api/v1/config", token: token)
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport(request)
         try Self.validate(response: response, data: data)
         return try Self.configurationData(fromResponse: data)
     }
@@ -450,7 +456,7 @@ public actor RemoteAgentClient: RadioControlling {
         var request = endpoint.httpRequest(path: "/api/v1/config", token: token, method: "PUT")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try Self.configurationRequestBody(configuration)
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport(request)
         try Self.validate(response: response, data: data)
         return try Self.configurationData(fromResponse: data)
     }
@@ -473,9 +479,33 @@ public actor RemoteAgentClient: RadioControlling {
         }
     }
 
+    private func transport(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        #if os(Windows)
+        if let components = URLComponents(url: endpoint.baseURL, resolvingAgainstBaseURL: false),
+           LocalStationAgent.isLocal(components), let url = request.url, let auth = request.value(forHTTPHeaderField: "Authorization") {
+            let path = url.path, verb = request.httpMethod ?? "GET", payload = request.httpBody ?? Data()
+            let (data, code) = try await Task.detached {
+                var bytes = [UInt8](repeating: 0, count: 512 * 1024)
+                var length: Int32 = 0
+                let code = payload.withUnsafeBytes { input in
+                    bytes.withUnsafeMutableBytes { output in
+                        xlog_local_agent_http(path, verb, auth, input.baseAddress, Int32(input.count),
+                            output.baseAddress, Int32(output.count), &length)
+                    }
+                }
+                guard code > 0 else { throw XCatError.server("The local Agent did not return a complete response.") }
+                return (Data(bytes.prefix(Int(length))), Int(code))
+            }.value
+            guard let response = HTTPURLResponse(url: url, statusCode: code, httpVersion: nil, headerFields: nil) else { throw URLError(.badServerResponse) }
+            return (data, response)
+        }
+        #endif
+        return try await session.data(for: request)
+    }
+
     private func fetchState() async throws -> RemoteAgentDecodedState {
         let request = endpoint.httpRequest(path: "/api/v1/state", token: token)
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport(request)
         let receivedAt = Date()
         try Self.validate(response: response, data: data)
         return try RemoteAgentStateDecoder.stateResponse(data, receivedAt: receivedAt)
@@ -519,9 +549,33 @@ public actor RemoteAgentClient: RadioControlling {
                 if let decoded = try RemoteAgentStateDecoder.streamMessage(data, receivedAt: receivedAt) { apply(decoded) }
             }
         } catch {
+            #if os(Windows)
+            // Some deployed Agent servers serve REST but reject the WebSocket
+            // upgrade. Keep observing revisioned, timestamped hardware state.
+            guard shouldRun, generation == currentGeneration, !Task.isCancelled else { return }
+            watchdogTask?.cancel()
+            socket.cancel(with: .goingAway, reason: nil)
+            await pollState(generation: currentGeneration)
+            #else
             connectionFailed("Remote Agent stream interrupted: \(error.localizedDescription)", generation: currentGeneration)
+            #endif
         }
     }
+
+    #if os(Windows)
+    private func pollState(generation epoch: Int) async {
+        do {
+            while shouldRun, generation == epoch, !Task.isCancelled {
+                let state = try await fetchState()
+                guard shouldRun, generation == epoch, !Task.isCancelled else { return }
+                apply(state)
+                try await Task.sleep(for: .milliseconds(350))
+            }
+        } catch {
+            if !Task.isCancelled { connectionFailed("Remote Agent state polling failed.", generation: epoch) }
+        }
+    }
+    #endif
 
     func checkStreamFreshness(generation currentGeneration: Int, at now: Date = Date()) {
         guard currentGeneration == generation, shouldRun else { return }
@@ -549,7 +603,7 @@ public actor RemoteAgentClient: RadioControlling {
         for attempt in 0..<attempts {
             guard shouldRun, commandGeneration == generation, !Task.isCancelled else { throw XCatError.notConnected }
             do {
-                let (data, response) = try await session.data(for: request)
+                let (data, response) = try await transport(request)
                 guard shouldRun, commandGeneration == generation, !Task.isCancelled else { throw XCatError.notConnected }
                 let receivedAt = Date()
                 try Self.validate(response: response, data: data)

@@ -1,3 +1,5 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { formatRadioFrequency } from "./radioFrequency";
 import { lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent, type KeyboardEvent } from "react";
 import { Download, FileUp, Pencil, RotateCcw, Search, Trash2, Triangle, ExternalLink, PanelsTopLeft, ClipboardList } from "lucide-react";
 import "./logbook.css";
@@ -7,10 +9,12 @@ import { useLogbookCapacity } from "./logbookCapacity";
 import { LogbookColumnHeader, LogbookColumns, useLogbookColumns } from "./LogbookColumns";
 import { orderedLogbookColumns, type LogbookColumn, type LogbookColumnContext } from "./logbookColumnPreferences";
 import type { ADIFExportFormat, ADIFImportEncoding, ADIFFieldMetadata } from "./adifTransfer";
+import type { LogbookExportSink } from "../contesting/contestAnalyticsExport";
 import { ADIFSessionOwner } from "./adifSessionOwner";
 import { emptyLogbookQuery, logbookQuerySummary, type LogbookQuery } from "./logbookQuery";
 import { clusterBandColors, clusterModeColors, paletteColor } from "./clusterPalette";
 import { countryDisplay } from "./countryDisplay";
+import { useLogbookAppearancePreference } from "./logbookAppearance";
 import { retryStartupRead, startupReadFailureMessage } from "./startupReadRecovery";
 import type { LogbookMenuTarget } from "./LogbookContactMenu";
 
@@ -47,6 +51,8 @@ type LogbookPage = { qsos: QSO[]; total: number; offset: number; limit: number }
 type Request = (method: string, params?: Record<string, unknown>) => Promise<any>;
 // Keep worker responses and ADIF export frames bounded independently of the UI page.
 const requestPageSize = 20;
+/** Export reads take up to 100 records; the worker returns fewer when a page would near its response cap. */
+const exportPageSize = 100;
 
 function result<T>(response: any): T {
   return (response && typeof response === "object" && "result" in response
@@ -95,7 +101,7 @@ function ConfirmationStatus({ service, sent, received, supportsReceived = true }
   </span>;
 }
 
-export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutations, onChanged, onUndock, onDock, onBusyChange, onWorkingChange, disabled = false, columnContext, taskToolbar = false }: {
+export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutations, onChanged, onUndock, onDock, onBusyChange, onWorkingChange, disabled = false, columnContext, taskToolbar = false, tableOnly = false }: {
   onRequest: Request;
   onEdit: (qso: QSO) => void;
   refreshKey: number;
@@ -106,6 +112,7 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
   onWorkingChange?: (working: boolean) => void;
   columnContext?: LogbookColumnContext;
   taskToolbar?: boolean;
+  tableOnly?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState("");
@@ -133,7 +140,8 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
   const columnsID = useId();
   const columnsButton = useRef<HTMLButtonElement>(null);
   const resolvedColumnContext = columnContext ?? (onDock ? "detached" : "docked");
-  const compact = resolvedColumnContext === "desk";
+  const compact = tableOnly || resolvedColumnContext === "desk";
+  const { appearance } = useLogbookAppearancePreference();
   const [columnPreferences, setColumnPreferences] = useLogbookColumns(resolvedColumnContext);
   const orderedColumns = orderedLogbookColumns(columnPreferences);
   const visibleColumns = orderedColumns.filter(([id]) => columnPreferences.columns.includes(id));
@@ -450,8 +458,17 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
     if (scope === "selected" && (loading || !ids.length)) return;
     if (!beginWorking()) return;
     const owner = newTransfer("logbook_export_adif"), release = owner.hold();
-    setError(""); setNotice("");
+    setError(""); setNotice("Choose where to save the export…");
+    let sink: LogbookExportSink | null = null, saved = false;
     try {
+      // The destination is chosen first, so a cancel costs no read, and the
+      // prepared text streams to disk in pieces instead of one in-memory file.
+      const { openLogbookExport } = await import("../contesting/contestAnalyticsExport");
+      if (!owner.active) return;
+      sink = await openLogbookExport(format);
+      if (!owner.active) return;
+      if (!sink) { setNotice("Export cancelled."); return; }
+      setNotice("Preparing the logbook snapshot…");
       const snapshot = result<{ token: string; total: number; workspace_generation: string }>(await onRequest("logbook_export_adif", {
         action: "begin", scope, ...(scope === "filtered" ? { search, ...queryParams } : scope === "selected" ? { ids } : {}),
       }));
@@ -460,33 +477,38 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
       const total = snapshot.total;
       if (!Number.isSafeInteger(total) || total < 0 || typeof snapshot.token !== "string" || !snapshot.token) throw new Error("Export snapshot could not be verified.");
       if (!total) throw new Error("There are no QSOs to export.");
-      const { ADIFExportDocument } = await import("./adifTransfer");
+      const { ADIFExportDocument, maximumStreamedExportBytes, exportPieces } = await import("./adifTransfer");
       if (!owner.active) return;
-      const exportDocument = new ADIFExportDocument(format);
-      let exported = 0;
+      const exportDocument = new ADIFExportDocument(format, maximumStreamedExportBytes);
+      let exported = 0, pending = "";
       while (exported < total) {
         const response = result<{ text: string; count: number; fieldMetadata?: (ADIFFieldMetadata | null)[] }>(
-          await onRequest("logbook_export_adif", { action: "read", token: snapshot.token, offset: exported, limit: requestPageSize }),
+          await onRequest("logbook_export_adif", { action: "read", token: snapshot.token, offset: exported, limit: exportPageSize }),
         );
         if (!owner.active) return;
-        if (!Number.isSafeInteger(response.count) || response.count <= 0 || response.count > Math.min(requestPageSize, total - exported) || typeof response.text !== "string") {
+        if (!Number.isSafeInteger(response.count) || response.count <= 0 || response.count > Math.min(exportPageSize, total - exported) || typeof response.text !== "string") {
           throw new Error("Export stopped before the end of the logbook; its frame could not be verified.");
         }
-        exportDocument.append(response.text, response.count, response.fieldMetadata);
+        const pieces = exportPieces(pending, exportDocument.convert(response.text, response.count, response.fieldMetadata));
+        pending = pieces.pending;
+        for (const piece of pieces.ready) { await sink.append(piece); if (!owner.active) return; }
         exported += response.count;
-        setNotice(`Preparing ADIF · ${exported.toLocaleString()} of ${total.toLocaleString()} QSOs`);
+        setNotice(`Writing ADIF · ${exported.toLocaleString()} of ${total.toLocaleString()} QSOs`);
       }
-      setNotice("Choose where to save the export…");
-      const { saveLogbookFile } = await import("../contesting/contestAnalyticsExport");
+      if (pending) await sink.append(pending);
       if (!owner.active) return;
-      const outcome = await saveLogbookFile(exportDocument.finish(), format);
+      const { header, footer } = exportDocument.envelope();
+      await sink.finish(header, footer);
+      saved = true;
       if (!owner.active) return;
-      if (outcome === "Export cancelled.") { setNotice(outcome); return; }
       setNotice(`${exported.toLocaleString()} QSOs exported from the integrated logbook.`);
     } catch (cause) {
       if (!owner.active) return;
       setNotice(""); setError(errorMessage(cause));
-    } finally { release(); retireTransfer(owner); finishWorking(); }
+    } finally {
+      if (sink && !saved) void sink.abort();
+      release(); retireTransfer(owner); finishWorking();
+    }
   }
 
   const total = page?.total ?? 0;
@@ -502,8 +524,8 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
     <button type="button" disabled={busy || loading || !exportIDs.length} onClick={() => setExportSelection([])}>Clear selection</button>
   </>;
   return (
-    <section className="live-logbook" aria-label="Integrated logbook">
-      {compact ? <div className="live-logbook-compact-actions">
+    <section className={`live-logbook${appearance === "classic" ? " is-classic" : ""}${tableOnly ? " is-table-only" : ""}`} aria-label="Integrated logbook">
+      {compact ? !tableOnly && <div className="live-logbook-compact-actions">
         {mutation.undo && <button type="button" onClick={() => void undoDelete()} disabled={busy}><RotateCcw size={13} /> Undo delete</button>}
         {columnsControl}
       </div> : <header className={`live-logbook-head${taskToolbar ? " live-logbook-task-toolbar" : ""}`}>
@@ -552,20 +574,20 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
       </header>}
       {columnsOpen && <LogbookColumns id={columnsID} preferences={columnPreferences} onChange={setColumnPreferences} context={resolvedColumnContext}
         onDone={() => { setColumnsOpen(false); columnsButton.current?.focus(); }} />}
-      {ctyPreviewOpen && <Suspense fallback={<p role="status">Opening country preview…</p>}><CTYCorrectionPreview onRequest={onRequest} refreshKey={refreshKey}
+      {ctyPreviewOpen && <Suspense fallback={<ErrorNotice><p role="status">Opening country preview…</p></ErrorNotice>}><CTYCorrectionPreview onRequest={onRequest} refreshKey={refreshKey}
         queryContext={{ search, ...queryParams }} onChanged={() => { setReadRetry(value => value + 1); onChanged?.(); }} /></Suspense>}
-      {followUpOpen && selected && <Suspense fallback={<p role="status">Opening upload follow-up…</p>}><OnlineLogFollowUpPanel key={selected.id} contactID={selected.id} call={selected.call} onRequest={onRequest} refreshKey={refreshKey} onClose={() => setFollowUpOpen(false)} /></Suspense>}
-      {filtersOpen && <Suspense fallback={<p role="status">Loading contact filter controls…</p>}>
+      {followUpOpen && selected && <Suspense fallback={<ErrorNotice><p role="status">Opening upload follow-up…</p></ErrorNotice>}><OnlineLogFollowUpPanel key={selected.id} contactID={selected.id} call={selected.call} onRequest={onRequest} refreshKey={refreshKey} onClose={() => setFollowUpOpen(false)} /></Suspense>}
+      {filtersOpen && <Suspense fallback={<ErrorNotice><p role="status">Loading contact filter controls…</p></ErrorNotice>}>
         <LogbookFilterBuilder value={filterDraft} onChange={setFilterDraft} onApply={() => applyFilter()} disabled={busy} />
         <LogbookSavedFilters onRequest={onRequest} currentQuery={query} currentDefinition={filterDraft} disabled={busy}
           onApply={(value, definition) => { const next = definition ?? emptyLogbookQuery(); setQuery(value); setFilterDraft(next); applyFilter(value, next); }} />
       </Suspense>}
-      {!compact && filter.clauses.length > 0 && <p role="status">Active filter · {logbookQuerySummary(filter)} · {total.toLocaleString()} contacts · relative periods fixed at {referenceTime}
-        <button type="button" disabled={busy} onClick={() => { setQuery(""); setFilterDraft(emptyLogbookQuery()); applyFilter("", emptyLogbookQuery()); }}>Reset filter and search</button></p>}
-      {error && <p className="live-logbook-feedback error" role="alert">{error} <button type="button" disabled={loading} onClick={() => setReadRetry(value => value + 1)}>Retry logbook</button></p>}
-      {notice && <p className="live-logbook-feedback" role="status">{notice}</p>}
-      {potaExportSelection && <Suspense fallback={<p role="status">Loading POTA export controls…</p>}><POTAExportPanel request={onRequest} readScope={readScope} selection={potaExportSelection} onClose={() => setPotaExportSelection(null)} onWorking={value => { setBusy(value); localWorking.current=value; workingChanged.current?.(value); }} /></Suspense>}
-    {readStale && !loading && <p className="live-logbook-feedback" role="status">Refresh unavailable. Showing the previous page. <button type="button" onClick={() => setReadRetry(value => value + 1)}>Retry logbook</button></p>}
+      {!compact && filter.clauses.length > 0 && <ErrorNotice><p role="status">Active filter · {logbookQuerySummary(filter)} · {total.toLocaleString()} contacts · relative periods fixed at {referenceTime}
+        <button type="button" disabled={busy} onClick={() => { setQuery(""); setFilterDraft(emptyLogbookQuery()); applyFilter("", emptyLogbookQuery()); }}>Reset filter and search</button></p></ErrorNotice>}
+      {error && <ErrorNotice><p className="live-logbook-feedback error" role="alert">{error} <button type="button" disabled={loading} onClick={() => setReadRetry(value => value + 1)}>Retry logbook</button></p></ErrorNotice>}
+      {notice && <ErrorNotice when={true} title="Message"><p className="live-logbook-feedback" role="status">{notice}</p></ErrorNotice>}
+      {potaExportSelection && <Suspense fallback={<ErrorNotice><p role="status">Loading POTA export controls…</p></ErrorNotice>}><POTAExportPanel request={onRequest} readScope={readScope} selection={potaExportSelection} onClose={() => setPotaExportSelection(null)} onWorking={value => { setBusy(value); localWorking.current=value; workingChanged.current?.(value); }} /></Suspense>}
+    {readStale && !loading && <ErrorNotice><p className="live-logbook-feedback" role="status">Refresh unavailable. Showing the previous page. <button type="button" onClick={() => setReadRetry(value => value + 1)}>Retry logbook</button></p></ErrorNotice>}
       {importReview && <div className="live-logbook-feedback" role="group" aria-label="Review ADIF import">
         <p>Source encoding: {importReview.encoding === "utf-8" ? "UTF-8" : importReview.encoding === "windows-1252" ? "Windows-1252" : "ISO-8859-1"}. Review uses normalized UTF-8 ADI.</p>
         <p>{importReview.name} · {importReview.records.toLocaleString()} validated records. {updateDuplicates ? "Duplicate policy: update only selected fields of reviewed existing contacts." : "Duplicate policy: skip existing contacts and repeated records; existing fields remain unchanged."}</p>
@@ -586,14 +608,14 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
             cancelDelete(); if (compact && deleteMenuOrigin.current?.isConnected) deleteMenuOrigin.current.focus();
           }} disabled={busy}>Cancel</button></div>
       </div>}
-      {!compact && details && selected && <Suspense fallback={<p role="status">Opening contact details…</p>}><LogbookContactReview key={`${selected.id}:${refreshKey}:${search}:${offset}`} contactID={selected.id} call={selected.call}
+      {!compact && details && selected && <Suspense fallback={<ErrorNotice><p role="status">Opening contact details…</p></ErrorNotice>}><LogbookContactReview key={`${selected.id}:${refreshKey}:${search}:${offset}`} contactID={selected.id} call={selected.call}
         pageContext={page} pageLoading={loading} onRequest={onRequest} onCountryChanged={() => { setReadRetry(value => value + 1); onChanged?.(); }} renderContact={snapshot => {
           const selected = snapshot.qso as QSO;
           return <dl className="live-logbook-details">
         <div><dt>Callsign</dt><dd>{selected.call}</dd></div>
         <div><dt>UTC</dt><dd>{utcTime(selected.start)}</dd></div>
         <div><dt>Band / Mode</dt><dd>{selected.band} · {selected.submode || selected.mode}</dd></div>
-        <div><dt>Frequency MHz</dt><dd>{typeof selected.frequencyHz === "number" ? (selected.frequencyHz / 1_000_000).toFixed(6) : "—"}</dd></div>
+        <div><dt>Frequency MHz</dt><dd>{typeof selected.frequencyHz === "number" ? formatRadioFrequency(selected.frequencyHz) : "—"}</dd></div>
         <div><dt>RST sent / received</dt><dd>{selected.rstSent || "—"} / {selected.rstReceived || "—"}</dd></div>
         <div><dt>Country / Name</dt><dd>{countryDisplay(selected.country) || "—"}{selected.name ? ` · ${selected.name}` : ""}</dd></div>
         <div className="live-logbook-details-qsl"><dt>Confirmations</dt><dd>
@@ -641,7 +663,7 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
                 <span className={`live-logbook-sync-dot ${qso.isDirty ? "is-pending" : "is-clean"}`} role="img" aria-label={qso.isDirty ? "Pending synchronization" : "No pending changes"} title={qso.isDirty ? "Pending synchronization" : "No pending changes"} />{qso.call}</td>,
               <td key="band" hidden={hidden("band")} data-label="Band" className="live-logbook-band" title={qso.band}><span className="live-logbook-category" style={{ color: paletteColor(qso.band, undefined, clusterBandColors) }}>{qso.band}</span></td>,
               <td key="mode" hidden={hidden("mode")} data-label="Mode" className="live-logbook-band" title={qso.submode || qso.mode}><span className="live-logbook-category" style={{ color: paletteColor(qso.submode || qso.mode, undefined, clusterModeColors) }}>{qso.submode || qso.mode}</span></td>,
-              <td key="frequency" hidden={hidden("frequency")} data-label="Frequency" className="live-logbook-frequency mono">{typeof qso.frequencyHz === "number" ? (qso.frequencyHz / 1_000_000).toFixed(6) : "—"}</td>,
+              <td key="frequency" hidden={hidden("frequency")} data-label="Frequency" className="live-logbook-frequency mono">{typeof qso.frequencyHz === "number" ? formatRadioFrequency(qso.frequencyHz) : "—"}</td>,
               <td key="rst" hidden={hidden("rst")} data-label="RST" className="mono" aria-label={`RST sent ${qso.rstSent || "not recorded"}, received ${qso.rstReceived || "not recorded"}`}>{qso.rstSent || "—"} / {qso.rstReceived || "—"}</td>,
               <td key="country" hidden={hidden("country")} data-label="Country" title={[countryDisplay(qso.country), qso.name].filter(Boolean).join(" · ") || undefined}>{countryDisplay(qso.country) || "—"}</td>,
               <td key="qsl" hidden={hidden("qsl")} data-label="QSL"><ConfirmationStatus service="QSL" sent={qso.qslSent} received={qso.qslReceived} /></td>,
@@ -662,6 +684,7 @@ export function LogbookPanel({ onRequest, onEdit, refreshKey, readScope, mutatio
       <footer className="live-logbook-footer">
         <span>{!page && loading ? "Loading logbook…" : !page && error ? "Logbook unavailable" : total ? `${offset + 1}–${Math.min(offset + rows.length, total)} of ${total.toLocaleString()}` : "0 contacts"}</span>
         <div>
+          {tableOnly && <>{mutation.undo && <button type="button" onClick={() => void undoDelete()} disabled={busy}><RotateCcw size={13} /> Undo delete</button>}{columnsControl}</>}
           <button type="button" onClick={() => { cancelDelete(); setOffset(Math.max(0, offset - pageSize)); }} disabled={loading || offset === 0}>Previous</button>
           <button type="button" onClick={() => { cancelDelete(); setOffset(offset + pageSize); }} disabled={loading || offset + pageSize >= total}>Next</button>
         </div>

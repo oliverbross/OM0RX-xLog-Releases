@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ContestCallStackPanel } from "./ContestCallStackPanel";
 import { ContestCallStack, callStackStorageKey, occupiedStackDraft, partialStackCall, restoreCallStack,
@@ -81,7 +82,7 @@ function ScopedContestCallStackOwner(props: ContestCallStackOwnerProps) {
     catch (cause) { latest.current.onError(message(cause)); }
   };
   if (!holder.controller || !state) return <section aria-label="Call Stack"><h2>Call Stack</h2>
-    <p role="alert">{holder.error || "Call Stack is unavailable."} Saved recovery data has been preserved.</p></section>;
+    <ErrorNotice><p role="alert">{holder.error || "Call Stack is unavailable."} Saved recovery data has been preserved.</p></ErrorNotice></section>;
   return <ContestCallStackPanel state={state} disabled={props.disabled} occupied={occupiedStackDraft(props.draft)}
     currentCallsign={props.draft.fields.callsign ?? ""} classifications={classifications} classificationScope={classificationScope}
     onAdd={callsign => run(controller => controller.add(callsign))}

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestRequest } from "./types";
 import type { StrategyScope } from "./ContestReminders";
@@ -19,7 +20,7 @@ export function ContestDeveloperKit({scope,request}:{scope:StrategyScope;request
     <details><summary>Unsupported UDC inspection</summary><p>Inspection retains the supplied text and diagnoses unsupported declarations. It never executes commands, converts rules or installs a definition. General UDC conversion remains deferred.</p>
       <label>Original UDC text<textarea aria-label="Original UDC text" rows={5} maxLength={65536} value={text} disabled={working} onChange={event=>{ticket.current++;setReview(null);setText(event.target.value);}}/></label>
       <button disabled={working||!text} onClick={()=>void read(true)}>Inspect without executing or installing</button></details>
-    {error&&<p role="alert">{error}</p>}{review&&<><p>{review.converted===false?"Conversion rejected; original input retained in this diagnostic.":"Bundled reference example; no new definition is installed."}</p>
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{review&&<><p>{review.converted===false?"Conversion rejected; original input retained in this diagnostic.":"Bundled reference example; no new definition is installed."}</p>
       <button onClick={()=>void navigator.clipboard.writeText(JSON.stringify(review,null,2)).catch(cause=>setError(String(cause)))}>Copy developer evidence</button>
       <pre aria-label="Developer manifest and diagnostics" style={{whiteSpace:"pre-wrap",overflowWrap:"anywhere"}}>{JSON.stringify(review,null,2)}</pre></>}
   </section>;

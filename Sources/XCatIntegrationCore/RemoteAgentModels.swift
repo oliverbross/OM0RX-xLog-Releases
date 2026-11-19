@@ -1,4 +1,17 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+public enum LocalStationAgent {
+    public static let address = "http://127.0.0.1:8840"
+
+    public static func isLocal(_ components: URLComponents) -> Bool {
+        components.scheme == "http" && components.host == "127.0.0.1" && components.port == 8840
+            && ["", "/"].contains(components.path) && components.user == nil && components.password == nil
+            && components.query == nil && components.fragment == nil
+    }
+}
 
 struct RemoteAgentEndpoint: Equatable, Sendable {
     let baseURL: URL
@@ -6,7 +19,7 @@ struct RemoteAgentEndpoint: Equatable, Sendable {
     init(_ rawValue: String) throws {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: trimmed),
-              components.scheme?.lowercased() == "https",
+              (components.scheme?.lowercased() == "https" || LocalStationAgent.isLocal(components)),
               components.host?.isEmpty == false,
               components.user == nil,
               components.password == nil,
@@ -40,7 +53,7 @@ struct RemoteAgentEndpoint: Equatable, Sendable {
 
     private func url(path: String, webSocket: Bool) -> URL {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
-        if webSocket { components.scheme = "wss" }
+        if webSocket { components.scheme = components.scheme == "http" ? "ws" : "wss" }
         let basePath = components.path == "/" ? "" : components.path
         components.path = basePath + (path.hasPrefix("/") ? path : "/\(path)")
         return components.url!
@@ -360,7 +373,7 @@ enum RemoteAgentStateDecoder {
             radio.drive
         }
         let measuredTransmitPower = measuredPower(radio: radio, kpa: kpa, receivedAt: receivedAt)
-        let status = RemoteStationStatus(
+        var status = RemoteStationStatus(
             revision: state.revision,
             radioKnown: radioKnown,
             radioStale: radioStale,
@@ -388,6 +401,9 @@ enum RemoteAgentStateDecoder {
             katDetailSecondary: katDetailSecondary(kat),
             routeDetail: path?.routeLabel ?? routeSummary(route)
         )
+        let instrumentEncoder = JSONEncoder()
+        instrumentEncoder.outputFormatting = .sortedKeys
+        status.instrumentReadings = try state.elecraft.map { try instrumentEncoder.encode($0) }
         let fallbackFrequency = try radio.resolvedFrequencyHz() ?? 0
         let rfPowerWatts: Int?
         if let drive = radio.drive {
@@ -727,14 +743,15 @@ private struct RouteDTO: Decodable {
     }
 }
 
-private struct ElecraftDTO: Decodable {
+private struct ElecraftDTO: Codable {
     let kpa500: KPADTO?
     let kat500: KATDTO?
 }
 
-private struct KPADTO: Decodable {
+private struct KPADTO: Codable {
     let enabled: Bool?
     let connected: Bool?
+    let responsive: Bool?
     let operate: Bool?
     let fault: String?
     let band: String?
@@ -753,7 +770,7 @@ private struct KPADTO: Decodable {
     let meterError: String?
 
     enum CodingKeys: String, CodingKey {
-        case enabled, connected, operate, fault, band, swr, voltage, current, firmware, quality
+        case enabled, connected, responsive, operate, fault, band, swr, voltage, current, firmware, quality
         case outputPowerW = "output_power_w"
         case swrLive = "swr_live"
         case temperatureC = "temperature_c"
@@ -765,9 +782,10 @@ private struct KPADTO: Decodable {
     }
 }
 
-private struct KATDTO: Decodable {
+private struct KATDTO: Codable {
     let enabled: Bool?
     let connected: Bool?
+    let responsive: Bool?
     let antenna: Int?
     let bypass: Bool?
     let tuning: Bool?
@@ -777,6 +795,8 @@ private struct KATDTO: Decodable {
     let forwardADC: Double?
     let reflectedADC: Double?
     let swrSample: Double?
+    let bypassSWR: Double?
+    let frequencyKHz: Double?
     let swrLive: Bool?
     let swrValid: Bool?
     let ampKeyInterrupted: Bool?
@@ -784,10 +804,12 @@ private struct KATDTO: Decodable {
     let quality: String?
 
     enum CodingKeys: String, CodingKey {
-        case enabled, connected, antenna, bypass, tuning, fault, mode, band, firmware, quality
+        case enabled, connected, responsive, antenna, bypass, tuning, fault, mode, band, firmware, quality
         case forwardADC = "forward_adc"
         case reflectedADC = "reflected_adc"
         case swrSample = "swr_sample"
+        case bypassSWR = "bypass_swr"
+        case frequencyKHz = "frequency_khz"
         case swrLive = "swr_live"
         case swrValid = "swr_valid"
         case ampKeyInterrupted = "amp_key_interrupted"

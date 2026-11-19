@@ -58,8 +58,9 @@ pub struct WindowSpec {
     pub width: f64,
     pub height: f64,
 }
-pub const SUPPORTED_WINDOWS: [WindowSpec; 26] = [
+pub const SUPPORTED_WINDOWS: [WindowSpec; 28] = [
     WindowSpec { id: "about", title: "About OM0RX-xLog", width: 440.0, height: 530.0 },
+    WindowSpec { id: "elecraft", title: "OM0RX-xLog — KPA500 & KAT500", width: 1060.0, height: 850.0 },
     WindowSpec { id: "hm-control", title: "OM0RX-xLog — HM Control", width: 1440.0, height: 850.0 },
     WindowSpec { id: "operating-goals", title: "OM0RX-xLog — Operating Goals", width: 900.0, height: 700.0 },
     WindowSpec { id: "previous-qsos", title: "OM0RX-xLog — Previous QSOs", width: 860.0, height: 600.0 },
@@ -69,7 +70,7 @@ pub const SUPPORTED_WINDOWS: [WindowSpec; 26] = [
     WindowSpec { id: "monitor", title: "OM0RX-xLog — Station Monitor", width: 780.0, height: 600.0 },
     WindowSpec { id: "world-map", title: "OM0RX-xLog — World Map", width: 1100.0, height: 720.0 },
     WindowSpec { id: "dxpedition-map", title: "OM0RX-xLog — DXpedition Map", width: 1240.0, height: 800.0 },
-    WindowSpec { id: "band-maps", title: "OM0RX-xLog — Band Maps", width: 920.0, height: 760.0 },
+    WindowSpec { id: "band-maps", title: "OM0RX-xLog — Band Map (choose band)", width: 920.0, height: 760.0 },
     WindowSpec { id: "dx-cluster", title: "OM0RX-xLog — DX Cluster", width: 1180.0, height: 800.0 },
     WindowSpec { id: "logbook", title: "OM0RX-xLog — Logbook", width: 1280.0, height: 800.0 },
     WindowSpec { id: "awards", title: "OM0RX-xLog — Awards", width: 1280.0, height: 800.0 },
@@ -83,7 +84,8 @@ pub const SUPPORTED_WINDOWS: [WindowSpec; 26] = [
     WindowSpec { id: "connection-doctor", title: "OM0RX-xLog — Connection Doctor", width: 700.0, height: 600.0 },
     WindowSpec { id: "propagation", title: "OM0RX-xLog — Propagation", width: 800.0, height: 240.0 },
     WindowSpec { id: "station-identity", title: "OM0RX-xLog — Station Identity", width: 780.0, height: 650.0 },
-    WindowSpec { id: "alerts", title: "OM0RX-xLog — Alerts", width: 780.0, height: 600.0 },
+    WindowSpec { id: "alerts", title: "OM0RX-xLog — Alerts", width: 1180.0, height: 760.0 },
+    WindowSpec { id: "special", title: "OM0RX-xLog — Special", width: 980.0, height: 640.0 },
     WindowSpec { id: "antenna", title: "OM0RX-xLog — Antenna Reference", width: 780.0, height: 600.0 },
 ];
 pub const CONTEST_LABEL_PREFIX: &str = "contest--";
@@ -207,9 +209,9 @@ pub fn native_minimum(label: &str) -> (f64, f64) {
     }
 }
 
-const ROLES: [&str; 21] = ["active-qso", "log-qso", "logbook", "callsign-intelligence", "rotor", "antenna",
+pub(crate) const ROLES: [&str; 24] = ["active-qso", "log-qso", "logbook", "callsign-intelligence", "rotor", "antenna",
     "world-map", "band-maps", "dx-cluster", "station-control", "station-status", "station-identity",
-    "cw", "alerts", "propagation", "settings", "sync", "awards", "chaser-dx", "spot-history", "monitor"];
+    "cw", "alerts", "propagation", "settings", "sync", "awards", "chaser-dx", "spot-history", "monitor", "previous-qsos", "kpa500", "kat500"];
 const MAX_REVISION: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +298,7 @@ fn identifier(value: &Value) -> Result<&str, String> {
 fn minimum(id: &str) -> (f64, f64) {
     match id {
         "active-qso" => (520.0, 240.0), "callsign-intelligence" => (360.0, 240.0),
+        "previous-qsos" => (280.0, 160.0), "kpa500" | "kat500" => (200.0, 120.0),
         "rotor" | "antenna" => (240.0, 240.0),
         "world-map" | "band-maps" | "dx-cluster" => (280.0, 200.0),
         "station-status" | "station-identity" | "propagation" | "cw" | "alerts" => (240.0, 80.0),
@@ -324,7 +327,7 @@ fn checked(snapshot: &Value, scope: WorkspaceWindowScope) -> Result<(Intent, u64
     if !valid_layout_generation(&snapshot["generation"]) { return Err(invalid()); }
     let revision = snapshot["revision"].as_u64().filter(|revision| *revision <= MAX_REVISION).ok_or_else(invalid)?;
     let document = &snapshot["document"];
-    if document["version"].as_u64() != Some(2) { return Err(invalid()); }
+    if document["version"].as_u64() != Some(3) { return Err(invalid()); }
     let active = identifier(&document["activePresetID"])?;
     let presets = document["presets"].as_array().filter(|presets| (1..=12).contains(&presets.len())).ok_or_else(invalid)?;
     let mut ids = BTreeSet::new();
@@ -460,7 +463,7 @@ mod tests {
                 "rect":{"x":0,"y":0,"width":width,"height":height},"z":z})
         }).collect();
         json!({"generation":"12345678-1234-1234-1234-123456789abc","revision":4,
-            "document":{"version":2,"activePresetID":"desk","presets":[{"id":"desk","name":"Desk","width":1920,"height":1080,
+            "document":{"version":3,"activePresetID":"desk","presets":[{"id":"desk","name":"Desk","width":1920,"height":1080,
                 "locked":true,"snap":true,"panels":panels}]}})
     }
     #[test]
@@ -533,7 +536,7 @@ mod tests {
     #[test]
     fn registry_covers_only_real_windows() {
         let ids: BTreeSet<_> = SUPPORTED_WINDOWS.iter().map(|window| window.id).collect();
-        assert_eq!(ids.len(), 26);
+        assert_eq!(ids.len(), 28);
         let capabilities: Value = serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
         for id in &ids { assert!(capabilities["windows"].as_array().unwrap().contains(&json!(id))); }
         for window in SUPPORTED_WINDOWS {

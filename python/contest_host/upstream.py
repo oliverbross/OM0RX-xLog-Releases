@@ -178,6 +178,7 @@ def load_plugin(plugin_id="cq_ww_cw"):
     import_module("not1mm.lib")
     if "not1mm.lib.plugin_common" not in sys.modules:
         overlay("not1mm.lib.plugin_common", [
+            ("str(Path.home())", "str(self.export_directory)", 2),
             ("import adif_io\n", "# adif_io is loaded only by the unsupported import callback.\n"),
             ("from PyQt6.QtCore import QCoreApplication, Qt", "from contest_host.qt_compat import QCoreApplication, Qt"),
             ("from PyQt6.QtWidgets import QApplication, QDialog, QProgressDialog, QPushButton", "from contest_host.qt_compat import QApplication, QDialog, QProgressDialog, QPushButton"),
@@ -202,6 +203,20 @@ def load_plugin(plugin_id="cq_ww_cw"):
             # emitted 14 rather than 14080, outside Cabrillo's HF contract.
             replacements.append(('freq = contact.get("Freq", "0") / 1000',
                                  'freq = float(contact.get("Freq", "0"))'))
+        if plugin_id in {"sac_cw", "sac_ssb"}:
+            # SAC rules: a Scandinavian station's multipliers are the
+            # non-Scandinavian DXCC entities worked per band. Upstream counted
+            # every country/band, so a zero-point Scandinavian-to-Scandinavian
+            # contact still added a multiplier. Scored contacts are exactly the
+            # non-Scandinavian ones, so count country/band among those.
+            replacements.append((
+                "        result = self.database.fetch_country_band_count()\n",
+                "        if self.state.get(\"scoringRevision\") == \"26.10.26\":\n"
+                "            result = self.database.exec_sql(\n"
+                "                \"SELECT count(DISTINCT(CountryPrefix || ':' || Band)) AS cb_count FROM DXLOG \"\n"
+                "                \"WHERE ContestNR = ? AND Points > 0\", (self.database.current_contest,))\n"
+                "        else:\n"
+                "            result = self.database.fetch_country_band_count()\n"))
         if plugin_id in {"cq_wpx_rtty", "arrl_rtty_ru"}:
             replacements.append(('themode = contact.get("Mode", "")',
                                  'themode = "RY"'))

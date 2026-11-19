@@ -22,6 +22,7 @@ mod map_context;
 mod hm_control;
 mod monitor_context;
 mod connection_doctor;
+mod elecraft;
 mod contest_export;
 mod spot_identity;
 mod spot_editor_barrier;
@@ -34,9 +35,29 @@ mod guide_marker_tune;
 mod tci_filter;
 mod radio_release;
 mod carrier_tune;
+mod output_authority;
 mod ptt_session;
 mod amplifier_transition;
 mod manual_rotor;
+mod companion_bridge;
+mod companion_bearing;
+mod companion_contact_detail;
+mod companion_host;
+mod companion_connection;
+mod companion_audio_config;
+mod companion_identity;
+mod companion_needs;
+mod companion_projection;
+mod companion_rx;
+mod companion_rx_buffer;
+mod companion_rx_lifecycle;
+mod companion_tx;
+mod companion_tx_timing;
+mod companion_tx_contract;
+mod companion_tx_prepare;
+mod companion_tx_audio;
+mod companion_tx_context;
+mod companion_tx_journal;
 mod radio_follow;
 mod opportunity_selection;
 mod auto_rotor;
@@ -72,14 +93,19 @@ mod contest_group_replica;
 mod contest_log_transfer;
 mod contest_log_review;
 mod contest_analytics;
+mod logbook_export_stream;
+mod wsjtx_follow;
+mod worker_health;
+#[cfg(test)]
+mod test_support;
 mod contest_lane_output;
 mod contest_voice;
 mod voice_audio;
 mod contest_recorder;
 mod contest_recorder_store;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod contest_recorder_audio;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod contest_recorder_acceptance;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID};
@@ -97,7 +123,9 @@ static WORKSPACE_PRESENTATION: Mutex<bool> = Mutex::new(false);
 static WORKSPACE_MENU_WINDOWS: AtomicBool = AtomicBool::new(false);
 static FOREGROUND_PRESENTATION: Mutex<()> = Mutex::new(());
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
 static CONTEST_QUIT_PREPARING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
 static CONTEST_QUIT_PREPARED: AtomicBool = AtomicBool::new(false);
 static MAIN_WORKSPACE_REOPENED: AtomicBool = AtomicBool::new(false);
 static SCP_IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -675,6 +703,7 @@ fn workspace_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // Window, Help, and macOS View/Fullscreen menus or keyboard shortcuts.
     let menu = Menu::default(app)?;
     replace_about_menu(app, &menu)?;
+    append_feedback_menu(app, &menu)?;
     append_workspace_settings(app, &menu)?;
     let compact = MenuItem::with_id(
         app,
@@ -761,7 +790,7 @@ fn append_logbook_menu(app: &tauri::AppHandle, menu: &Menu<tauri::Wry>) -> tauri
             &screen.title, true, screen.shortcut.as_deref())?)?;
     }
     logbook.append(&MenuItem::with_id(app, LOGBOOK_OPEN_WINDOW_MENU_ID,
-        "Logbook", true, None::<&str>)?)?;
+        "Open Logbook in a Separate Window", true, None::<&str>)?)?;
     logbook.append(&PredefinedMenuItem::separator(app)?)?;
     logbook.append(&MenuItem::with_id(app, LOGBOOK_IMPORT_ADIF_MENU_ID,
         "Import ADIF…", true, None::<&str>)?)?;
@@ -884,6 +913,15 @@ fn window_menu_includes(id: &str) -> bool {
 }
 
 
+fn append_feedback_menu(app: &tauri::AppHandle, menu: &Menu<tauri::Wry>) -> tauri::Result<()> {
+    let item = MenuItem::with_id(app, "feedback_history", "Recent messages…", true, None::<&str>)?;
+    for submenu in menu.items()?.iter().filter_map(|item| item.as_submenu().cloned()) {
+        if submenu.text()? == "Help" { submenu.append(&item)?; return Ok(()); }
+    }
+    menu.append(&Submenu::with_items(app, "Help", true, &[&item])?)?;
+    Ok(())
+}
+
 fn replace_about_menu(app: &tauri::AppHandle, menu: &Menu<tauri::Wry>) -> tauri::Result<()> {
     let title = PredefinedMenuItem::about(app, None, None)?.text()?;
     for submenu in menu.items()?.iter().filter_map(|item| item.as_submenu().cloned()) {
@@ -926,21 +964,27 @@ fn append_workspace_settings(app: &tauri::AppHandle, menu: &Menu<tauri::Wry>) ->
     #[cfg(not(target_os = "macos"))]
     parent.append_items(&[&separator, &settings])?;
     #[cfg(target_os = "macos")]
+    parent.insert_items(&[&settings, &separator], 2)?;
+    #[cfg(any(target_os = "macos", windows))]
     {
-        parent.insert_items(&[&settings, &separator], 2)?;
-        // Muda's predefined macOS Quit invokes Cocoa terminate: directly, which
-        // bypasses cancellable Tauri ExitRequested. Keep Cmd-Q and the existing
-        // menu position, but enter our correlated draft/output preparation path.
-        let cocoa_quit = PredefinedMenuItem::quit(app, None)?;
+        // Both Cocoa terminate: and Win32 PostQuitMessage bypass our guarded
+        // exit request. Keep the platform menu title, shortcut and position.
+        #[cfg(target_os = "macos")]
+        let quit_menu = parent;
+        #[cfg(windows)]
+        let quit_menu = menu.items()?.into_iter().filter_map(|item| item.as_submenu().cloned())
+            .find(|submenu| submenu.text().is_ok_and(|text| text == "File"))
+            .ok_or_else(|| tauri::Error::Io(std::io::Error::other("File menu is unavailable")))?;
+        let native_quit = PredefinedMenuItem::quit(app, None)?;
         // Predefined items have instance IDs, not stable IDs by command kind.
         // Compare only predefined entries with the platform's exact Quit title.
-        let quit_title = cocoa_quit.text()?;
-        let position = parent.items()?.iter().position(|item| item.as_predefined_menuitem()
+        let quit_title = native_quit.text()?;
+        let position = quit_menu.items()?.iter().position(|item| item.as_predefined_menuitem()
             .is_some_and(|item| item.text().is_ok_and(|title| title == quit_title)))
             .ok_or_else(|| tauri::Error::Io(std::io::Error::other("Application Quit item is unavailable")))?;
         let guarded_quit = MenuItem::with_id(app, "workspace_guarded_quit", quit_title, true, Some("CmdOrCtrl+Q"))?;
-        parent.remove_at(position)?;
-        parent.insert(&guarded_quit, position)?;
+        quit_menu.remove_at(position)?;
+        quit_menu.insert(&guarded_quit, position)?;
     }
     Ok(())
 }
@@ -1192,6 +1236,7 @@ fn ensure_contest_setup_window_for(app: &tauri::AppHandle, foreground: bool,
             builder = builder.data_directory(directory);
         }
         let window = runtime_profile::offline_webview(builder).build().map_err(|error| error.to_string())?;
+        configure_detached_chrome(&window)?;
         if app.state::<acceptance::Acceptance>().path.is_none() { detached_geometry::install(&window); }
         Ok(window)
     })?;
@@ -1217,6 +1262,7 @@ fn ensure_contest_analytics_window(app: &tauri::AppHandle) -> Result<(), String>
             .incognito(app.state::<acceptance::Acceptance>().path.is_some());
         if let Some(directory) = app.state::<acceptance::Acceptance>().detached_browser_context()? { builder = builder.data_directory(directory); }
         let window = runtime_profile::offline_webview(builder).build().map_err(|error| error.to_string())?;
+        configure_detached_chrome(&window)?;
         if app.state::<acceptance::Acceptance>().path.is_none() { detached_geometry::install(&window); }
         Ok(window)
     })?;
@@ -1231,6 +1277,7 @@ fn ensure_contest_recorder_window(app: &tauri::AppHandle) -> Result<(), String> 
             tauri::WebviewUrl::App("index.html?view=contest-recorder&scope=contesting".into()))
             .title("OM0RX-xLog Contest — Recorder").inner_size(1000.0, 760.0).min_inner_size(620.0, 480.0)
             .build().map_err(|e| e.to_string())?;
+        configure_detached_chrome(&window)?;
         detached_geometry::install(&window); Ok(window)
     })?;
     window.unminimize().map_err(|e| e.to_string())?;
@@ -1250,6 +1297,7 @@ fn ensure_contest_log_review_window(app: &tauri::AppHandle) -> Result<(), String
             .incognito(app.state::<acceptance::Acceptance>().path.is_some());
         if let Some(directory) = app.state::<acceptance::Acceptance>().detached_browser_context()? { builder = builder.data_directory(directory); }
         let window = runtime_profile::offline_webview(builder).build().map_err(|error| error.to_string())?;
+        configure_detached_chrome(&window)?;
         if app.state::<acceptance::Acceptance>().path.is_none() { detached_geometry::install(&window); }
         Ok(window)
     })?;
@@ -1268,6 +1316,7 @@ fn ensure_contest_log_transfer_window_with_presentation(app: &tauri::AppHandle, 
             .incognito(app.state::<acceptance::Acceptance>().path.is_some());
         if let Some(directory) = app.state::<acceptance::Acceptance>().detached_browser_context()? { builder = builder.data_directory(directory); }
         let window = runtime_profile::offline_webview(builder).build().map_err(|error| error.to_string())?;
+        configure_detached_chrome(&window)?;
         if app.state::<acceptance::Acceptance>().path.is_none() { detached_geometry::install(&window); }
         Ok(window)
     })?;
@@ -2148,7 +2197,7 @@ fn choose_history_file(window: tauri::WebviewWindow,generation:u64) -> Result<Op
     let app=window.app_handle().clone();
     dispatch_private_picker("Call-history preview",generation,worker::generation(),APP_EXITING.load(Ordering::Acquire),
         app.get_webview_window(CONTEST_CALL_HISTORY_WINDOW).is_some(),|| {
-        Ok(rfd::FileDialog::new().set_title("Choose an operator-managed call-history file").pick_file())
+        Ok(rfd::FileDialog::new().set_parent(&window).set_title("Choose an operator-managed call-history file").pick_file())
     })
 }
 
@@ -2157,7 +2206,7 @@ fn choose_scp_file(window: tauri::WebviewWindow,generation:u64) -> Result<Option
     let app=window.app_handle().clone();
     dispatch_private_picker("SCP import",generation,worker::generation(),APP_EXITING.load(Ordering::Acquire),
         app.get_webview_window(CONTEST_SETUP_WINDOW).is_some(),|| {
-        Ok(rfd::FileDialog::new().set_title("Choose an operator-managed MASTER.SCP file")
+        Ok(rfd::FileDialog::new().set_parent(&window).set_title("Choose an operator-managed MASTER.SCP file")
             .add_filter("Super Check Partial", &["scp", "txt"]).pick_file())
     })
 }
@@ -2183,8 +2232,9 @@ async fn choose_connection_doctor_export(window: tauri::WebviewWindow) -> Result
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn choose_connection_doctor_export(_window: tauri::WebviewWindow) -> Result<Option<std::path::PathBuf>, String> {
-    tauri::async_runtime::spawn_blocking(|| rfd::FileDialog::new()
+async fn choose_connection_doctor_export(window: tauri::WebviewWindow) -> Result<Option<std::path::PathBuf>, String> {
+    tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new()
+        .set_parent(&window)
         .set_title("Save redacted Connection Doctor report")
         .set_file_name("xlog-connection-doctor-redacted.json")
         .add_filter("JSON report", &["json"]).save_file())
@@ -2210,10 +2260,22 @@ fn dx_alerts_snapshot(window: tauri::WebviewWindow, state: tauri::State<'_, acce
 }
 
 #[tauri::command]
-fn dx_alerts_save(window: tauri::WebviewWindow, state: tauri::State<'_, acceptance::Acceptance>, expected_generation: String,
+async fn dx_alerts_save(window: tauri::WebviewWindow, state: tauri::State<'_, acceptance::Acceptance>, expected_generation: String,
     expected_revision: u64, configuration: serde_json::Value) -> Result<serde_json::Value, String> {
     dx_alerts::validate(window.label(), runtime_profile::isolated(state.path.is_some()), APP_EXITING.load(Ordering::Acquire))?;
-    dx_alerts::existing().ok_or("DX alerts are unavailable.")?.save(&expected_generation, expected_revision, configuration)
+    let owner = dx_alerts::existing().ok_or("DX alerts are unavailable.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        owner.save(&expected_generation, expected_revision, configuration)?;
+        owner.refresh_chases();
+        if let Some(cluster) = cluster_session::retained_owner() {
+            if let Ok(projection) = cluster.projection_value() {
+                if let Err(error) = owner.populate_retained_chases(&projection) {
+                    eprintln!("Saved alert retained-report refresh unavailable: {error}");
+                }
+            }
+        }
+        owner.snapshot()
+    }).await.map_err(|_| "Alert save task ended. Reload Alerts to verify the saved target.".to_string())?
 }
 
 #[tauri::command]
@@ -2234,8 +2296,10 @@ fn dx_alerts_review(window: tauri::WebviewWindow, app:tauri::AppHandle, state: t
     let result = token["activation"]["sourceEpoch"].as_str().zip(token["id"].as_str()).zip(token["activation"]["spotVersion"].as_str())
         .ok_or("Historical/test/WSJT-X entry has no cluster tune authority.".to_string())
         .and_then(|((epoch,id),version)|cluster_session::owner(&app)?.activation_spot(epoch,id,version));
-    review["admissible"] = serde_json::json!(result.is_ok());
-    review["reason"] = serde_json::json!(result.err());
+    let current = if result.is_err() { cluster_session::owner(&app)?.matching_alert_observation(&review["entry"])? } else { None };
+    review["admissible"] = serde_json::json!(result.is_ok() || current.is_some());
+    review["reason"] = serde_json::json!(if current.is_some() { None } else { result.err() });
+    review["currentObservation"] = serde_json::json!(current);
     if review["admissible"]!=true && review["entry"]["test"]!=true {
         let projection=cluster_session::owner(&app)?.projection_value()?;
         let alternatives:Vec<_>=projection["response"]["snapshot"]["spots"].as_array().into_iter().flatten()
@@ -2649,6 +2713,45 @@ async fn station_session_request(app: tauri::AppHandle, window: tauri::WebviewWi
 }
 
 #[tauri::command]
+async fn companion_bridge_request(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<'_, acceptance::Acceptance>, action: String) -> Result<serde_json::Value,String> {
+    let companion_fixture = runtime_profile::companion_loopback();
+    if !companion_fixture { runtime_profile::require_external_io_disabled()?; }
+    if !matches!(window.label(), "main" | "settings") || (runtime_profile::isolated(state.path.is_some()) && !companion_fixture) || APP_EXITING.load(Ordering::Acquire) {
+        return Err("Companion pairing is available only in live xLog Settings.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || companion_host::request(app, &action)).await.map_err(|_| "Companion settings task failed.".to_string())?
+}
+
+#[tauri::command]
+async fn companion_audio_request(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<'_, acceptance::Acceptance>, action: String, params: Option<serde_json::Value>) -> Result<serde_json::Value,String> {
+    runtime_profile::require_external_io_disabled()?;
+    if !matches!(window.label(), "main" | "settings") || runtime_profile::isolated(state.path.is_some()) || APP_EXITING.load(Ordering::Acquire) {
+        return Err("xNexus audio settings are available in live xLog Settings".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || companion_audio_config::request(&app, &action, params.unwrap_or(serde_json::Value::Null)))
+        .await.map_err(|_| "xNexus audio settings task failed".to_owned())?
+}
+
+#[tauri::command]
+async fn companion_rx_request(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<'_, acceptance::Acceptance>, action: String, params: Option<serde_json::Value>) -> Result<serde_json::Value,String> {
+    runtime_profile::require_external_io_disabled()?;
+    if !matches!(window.label(), "main" | "settings") || runtime_profile::isolated(state.path.is_some()) || APP_EXITING.load(Ordering::Acquire) {
+        return Err("Receive sharing is available only in live xLog Settings.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || companion_host::rx_request(app, &action, params.unwrap_or(serde_json::Value::Null))).await.map_err(|_| "Receive settings task failed.".to_owned())?
+}
+
+#[tauri::command]
+async fn companion_tx_request(app:tauri::AppHandle,window:tauri::WebviewWindow,state:tauri::State<'_,acceptance::Acceptance>,action:String,params:Option<serde_json::Value>)->Result<serde_json::Value,String>{
+    runtime_profile::require_external_io_disabled()?;
+    if !matches!(window.label(),"main"|"settings")||runtime_profile::isolated(state.path.is_some())||APP_EXITING.load(Ordering::Acquire){
+        return Err("Digital TX commissioning is available only in live xLog Settings".into());
+    }
+    tauri::async_runtime::spawn_blocking(move||companion_host::tx_request(app,&action,params.unwrap_or(serde_json::Value::Null)))
+        .await.map_err(|_|"Digital TX settings task failed".to_owned())?
+}
+
+#[tauri::command]
 async fn band_map_marker_tune(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<'_, acceptance::Acceptance>, params: serde_json::Value) -> Result<serde_json::Value,String> {
     runtime_profile::require_external_io_disabled()?;
     guide_marker_tune::execute(app,window.label().to_owned(),runtime_profile::isolated(state.path.is_some()),APP_EXITING.load(Ordering::Acquire),params).await
@@ -2828,7 +2931,7 @@ async fn worker_request(app: tauri::AppHandle, window: tauri::WebviewWindow, sta
         return Err("Use the shared CW session for CW output controls.".into());
     }
     // This explicit role gate precedes every native special dispatcher too.
-    if matches!(workspace_windows::surface_role(window.label()), "hm-control" | "monitor" | "log-qso" | "spot-history" | "world-map" | "dxpedition-map" | "band-maps" | "callsign-intelligence" | "previous-qsos" | "operating-goals" | "station-control" | "cw" | "rotor" | "station-status" | "propagation" | "station-identity" | "alerts" | "antenna") { worker::validate_surface(window.label(), &request)?; }
+    if matches!(workspace_windows::surface_role(window.label()), "elecraft" | "hm-control" | "monitor" | "log-qso" | "spot-history" | "world-map" | "dxpedition-map" | "band-maps" | "callsign-intelligence" | "previous-qsos" | "operating-goals" | "station-control" | "cw" | "rotor" | "station-status" | "propagation" | "station-identity" | "alerts" | "special" | "antenna") { worker::validate_surface(window.label(), &request)?; }
     if state.path.is_none() && matches!(method, "opportunities_snapshot" | "opportunities_refresh" | "opportunities_dxpedition_snapshot" | "opportunities_dxpedition_refresh") {
         worker::validate_surface(window.label(), &request)?;
         return tauri::async_runtime::spawn_blocking(move || opportunity_selection::snapshot(request)).await
@@ -2897,12 +3000,15 @@ async fn worker_request(app: tauri::AppHandle, window: tauri::WebviewWindow, sta
     worker::validate_surface(window.label(), &request)?;
     if retires_automatic_rotor(&request) { auto_rotor::revoke(); }
     let _telemetry_fence = if station_telemetry::changes_radio(&request) { Some(station_telemetry::owner(&app)?.control()?) } else { None };
-    let selection = if station_telemetry::changes_radio(&request) { Some(station_selection::owner(&app)?) } else { None };
+    let selection = if station_telemetry::changes_radio(&request)
+        || cfg!(target_os = "macos") && method == "station_configuration" {
+        Some(station_selection::owner(&app)?)
+    } else { None };
     let invalidate = logbook_events::changes_logbook(&request);
     let map_changed = invalidate || matches!(method, "settings_save" | "workspace_preferences_save" | "workspace_band_map_apply" | "workspace_create" | "backup_restore");
     let settings_changed = matches!(method, "settings_save" | "backup_restore");
     let shared_output_acquisition = requires_shared_output_acquisition(method);
-    let sync_changed = matches!(method, "sync_mutation" | "online_log_configure" | "settings_save" | "secret_save" | "workspace_create" | "backup_restore");
+    let sync_changed = matches!(method, "sync_mutation" | "online_log_configure" | "online_log_reconcile" | "settings_save" | "secret_save" | "workspace_create" | "backup_restore");
     let rotor_configuration_changed = matches!(method, "workspace_rotor_configuration_save" | "backup_restore");
     let isolated = runtime_profile::isolated(state.path.is_some());
     let native_rotor_configuration = routes_native_rotor_configuration(method, isolated);
@@ -2971,7 +3077,7 @@ async fn worker_request(app: tauri::AppHandle, window: tauri::WebviewWindow, sta
         // The initiating view already refreshes after its operation. In
         // particular, ADIF batches must not reload that view after every chunk.
         // The native sync monitor separately wakes all readers on completion.
-        for label in ["main", "settings", "log-qso", "logbook", "awards", "chaser-dx", "callsign-intelligence", "previous-qsos"] {
+        for label in ["main", "settings", "log-qso", "logbook", "awards", "chaser-dx", "special", "callsign-intelligence", "previous-qsos"] {
             if label != window.label() { let _ = app.emit_to(label, "xlog:logbook-changed", ()); }
         }
     }
@@ -2981,6 +3087,11 @@ async fn worker_request(app: tauri::AppHandle, window: tauri::WebviewWindow, sta
     }
     if settings_changed {
         for label in ["main", "settings"] { let _ = app.emit_to(label, "xlog:settings-changed", ()); }
+    }
+    if matches!(method, "workspace_commands_apply" | "workspace_create" | "backup_restore") {
+        // Keyboard shortcuts take effect in open Log QSO and CW windows now,
+        // not only when they next regain focus.
+        let _ = app.emit("xlog:workspace-preferences", ());
     }
     if sync_changed {
         // Ownership admission and unknown outcomes invalidate every Sync view;
@@ -3036,7 +3147,7 @@ fn exact_contest_recent_spots_command(request: &serde_json::Value) -> bool {
 }
 
 fn validate_worker_request_caller(label: &str, request: &serde_json::Value) -> Result<(), String> {
-    if matches!(label, "hm-control") {return worker::validate_surface(label,request);}
+    if matches!(label, "hm-control" | "elecraft") {return worker::validate_surface(label,request);}
     if label.starts_with(workspace_windows::CONTEST_LABEL_PREFIX) {
         let cluster_control = workspace_windows::WorkspaceWindowIdentity::parse_native_label(label).ok()
             .is_some_and(|identity| identity.scope == workspace_windows::WorkspaceWindowScope::Contesting
@@ -3121,11 +3232,10 @@ fn finish_module_transition_preparation(app: &tauri::AppHandle, prepared: &Prepa
     operating_module_prepare::preparation().finish(&prepared.request);
 }
 
-/// Reuse the current contest owner's correlated flush/freeze acknowledgement.
-/// A failed or absent acknowledgement leaves the application and draft alive.
-/// This never restores a database or manufactures a contact/output action.
+/// Preserve the Mac's existing correlated editor flush and refusal on unsaved work.
+#[cfg(target_os = "macos")]
 fn prepare_contesting_quit(app: &tauri::AppHandle) -> Result<(), String> {
-    let target=if app.get_webview_window(CONTEST_SETUP_WINDOW).is_some(){"quit-contesting"}else{"quit-normal"};
+    let target = if app.get_webview_window(CONTEST_SETUP_WINDOW).is_some() { "quit-contesting" } else { "quit-normal" };
     let prepared = prepare_module_transition(app, target)?;
     let ready = contest_surface::retirement_ready();
     finish_module_transition_preparation(app, &prepared, ready.is_err());
@@ -3188,6 +3298,7 @@ fn require_module_transition_idle(app: &tauri::AppHandle) -> Result<(), String> 
 }
 
 fn retire_for_module_restart(app: &tauri::AppHandle) -> Result<(), String> {
+    companion_host::shutdown();
     contest_recorder::prepare_module_restart()?;
     contest_voice::shutdown(app)?;
     carrier_tune::revoke_output_intent()?;
@@ -3203,6 +3314,7 @@ fn retire_for_module_restart(app: &tauri::AppHandle) -> Result<(), String> {
     propagation_session::shutdown();
     auto_rotor_reconcile::shutdown();
     logbook_events::shutdown();
+    logbook_export_stream::shutdown();
     workspace_window_runtime::shutdown();
     cluster_session::shutdown();
     rotor_telemetry::shutdown();
@@ -3319,6 +3431,18 @@ fn show_module_switch_error(_app: &tauri::AppHandle, message: &str) {
     rfd::MessageDialog::new().set_title("Workspace switch could not finish").set_description(message).show();
 }
 
+/// A Window-menu choice that cannot open (for example Log QSO while
+/// Contesting is selected) says why instead of doing nothing.
+fn show_window_open_error(message: String) {
+    if APP_EXITING.load(Ordering::Acquire) { return; }
+    #[cfg(not(target_os = "macos"))]
+    std::thread::spawn(move || {
+        rfd::MessageDialog::new().set_title("Window could not open").set_description(&message).show();
+    });
+    #[cfg(target_os = "macos")]
+    let _ = message;
+}
+
 #[tauri::command]
 async fn operating_module_switch(app: tauri::AppHandle, window: tauri::WebviewWindow,
     state: tauri::State<'_, acceptance::Acceptance>, target: String, context: String) -> Result<serde_json::Value, String> {
@@ -3373,10 +3497,11 @@ async fn pick_backup_package_native(window: tauri::WebviewWindow) -> Result<Opti
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn pick_backup_package_native(_window: tauri::WebviewWindow) -> Result<Option<String>, String> {
+async fn pick_backup_package_native(window: tauri::WebviewWindow) -> Result<Option<String>, String> {
     // On Windows/Linux xLog packages are ordinary folders in the picker.
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(move || {
         rfd::FileDialog::new()
+            .set_parent(&window)
             .set_title("Choose an xLog .xlogbackup package")
             .set_can_create_directories(false)
             .pick_folder()
@@ -3388,7 +3513,7 @@ async fn pick_backup_package_native(_window: tauri::WebviewWindow) -> Result<Opt
 
 #[tauri::command]
 async fn open_monitor(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
-    validate_detached_open(window.label())?;
+    validate_detached_open(window.label(), "monitor")?;
     // Creating a Windows WebView from a synchronous IPC command can block its
     // message loop. Tauri must dispatch this native window work asynchronously.
     open_detached_workspace(app, "monitor".into()).await
@@ -3396,12 +3521,15 @@ async fn open_monitor(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Re
 
 #[tauri::command]
 async fn open_detached_map(app: tauri::AppHandle, window: tauri::WebviewWindow, kind: String) -> Result<(), String> {
-    validate_detached_open(window.label())?;
+    validate_detached_open(window.label(), &kind)?;
     open_detached_workspace(app, kind).await
 }
 
-fn validate_detached_open(label: &str) -> Result<(), String> {
-    if label == "main" { Ok(()) }
+/// Main opens any workspace window. A few child windows carry a button that
+/// opens exactly one related window: Settings > Alerts opens Alerts, and the
+/// Station Monitor's instrument card opens KPA500 & KAT500.
+fn validate_detached_open(label: &str, kind: &str) -> Result<(), String> {
+    if label == "main" || matches!((label, kind), ("settings", "alerts") | ("monitor", "elecraft")) { Ok(()) }
     else { Err("Only the main workspace can open detached windows".into()) }
 }
 
@@ -3428,6 +3556,7 @@ async fn contest_setup_dialog_open(window: tauri::WebviewWindow, app: tauri::App
             .incognito(app.state::<acceptance::Acceptance>().path.is_some());
         if let Some(directory) = app.state::<acceptance::Acceptance>().detached_browser_context()? { builder = builder.data_directory(directory); }
     let dialog = runtime_profile::offline_webview(builder).build().map_err(|error| error.to_string())?;
+        configure_detached_chrome(&dialog)?;
         if app.state::<acceptance::Acceptance>().path.is_none() { detached_geometry::install(&dialog); }
         Ok(dialog)
     })?;
@@ -3542,6 +3671,7 @@ fn ensure_workspace_window(app: &tauri::AppHandle, kind: &str, presentation: Pre
     }
     if kind == "cw" { if let Some(owner) = cw_session_backend::existing() { owner.allow_window(kind)?; } }
     let detached = runtime_profile::offline_webview(builder).build().map_err(|e| e.to_string())?;
+        configure_detached_chrome(&detached)?;
     workspace_window_runtime::created(&detached);
     if app.state::<acceptance::Acceptance>().path.is_none() {
         detached_geometry::install(&detached);
@@ -3658,6 +3788,7 @@ async fn contest_contact_editor_open(window: tauri::WebviewWindow, app: tauri::A
             .incognito(app.state::<acceptance::Acceptance>().path.is_some());
         if let Some(directory) = app.state::<acceptance::Acceptance>().detached_browser_context()? { builder = builder.data_directory(directory); }
     let editor = runtime_profile::offline_webview(builder).build().map_err(|error| error.to_string())?;
+        configure_detached_chrome(&editor)?;
         workspace_window_runtime::created(&editor);
         if app.state::<acceptance::Acceptance>().path.is_none() { detached_geometry::install(&editor); }
         Ok(editor)
@@ -3887,8 +4018,9 @@ async fn pick_contest_voice_profile_native(window: tauri::WebviewWindow) -> Resu
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn pick_contest_voice_profile_native(_window: tauri::WebviewWindow) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| rfd::FileDialog::new()
+async fn pick_contest_voice_profile_native(window: tauri::WebviewWindow) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new()
+        .set_parent(&window)
         .set_title("Choose or create a contest voice WAV profile folder")
         .set_can_create_directories(true).pick_folder().map(|path| path.to_string_lossy().into_owned()))
         .await.map_err(|_| "Voice profile chooser failed.".to_string())
@@ -4134,7 +4266,7 @@ fn validate_workspace_window_scope_caller(label: &str, scope: Option<&str>, muta
 
 #[tauri::command]
 async fn detached_cluster_ready(window: tauri::WebviewWindow, app: tauri::AppHandle, state: tauri::State<'_, acceptance::Acceptance>) -> Result<(), String> {
-    if window.label() != "dx-cluster" { return Err("Only the detached cluster can announce readiness".into()); }
+    if !matches!(window.label(), "dx-cluster" | "special") { return Err("Only a detached cluster display can announce readiness".into()); }
     if runtime_profile::isolated(state.path.is_some()) { return Err("Live cluster access is disabled in isolated runtime.".into()); }
     let session = cluster_session::owner(&app)?;
     tauri::async_runtime::spawn_blocking(move || session.refresh_and_publish()).await
@@ -4276,6 +4408,7 @@ fn close_station_identity_window(window: tauri::WebviewWindow) -> Result<(), Str
 #[tauri::command]
 async fn close_main_window(window: tauri::WebviewWindow) -> Result<(), String> {
     if window.label() != "main" { return Err("Only the main workspace can close itself".into()); }
+    #[cfg(target_os = "macos")]
     validate_editor_transition(window.label())?;
     let presentation = PresentationRequest::claim(PresentationIntent::Focus)?;
     detached_geometry::flush(&window);
@@ -4327,11 +4460,26 @@ fn close_antenna_window(window: tauri::WebviewWindow) -> Result<(), String> {
     window.destroy().map_err(|error| error.to_string())
 }
 
+fn configure_detached_chrome(window: &tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        window.remove_menu().map_err(|error| error.to_string())?;
+        window.set_resizable(true).map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+    Ok(())
+}
+
 #[tauri::command]
 async fn close_logbook_window(window: tauri::WebviewWindow) -> Result<(), String> {
     if window.label() != "logbook" { return Err("Only the Logbook window can close itself".into()); }
     validate_editor_transition(window.label())?;
     detached_geometry::flush(&window);
+    // Win32 destroys the menu attached to a destroyed HWND. Tauri attached
+    // the same application menu to the Desk, so detach it from Logbook first.
+    #[cfg(windows)]
+    window.remove_menu().map_err(|error| error.to_string())?;
     window.destroy().map_err(|error| error.to_string())
 }
 
@@ -4356,7 +4504,7 @@ fn start_retained_contest_workspace(app:&tauri::AppHandle)->Result<(),String>{
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     if std::env::args().collect::<Vec<_>>().get(1).is_some_and(|a| a == "--recorder-acceptance") {
         match contest_recorder_acceptance::run() {
             Ok(report) => println!("{report}"),
@@ -4364,7 +4512,7 @@ fn main() {
         }
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     if std::env::args().collect::<Vec<_>>().get(1).is_some_and(|a| a == "--recorder-audio-devices") {
         match contest_recorder_audio::devices() {
             Ok(devices) => println!("{}", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"source":option_env!("XLOG_SOURCE_COMMIT"),"permission":contest_recorder_audio::permission(),"devices":devices,"captureStarted":false,"outputStarted":false})),
@@ -4398,6 +4546,14 @@ fn main() {
         .menu(workspace_menu)
         .on_window_event(|window, event| {
             if matches!(event,tauri::WindowEvent::Destroyed) {if let Ok(mut captures)=NORMAL_SHORTCUT_CAPTURE.lock(){captures.retain(|label|label!=window.label());}}
+            #[cfg(target_os = "windows")]
+            if window.label() == CONTEST_SETUP_WINDOW {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    window.app_handle().exit(0);
+                    return;
+                }
+            }
             if window.label()==contest_analytics::WINDOW || window.label()==CONTEST_SETUP_WINDOW {
                 // The renderer flushes annotations before acknowledging close.
                 // A missing listener leaves the editor available.
@@ -4405,6 +4561,12 @@ fn main() {
             }
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    #[cfg(target_os = "windows")]
+                    if !contest_desk_is_open(window.app_handle().webview_windows().keys().map(String::as_str)) {
+                        api.prevent_close();
+                        window.app_handle().exit(0);
+                        return;
+                    }
                     let labels = window.app_handle().webview_windows().into_keys().collect::<Vec<_>>();
                     if contest_desk_is_open(labels.iter().map(String::as_str)) {
                         // The contest desk owns the active application lifetime.
@@ -4478,6 +4640,13 @@ fn main() {
             }
         })
         .on_menu_event(|app, event| {
+            if event.id().0 == "feedback_history" {
+                if let Some(window) = app.webview_windows().values().find(|window| window.is_focused().unwrap_or(false)).cloned()
+                    .or_else(|| app.get_webview_window("main")) {
+                    let _ = window.emit("xlog:feedback-history", ());
+                }
+                return;
+            }
             if event.id().0 == "app_about" {
                 let Some(presentation) = menu_presentation_request() else { return; };
                 let app = app.clone();
@@ -4640,7 +4809,10 @@ fn main() {
                         // Native menu intent is trusted; renderer IPC must pass
                         // its own main-only caller gate before reaching this owner.
                         let result = open_detached_workspace_with_presentation(app, kind, presentation).await;
-                        if let Err(error) = result { eprintln!("Could not open workspace window: {error}"); }
+                        if let Err(error) = result {
+                            eprintln!("Could not open workspace window: {error}");
+                            show_window_open_error(error);
+                        }
                     });
                 }
                 return;
@@ -4676,6 +4848,7 @@ fn main() {
             operating_module::install(module_path).map_err(std::io::Error::other)?;
             let normal_module = operating_module::owner().and_then(|owner| owner.snapshot()).map_err(std::io::Error::other)?["selected"] == "normal_logging";
             acceptance::start_watchdog(app.handle().clone());
+            worker_health::install(app.handle());
             // Follow Radio starts disabled and its snapshot is passive. Install
             // the owner for isolated acceptance as well so renderer reads do
             // not fail merely because hardware/session startup is suppressed.
@@ -4686,6 +4859,7 @@ fn main() {
             let production = !runtime_profile::isolated(app.state::<acceptance::Acceptance>().path.is_some());
             if production {
                 if normal_module {
+                    wsjtx_follow::install(app.handle().clone());
                     qsy_clear::install(app.handle(), activation.editors.clone());
                     radio_read::install(app.handle(), activation.editors.clone());
                 }
@@ -4693,6 +4867,12 @@ fn main() {
                 // services. Contesting owns a separate log, but it must not lose
                 // these hardware/service owners when Normal Logging is inactive.
                 station_identity::install(app.handle());
+                #[cfg(windows)]
+                {
+                    companion_host::install(app.handle().clone());
+                    companion_audio_config::install(app.handle().clone());
+                }
+                elecraft::install(app.handle()).map_err(std::io::Error::other)?;
                 rotor_session::install(app.handle()).map_err(std::io::Error::other)?;
                 // Reserve the first automatic-rotor command before renderer
                 // input can arrive. A later explicit Off supersedes this token
@@ -4702,8 +4882,8 @@ fn main() {
                     auto_rotor::revoke).map_err(std::io::Error::other)?;
                 let selection_app = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || {
-                    if let Err(error) = (|| {
-                        for radio_id in [radio_slots::RADIO1, radio_slots::RADIO2] {
+                    for radio_id in [radio_slots::RADIO1, radio_slots::RADIO2] {
+                        if let Err(error) = (|| {
                             let owner = station_selection::owner_for(&selection_app, radio_id)?;
                             // Native saved intent seeds display polling once. Passive
                             // window reads never default, migrate or choose a radio.
@@ -4713,7 +4893,7 @@ fn main() {
                                 telemetry.select_selection(&saved, true)?;
                             }
                             owner.notify_saved()?;
-                            // Startup alone restores each native saved Agent intent.
+                            // Startup alone restores each selected saved connection.
                             // Snapshot/renderer reads remain passive; an intervening
                             // handover or radio control invalidates this exact view.
                             station_session::owner_for(&selection_app, radio_id)?.resume_saved_agent(&saved, |request, generation, identity| {
@@ -4722,10 +4902,10 @@ fn main() {
                                 startup_auto_rotor.epoch = epoch;
                                 Ok(result)
                             })?;
+                            Ok::<(), String>(())
+                        })() {
+                            eprintln!("Native {radio_id} startup unavailable: {error}");
                         }
-                        Ok::<(), String>(())
-                    })() {
-                        eprintln!("Native station startup unavailable: {error}");
                     }
                     match rotor_session::resume(startup_auto_rotor.epoch) {
                         Ok(Some(startup)) => match AUTOMATIC_ROTOR_COMMANDS.apply(startup_auto_rotor, |epoch|
@@ -4759,6 +4939,19 @@ fn main() {
                 // ID in this Tauri version. Build through the explicit owner
                 // before any renderer can read a production recovery journal.
                 if normal_module {
+                    #[cfg(windows)]
+                    {
+                        // WebView2 creation and the presentation acknowledgement
+                        // both need the Windows event loop to keep dispatching.
+                        let handle = app.handle().clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if let Err(error) = ensure_main_workspace(&handle) {
+                                eprintln!("Offline Desk startup failed: {error}");
+                                handle.exit(2);
+                            }
+                        });
+                    }
+                    #[cfg(not(windows))]
                     ensure_main_workspace(app.handle()).map_err(std::io::Error::other)?;
                 } else {
                     start_retained_contest_workspace(app.handle()).map_err(std::io::Error::other)?;
@@ -4766,7 +4959,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![hide_prepared_contest_owner, close_learning_window, operating_module_status, operating_module_switch, operating_module_transition_ack, operating_module_transition_pending, worker_request, cw_session_request, voice_request, tci_transmit_disable, contest_cw_speed_request, station_session_request, band_map_marker_tune, radio_release_request, carrier_tune_request, ptt_session_request, amplifier_transition_request, manual_rotor_request, pick_backup_package, open_monitor, open_detached_map,
+        .invoke_handler(tauri::generate_handler![companion_audio_request, companion_tx_request, companion_rx_request, companion_bridge_request, hide_prepared_contest_owner, close_learning_window, operating_module_status, operating_module_switch, operating_module_transition_ack, operating_module_transition_pending, worker_request, cw_session_request, voice_request, tci_transmit_disable, contest_cw_speed_request, station_session_request, band_map_marker_tune, radio_release_request, carrier_tune_request, ptt_session_request, amplifier_transition_request, manual_rotor_request, pick_backup_package, open_monitor, open_detached_map,
             spot_editor_register, spot_editor_unregister, spot_editor_ack, spot_editor_state,
             spot_activation_snapshot, spot_activation_status, spot_activation_reconcile, activate_spot, activate_opportunity, supersede_spot_rotor,
             operator_draft_read_radio,
@@ -4776,7 +4969,10 @@ fn main() {
             workspace_windows_status, workspace_windows_reconcile, contest_window_open, contest_window_toggle, contest_contact_editor_open, contest_contact_editor_close, contest_surface_context_close, contest_setup_service_open,
             contest_log_review::contest_log_review_read,
             contest_analytics::contest_analytics_read,
-            contest_analytics::contest_analytics_export, contest_analytics::logbook_export_file, contest_analytics::logbook_export_pota_set, contest_lane_output_request,
+            contest_analytics::contest_analytics_export, contest_analytics::logbook_export_file, contest_analytics::logbook_export_pota_set,
+            worker_health::worker_health, worker_health::worker_diagnostics_set,
+            logbook_export_stream::logbook_export_open, logbook_export_stream::logbook_export_append,
+            logbook_export_stream::logbook_export_finish, logbook_export_stream::logbook_export_abort, contest_lane_output_request,
         contest_analytics::contest_messages_export,
             contest_analytics::contest_analytics_print,
             open_contest_recorder, contest_recorder::contest_recorder_request, contest_recorder::contest_recorder_stop_replay,
@@ -4793,7 +4989,7 @@ fn main() {
             contest_voice_profile_write, contest_voice_profile_pick,
             contest_surface_action, contest_surface_diagnostic_report, contest_surface_action_next, contest_surface_escape_next, contest_surface_action_complete, contest_surface_owner_claim, contest_surface_publish, contest_surface_snapshot, contest_rotor_target,
             workspace_mode_present, workspace_presentation_begin, workspace_canvas_close_ack, close_about_window,
-            workspace_navigation_snapshot, workspace_navigation_ack, hm_control_snapshot, hm_control_feed, map_context_snapshot, monitor_context_snapshot, monitor_station_action, monitor_rotor_stop, rotor_telemetry_snapshot, station_telemetry_snapshot, station_selection_snapshot, station_status_snapshot, connection_doctor_snapshot, connection_doctor_export, contest_export_save, contest_scp_import, contest_history_preview, contest_history_manager_request, contest_qrz_details_lookup, propagation_session_request, station_identity_snapshot, alerts_snapshot, dx_alerts_snapshot, dx_alerts_entities, dx_alerts_preview, dx_alerts_review, nearby_callsign_snapshot, nearby_callsign_accept, normal_command_preferences, normal_command_navigate, normal_shortcut_capture, antenna_profile::antenna_transmit_context, dx_alerts_save, dx_alerts_test, dx_alerts_clear, dx_alerts_clear_selected, antenna_snapshot,
+            elecraft::elecraft_request, elecraft::elecraft_agent, workspace_navigation_snapshot, workspace_navigation_ack, hm_control_snapshot, hm_control_feed, map_context_snapshot, monitor_context_snapshot, monitor_station_action, monitor_rotor_stop, rotor_telemetry_snapshot, station_telemetry_snapshot, station_selection_snapshot, station_status_snapshot, connection_doctor_snapshot, connection_doctor_export, contest_export_save, contest_scp_import, contest_history_preview, contest_history_manager_request, contest_qrz_details_lookup, propagation_session_request, station_identity_snapshot, alerts_snapshot, dx_alerts_snapshot, dx_alerts_entities, dx_alerts_preview, dx_alerts_review, nearby_callsign_snapshot, nearby_callsign_accept, normal_command_preferences, normal_command_navigate, normal_shortcut_capture, antenna_profile::antenna_transmit_context, dx_alerts_save, dx_alerts_test, dx_alerts_clear, dx_alerts_clear_selected, antenna_snapshot,
             detached_cluster_ready, cluster_session_selection, contest_post_spot, dock_detached_window, close_logbook_window, close_qso_window, close_main_window, close_cw_window, show_cw_desk, close_rotor_window, show_rotor_desk, close_station_status_window, show_station_status_desk, close_propagation_window, show_propagation_desk, close_station_identity_window, show_station_identity_desk, close_alerts_window, show_alerts_desk, close_antenna_window, show_antenna_desk,
              hf_propagation_fetch,
              acceptance::acceptance_enabled, acceptance::acceptance_large_log, acceptance::acceptance_monitor,
@@ -4807,7 +5003,7 @@ fn main() {
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
                 let prepared_restart = operating_module_prepare::preparation().take_restart(*code == Some(tauri::RESTART_EXIT_CODE));
-                eprintln!("Workspace exit pid={} code={code:?} prepared_restart={prepared_restart:?}", std::process::id());
+                #[cfg(target_os = "macos")]
                 if prepared_restart.is_none() && app.webview_windows().keys().any(|label|module_transition_editor(label))
                     && !CONTEST_QUIT_PREPARED.load(Ordering::Acquire) {
                     api.prevent_exit();
@@ -4822,7 +5018,7 @@ fn main() {
                                 }
                                 Err(error) => {
                                     CONTEST_QUIT_PREPARING.store(false, Ordering::Release);
-                                    eprintln!("Contest Quit cancelled; entry retained: {error}");
+                                    eprintln!("Mac Quit cancelled; entry retained: {error}");
                                     if let Some(window) = app.get_webview_window(CONTEST_SETUP_WINDOW) {
                                         let _ = window.emit("xlog:contesting-quit-blocked", format!("Quit cancelled; your contest entry remains open. {error}"));
                                         let _ = window.show(); let _ = window.set_focus();
@@ -4834,8 +5030,8 @@ fn main() {
                     }
                     return;
                 }
-            }
-            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                #[cfg(not(target_os = "macos"))]
+                let _ = (api, prepared_restart);
                 contest_recorder::shutdown();
                 if contest_voice::needs_shutdown_barrier() {
                     if let Err(error) = contest_voice::shutdown(app) {
@@ -4843,7 +5039,7 @@ fn main() {
                     }
                 }
                 APP_EXITING.store(true, Ordering::Release);
-                rotor_session::shutdown();
+                companion_host::shutdown(); rotor_session::shutdown();
                 station_identity::shutdown();
                 dx_alerts::shutdown();
                 propagation_session::shutdown();
@@ -4851,6 +5047,7 @@ fn main() {
                 auto_rotor::revoke();
                 auto_rotor_reconcile::shutdown();
                 logbook_events::shutdown();
+                logbook_export_stream::shutdown();
                 workspace_window_runtime::shutdown();
                 app.state::<contest_group_chat::GroupChat>().shutdown();
                 detached_geometry::shutdown(app);
@@ -4868,7 +5065,8 @@ fn main() {
                 auto_rotor::revoke();
                 auto_rotor_reconcile::shutdown();
                 logbook_events::shutdown();
-                rotor_session::shutdown(); station_selection::shutdown(); station_telemetry::shutdown(); rotor_telemetry::shutdown(); cluster_session::shutdown(); winkeyer::shutdown(); hamlib::shutdown(); worker::shutdown();
+                logbook_export_stream::shutdown();
+                companion_host::shutdown(); rotor_session::shutdown(); station_selection::shutdown(); station_telemetry::shutdown(); rotor_telemetry::shutdown(); cluster_session::shutdown(); winkeyer::shutdown(); hamlib::shutdown(); worker::shutdown();
                 app.state::<acceptance::Acceptance>().cleanup_browser_contexts();
             }
         });
@@ -5806,11 +6004,18 @@ mod workspace_layout_tests {
 
     #[test]
     fn renderer_detached_open_gate_is_main_only_including_monitor_and_log_qso() {
-        assert!(validate_detached_open("main").is_ok());
+        assert!(validate_detached_open("main", "log-qso").is_ok());
         for spec in crate::workspace_windows::SUPPORTED_WINDOWS {
-            assert!(validate_detached_open(spec.id).is_err(), "{}", spec.id);
+            for kind in ["monitor", "log-qso", "logbook"] {
+                assert!(validate_detached_open(spec.id, kind).is_err(), "{} -> {kind}", spec.id);
+            }
         }
-        for label in ["", "unknown", "MAIN"] { assert!(validate_detached_open(label).is_err()); }
+        for label in ["", "unknown", "MAIN"] { assert!(validate_detached_open(label, "alerts").is_err()); }
+        // The two related-window buttons, and nothing more from those windows.
+        assert!(validate_detached_open("settings", "alerts").is_ok());
+        assert!(validate_detached_open("monitor", "elecraft").is_ok());
+        assert!(validate_detached_open("settings", "elecraft").is_err());
+        assert!(validate_detached_open("monitor", "alerts").is_err());
     }
 
     #[test]
@@ -5889,20 +6094,11 @@ mod intelligence_window_tests {
         }
     }
     #[test]
-    fn quit_preparation_uses_the_existing_contest_owner_without_requiring_unrelated_editors() {
-        assert!(super::preparation_editor(super::CONTEST_SETUP_WINDOW, "quit-contesting"));
-        assert!(super::preparation_editor(crate::contest_analytics::WINDOW, "quit-contesting"));
-        for label in ["main","log-qso","logbook",crate::contest_analytics::WINDOW] {
-            assert!(super::preparation_editor(label,"quit-normal"));
+    fn module_switch_prepares_all_editors() {
+        for label in ["main", "contest-setup", "logbook", "log-qso", crate::contest_analytics::WINDOW] {
+            assert!(super::module_transition_editor(label));
         }
-        for label in ["main", "logbook", "log-qso", "contesting-active-qso", "unknown"] {
-            assert!(!super::preparation_editor(label, "quit-contesting"));
-        }
-        for target in ["normal_logging", "contesting"] {
-            for label in ["main", "contest-setup", "logbook", "log-qso"] {
-                assert!(super::preparation_editor(label, target));
-            }
-        }
+        assert!(!super::module_transition_editor("monitor"));
     }
 
     #[test]

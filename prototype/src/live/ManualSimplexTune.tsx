@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useState, useSyncExternalStore } from "react";
 import { manualTuneSession, type ManualTuneSession } from "./manualTune";
 import type { StationProvider } from "../worker";
@@ -11,7 +12,7 @@ export function ManualTuneStatus({ radioId, session = manualTuneSession(radioId)
     try { await action(); if (operation && !session.getSnapshot().pending) onResolved?.(operation); }
     catch (cause) { setError(cause instanceof Error ? cause.message : fallback); }
   };
-  return <>{state.message && <p role="status">{state.message}</p>}{error && <p role="alert">{error}</p>}
+  return <>{state.message && <ErrorNotice><p role="status">{state.message}</p></ErrorNotice>}{error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     {state.pending && <button type="button" disabled={state.busy} onClick={() => void recover(() => session.check(), "Manual tune receipt unavailable.")}>Check manual tune receipt</button>}
     {state.reviewable && <button type="button" disabled={state.busy} onClick={() => void recover(() => session.review(), "Manual tune review could not be retained.")}>I have reviewed observed radio state</button>}</>;
 }
@@ -25,6 +26,6 @@ export function ManualSimplexTune({ radioId, provider, context, session = manual
     <button type="button" disabled={state.busy || !!state.pending || !!context?.acceptance || hz < 100_000 || hz > 1_000_000_000} onClick={() => {
       setError(""); void session.tune(provider, hz, mode, context).catch(cause => setError(cause instanceof Error ? cause.message : "Manual tune was not confirmed."));
     }}>Tune simplex</button>
-    {error && <p role="alert">{error}</p>}<ManualTuneStatus radioId={radioId} session={session} onResolved={() => setError("")} />
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}<ManualTuneStatus radioId={radioId} session={session} onResolved={() => setError("")} />
   </section>;
 }

@@ -1,4 +1,4 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
 import XClusterIntegrationCore
 
@@ -6,16 +6,36 @@ import XClusterIntegrationCore
 /// WSJT-X starts at schema 2; this receive-only listener never negotiates an upgrade.
 /// https://github.com/WSJTX/wsjtx/blob/master/Network/NetworkMessage.hpp
 /// No command builder or sending capability exists in this receive model.
+/// The station a WSJT-X-compatible engine (WSJT-X, Nexus) is working, from its
+/// Status message: who it is calling or answering, and whether it is keyed.
+struct WSJTXWorking: Equatable, Sendable {
+    var call = ""
+    var grid = ""
+    var txEnabled = false
+    var transmitting = false
+
+    /// A plausible callsign and grid, or empty when the field is free text.
+    static func sanitized(call rawCall: String, grid rawGrid: String) -> (String, String) {
+        let call = rawCall.trimmingCharacters(in: .whitespaces).uppercased()
+        let validCall = (3...32).contains(call.utf8.count)
+            && call.utf8.allSatisfy { (65...90).contains($0) || (48...57).contains($0) || $0 == 47 || $0 == 45 }
+            && call.utf8.contains { (48...57).contains($0) }
+        let grid = rawGrid.trimmingCharacters(in: .whitespaces).uppercased()
+        let validGrid = grid.range(of: #"^[A-R]{2}[0-9]{2}([A-X]{2})?$"#, options: .regularExpression) != nil
+        return (validCall ? call : "", validGrid ? grid : "")
+    }
+}
+
 enum WSJTXActivityMessage {
     case heartbeat(String)
-    case status(String, UInt64, String)
+    case status(String, UInt64, String, WSJTXWorking)
     case decode(String, Bool, UInt32, UInt32, String, Bool, Bool)
     case close(String)
     case clear(String)
 
     var instance: String {
         switch self {
-        case .heartbeat(let id), .status(let id, _, _), .decode(let id, _, _, _, _, _, _), .close(let id), .clear(let id): id
+        case .heartbeat(let id), .status(let id, _, _, _), .decode(let id, _, _, _, _, _, _), .close(let id), .clear(let id): id
         }
     }
 
@@ -34,12 +54,14 @@ enum WSJTXActivityMessage {
             return .heartbeat(id)
         case 1:
             let frequency = try cursor.uint64(), mode = try cursor.text(24)
-            _ = try cursor.text(32); _ = try cursor.text(32); _ = try cursor.text(24)
-            _ = try cursor.boolean(); _ = try cursor.boolean(); _ = try cursor.boolean()
+            let dxCall = try cursor.text(32); _ = try cursor.text(32); _ = try cursor.text(24)
+            let txEnabled = try cursor.boolean(), transmitting = try cursor.boolean(); _ = try cursor.boolean()
             _ = try cursor.uint32(); _ = try cursor.uint32()
-            _ = try cursor.text(32); _ = try cursor.text(12); _ = try cursor.text(12)
+            _ = try cursor.text(32); _ = try cursor.text(12); let dxGrid = try cursor.text(12)
             guard frequency <= 10_000_000_000, !mode.isEmpty, mode.utf8.allSatisfy({ $0 >= 32 && $0 < 127 }) else { throw WSJTXMessageError.invalid }
-            return .status(id, frequency, mode)
+            let (call, grid) = WSJTXWorking.sanitized(call: dxCall, grid: dxGrid)
+            return .status(id, frequency, mode, WSJTXWorking(call: call, grid: call.isEmpty ? "" : grid,
+                                                            txEnabled: txEnabled, transmitting: transmitting))
         case 2:
             let new = try cursor.boolean(), time = try cursor.uint32()
             _ = try cursor.uint32() // signed SNR is not needed by this passive projection
@@ -106,6 +128,8 @@ struct WSJTXActivity {
         var mode = ""
         var statusAt: UInt64 = 0
         var lastSeen: UInt64
+        var working = WSJTXWorking()
+        var dialHz: UInt64 = 0
     }
     private struct CQ {
         let id: String
@@ -154,16 +178,19 @@ struct WSJTXActivity {
         var session = sessions[key] ?? Session(lastSeen: now)
         session.lastSeen = now
         switch message {
-        case .status(_, let frequency, let mode):
+        case .status(_, let frequency, let mode, let working):
             if session.frequency != frequency || session.mode != mode { spots.removeAll { $0.session == key } }
             session.frequency = frequency > 0 && ["FT8", "FT4"].contains(mode) ? frequency : nil
             session.mode = mode; session.statusAt = now
+            session.working = working; session.dialHz = frequency
         case .decode(_, let new, let time, let offset, let text, let low, let offAir):
             guard new, !low, !offAir, let frequency = session.frequency,
                   now >= session.statusAt, now - session.statusAt <= 120_000,
                   let call = Self.cqCall(text) else { sessions[key] = session; return }
             let day = now / 86_400_000 * 86_400_000
-            let decodeTime = [Int64(day) + Int64(time), Int64(day) + Int64(time) - 86_400_000, Int64(day) + Int64(time) + 86_400_000]
+            let today = Int64(day) + Int64(time)
+            let candidates: [Int64] = [today, today - 86_400_000, today + 86_400_000]
+            let decodeTime = candidates
                 .min(by: { abs($0 - Int64(now)) < abs($1 - Int64(now)) })!
             guard abs(decodeTime - Int64(now)) <= 60_000 else { sessions[key] = session; return }
             let identity = key + "\u{1f}\(frequency)\u{1f}\(decodeTime)\u{1f}\(offset)\u{1f}" + text
@@ -195,6 +222,7 @@ struct WSJTXActivity {
                            classifications: [String: WSJTXActivityClassification]) -> [String: Any] {
         expire(now: now)
         return ["epoch": epoch, "revision": revision, "available": available, "received_at_ms": sessions.values.map(\.lastSeen).max() ?? 0,
+                "working": working(now: now),
                 "classification_revision": classificationRevision, "session_count": sessions.count, "ttl_ms": 60_000,
                 "spots": spots.map { spot in
                     let classification = classifications[spot.id]
@@ -204,6 +232,17 @@ struct WSJTXActivity {
                     "dxccStatus": classification?.dxccStatus ?? "Unknown", "specialTags": [String](),
                     "receivedAtMs": spot.receivedAt] as [String: Any]
                 }]
+    }
+
+    /// The most recently reported station being worked, from a Status seen in
+    /// the last 60 s, or NSNull when no engine is working anyone.
+    private func working(now: UInt64) -> Any {
+        guard let (key, session) = sessions.filter({ !$0.value.working.call.isEmpty && now >= $0.value.statusAt
+                && now - $0.value.statusAt <= 60_000 }).max(by: { $0.value.statusAt < $1.value.statusAt }) else { return NSNull() }
+        let parts = key.split(separator: "\u{1f}", maxSplits: 1).map(String.init)
+        return ["call": session.working.call, "grid": session.working.grid, "tx_enabled": session.working.txEnabled,
+                "transmitting": session.working.transmitting, "dial_hz": session.dialHz, "mode": session.mode,
+                "sender": parts.first ?? "", "instance": parts.count > 1 ? parts[1] : "", "updated_ms": session.statusAt] as [String: Any]
     }
 
     private static func cqCall(_ message: String) -> String? {

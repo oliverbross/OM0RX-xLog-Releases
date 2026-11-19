@@ -1,0 +1,19 @@
+.xlog-dialog.feedback-dialog { width:min(460px,calc(100vw - 40px)); max-height:75vh; background:#0b1728; border-radius:12px; }
+.feedback-dialog > header { padding:12px 16px; }
+.feedback-dialog > header h2 { font-size:17px; color:#e6edf6; }
+.feedback-dialog .xlog-dialog-content { padding:16px; overflow-wrap:anywhere; }
+.feedback-dialog .feedback-message { max-height:38vh; overflow:auto; color:#e6edf6; }
+.feedback-dialog .feedback-message > :is(p,div,section,span,aside,small,output) { position:static; margin:0; padding:0; border:0; background:none; box-shadow:none; color:inherit; max-width:none; }
+.feedback-dialog .feedback-message [role=alert] { color:inherit; }
+.feedback-dialog .feedback-message button { margin:8px 6px 0 0; }
+.feedback-dialog .feedback-additional { margin-top:12px; color:#afc4d4; }
+.feedback-dialog .feedback-additional[hidden] { display:none; }
+.feedback-dialog .feedback-additional summary { cursor:pointer; }
+.feedback-dialog .feedback-additional .feedback-message { margin-top:12px; }
+.feedback-dialog .dialog-actions { margin-top:16px; }
+
+.feedback-repeats {
+  margin: 2px 0 0;
+  font-size: 0.85em;
+  opacity: 0.75;
+}

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useState } from "react";
 
 type Data = Record<string, any>;
@@ -27,7 +28,7 @@ export default function QRZLookupTest({ request, defaultCall, provider = "QRZ", 
     <label>{provider} test callsign<input aria-label={`${provider} test callsign`} value={call} maxLength={32}
       onChange={event => setCall(event.target.value.toUpperCase())} /></label>
     <button type="button" disabled={!applied || busy || !/^[A-Z0-9/]{3,32}$/.test(call.trim())} onClick={() => void test()}>{busy ? `Testing ${provider}…` : `Test ${provider} lookup`}</button>
-    {!applied && <p className="service-credential-state" role="status">Save settings to apply {provider} before testing.</p>}
-    {message && <p className="service-credential-state" role="status">{message}</p>}
+    {!applied && <ErrorNotice><p className="service-credential-state" role="status">Save settings to apply {provider} before testing.</p></ErrorNotice>}
+    {message && <ErrorNotice when={true} title="Message"><p className="service-credential-state" role="status">{message}</p></ErrorNotice>}
   </div>;
 }

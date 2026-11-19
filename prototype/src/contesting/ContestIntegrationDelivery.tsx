@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import {useEffect,useRef,useState} from "react";
 import type {ContestRequest} from "./types";
 
@@ -21,8 +22,8 @@ export function ContestIntegrationDelivery({scope,request,disabled}:{scope:{sess
     catch(cause){if(currentIdentity.current===origin)setError(cause instanceof Error?cause.message:String(cause));}finally{if(currentIdentity.current===origin)setRetrying(false);}};
   return <section aria-label="External integration delivery"><h2>External integration delivery</h2>
     <p>N1MM-compatible UDP: sent means an attempted datagram, never remote persistence or contest submission. A newer contact or changed destination blocks an old retry.</p>
-    {error&&<p role="alert">{error}</p>}
-    {snapshot?.scorePublicationComplete===false&&<p role="status">Score publication withheld: the current score is incomplete.</p>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
+    {snapshot?.scorePublicationComplete===false&&<ErrorNotice><p role="status">Score publication withheld: the current score is incomplete.</p></ErrorNotice>}
     <div className="contest-log-scroll"><table><thead><tr><th>Packet</th><th>Destination</th><th>Delivery</th><th>Attempts</th><th>Review</th></tr></thead>
       <tbody>{snapshot?.rows.map(row=><tr key={row.id}><td>{row.kind}</td><td>{row.destination}</td><td>{row.outcome==="sent_unverified"?"Sent · remote result unverified":row.outcome==="attempting"?"Interrupted or pending · uncertain":row.outcome}{row.error&&` · ${row.error}`}</td>
         <td>{row.attempts}</td><td><code style={{overflowWrap:"anywhere"}}>{row.sha256}</code><label><input type="checkbox" disabled={disabled||retrying}

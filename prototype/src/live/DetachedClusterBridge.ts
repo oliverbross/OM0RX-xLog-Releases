@@ -2,7 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export const detachedClusterMethods = [
-  "cluster_snapshot", "cluster_filter", "cluster_connect", "cluster_disconnect",
+  "cluster_snapshot", "cluster_filter", "cluster_connect", "cluster_disconnect", "cluster_push_spots",
   "cluster_history", "cluster_command", "cluster_console_clear", "cluster_configure",
 ] as const;
 export type DetachedClusterMethod = typeof detachedClusterMethods[number];

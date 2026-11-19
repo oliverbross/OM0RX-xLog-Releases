@@ -22,6 +22,7 @@ pub fn handles(method: &str) -> bool {
             | "cluster_history"
             | "cluster_command"
             | "cluster_console_clear"
+            | "cluster_push_spots"
             | "cluster_configure"
             | "cluster_radio_spots_configure"
             | "cluster_contest_radio_spots_publish"
@@ -38,7 +39,7 @@ pub fn validate(label: &str, request: &Value) -> Result<(), String> {
     if !handles(method)
         || !matches!(
             label,
-            "main" | "settings" | "dx-cluster" | "monitor" | "world-map" | "band-maps" | "contest-setup"
+            "main" | "settings" | "dx-cluster" | "special" | "monitor" | "world-map" | "band-maps" | "contest-setup"
         )
     {
         return Err("This window cannot access the cluster session.".into());
@@ -57,7 +58,7 @@ pub fn validate(label: &str, request: &Value) -> Result<(), String> {
     {
         return Err("The contest Cluster window may only read, connect, disconnect, or request recent spots from the shared cluster session.".into());
     }
-    if label == "settings" && !matches!(method, "cluster_snapshot" | "cluster_radio_spots_configure") {
+    if label == "settings" && !matches!(method, "cluster_snapshot" | "cluster_radio_spots_configure" | "cluster_configure" | "cluster_connect" | "cluster_disconnect" | "cluster_password_set") {
         return Err("This cluster action is unavailable in Settings.".into());
     }
     if label != "main" && label != "settings"
@@ -78,11 +79,16 @@ struct Projection {
     available: bool,
     received_at_ms: u64,
     identities: crate::spot_identity::SpotIdentities,
+    /// Needs evidence from the dedicated needs poll, retained apart from the
+    /// spot snapshot so its freshness never waits for the large snapshot reply.
+    needs: Option<Value>,
+    needs_received_at_ms: u64,
 }
 
 pub struct ClusterSession {
     activity_tick: Arc<dyn Fn() + Send + Sync>,
     transport: Arc<Transport>,
+    needs_transport: Option<Arc<Transport>>,
     publish: Arc<Publish>,
     command: Mutex<()>,
     projection: Mutex<Projection>,
@@ -105,6 +111,7 @@ impl ClusterSession {
         Self {
             activity_tick: Arc::new(|| {}),
             transport,
+            needs_transport: None,
             publish,
             command: Mutex::new(()),
             projection: Mutex::new(Projection {
@@ -115,6 +122,8 @@ impl ClusterSession {
                 available: false,
                 received_at_ms: 0,
                 identities: crate::spot_identity::SpotIdentities::new(crate::worker::generation()),
+                needs: None,
+                needs_received_at_ms: 0,
             }),
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -139,6 +148,32 @@ impl ClusterSession {
             "method":"cluster_snapshot","params":{}})
     }
 
+    fn needs_request(&self) -> Value {
+        json!({"id":format!("native-cluster-needs-{}", self.sequence.fetch_add(1, Ordering::AcqRel)),
+            "method":"cluster_snapshot","params":{"needs_only":true}})
+    }
+
+    /// One dedicated needs poll. It never takes the command lock, never
+    /// replaces the spot projection and never emits to renderers.
+    fn refresh_needs(&self) {
+        let Some(transport) = self.needs_transport.as_ref() else { return; };
+        if self.active().is_err() { return; }
+        let generation = crate::worker::generation();
+        let reply = transport(self.needs_request());
+        self.accept_needs(reply, generation, crate::worker::generation());
+    }
+
+    fn accept_needs(&self, reply: Result<Value, String>, generation: u64, current_generation: u64) {
+        let needs = reply.ok().filter(|response| response["ok"] == true && generation == current_generation)
+            .map(|response| response["result"]["needs"].clone()).filter(Value::is_object);
+        if let Ok(mut state) = self.projection.lock() {
+            state.needs_received_at_ms = if needs.is_some() {
+                SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
+            } else { 0 };
+            state.needs = needs;
+        }
+    }
+
     fn resume_request(&self) -> Value {
         json!({"id":format!("native-cluster-{}", self.sequence.fetch_add(1, Ordering::AcqRel)),
             "method":"cluster_resume","params":{}})
@@ -150,7 +185,8 @@ impl ClusterSession {
             .lock()
             .map_err(|_| "Cluster projection unavailable")?;
         Ok(
-            json!({"revision":state.revision,"selection_revision":state.selection_revision,"response":state.response,"selected":state.selected,"available":state.available,"received_at_ms":state.received_at_ms}),
+            json!({"revision":state.revision,"selection_revision":state.selection_revision,"response":state.response,"selected":state.selected,"available":state.available,"received_at_ms":state.received_at_ms,
+                "needs":state.needs,"needs_received_at_ms":state.needs_received_at_ms}),
         )
     }
 
@@ -295,6 +331,26 @@ impl ClusterSession {
         state.identities.resolve(epoch, id, version, crate::worker::generation())
     }
 
+    /// Refresh only the authority for an equivalent native alert report; never its tuning fields.
+    pub fn matching_alert_observation(&self, entry: &Value) -> Result<Option<Value>, String> {
+        self.active()?;
+        if entry["test"] != false || entry["source"] != "cluster" { return Ok(None); }
+        let state = self.projection.lock().map_err(|_| "Cluster projection unavailable")?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "Cluster clock unavailable")?.as_millis() as u64;
+        if !state.available || now.saturating_sub(state.received_at_ms) > 5000 || state.received_at_ms > now + 1000 { return Ok(None); }
+        let Some(response) = &state.response else { return Ok(None); };
+        let Some(frequency) = entry["frequencyKHz"].as_f64().filter(|f| f.is_finite() && *f > 0.0) else { return Ok(None); };
+        for spot in ["/snapshot/spots", "/contest_spots"].into_iter().filter_map(|path| response.pointer(path)?.as_array()).flatten() {
+            if spot["callsign"] != entry["callsign"] || spot["band"] != entry["band"] || spot["mode"] != entry["mode"]
+                || spot["frequencyKHz"].as_f64().is_none_or(|f| (f * 1000.0).round() != (frequency * 1000.0).round()) { continue; }
+            let Some(((epoch, id), version)) = spot["activation"]["sourceEpoch"].as_str().zip(spot["id"].as_str()).zip(spot["activation"]["spotVersion"].as_str()) else { continue; };
+            if state.identities.resolve(epoch, id, version, crate::worker::generation()).is_ok() {
+                return Ok(Some(json!({"id":id,"activation":spot["activation"]})));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn request(&self, request: Value) -> Result<Value, String> {
         self.active()?;
         crate::worker::validate_request(&request)?;
@@ -318,10 +374,12 @@ impl ClusterSession {
                 return Ok(json!({"id":request["id"],"ok":true,"result":state.response}));
             }
         }
-        let _guard = self
-            .command
-            .try_lock()
-            .map_err(|_| "Cluster session is busy. Wait for the current action to finish.")?;
+        let explicit_setup = matches!(request["method"].as_str(), Some("cluster_connect" | "cluster_disconnect" | "cluster_configure" | "cluster_password_set"));
+        let _guard = if explicit_setup {
+            self.command.lock().map_err(|_| "Cluster session unavailable.")?
+        } else {
+            self.command.try_lock().map_err(|_| "Cluster session is busy. Wait for the current action to finish.")?
+        };
         self.active()?;
         if matches!(request["method"].as_str(), Some("cluster_connect" | "cluster_disconnect" | "cluster_configure")) {
             // Retire displayed activation tokens before a source/session action,
@@ -433,6 +491,7 @@ impl ClusterSession {
         }
         let owner = Arc::clone(self);
         std::thread::spawn(move || {
+            let mut started = std::time::Instant::now();
             while owner.active().is_ok() {
                 let Ok(guard) = owner.wake.0.lock() else {
                     break;
@@ -440,12 +499,31 @@ impl ClusterSession {
                 let _ = owner
                     .wake
                     .1
-                    .wait_timeout_while(guard, Duration::from_secs(1), |_| {
+                    .wait_timeout_while(guard, poll_wait(started.elapsed()), |_| {
                         !owner.stopped.load(Ordering::Acquire)
                     });
+                started = std::time::Instant::now();
                 owner.cycle();
             }
         });
+        if self.needs_transport.is_none() { return; }
+        let owner = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut started = std::time::Instant::now();
+            while owner.active().is_ok() {
+                let Ok(guard) = owner.wake.0.lock() else { break; };
+                let _ = owner.wake.1.wait_timeout_while(guard, needs_poll_wait(started.elapsed()), |_| {
+                    !owner.stopped.load(Ordering::Acquire)
+                });
+                started = std::time::Instant::now();
+                if needs_wanted(now_ms(), NEEDS_READER_AT_MS.load(Ordering::Acquire)) { owner.refresh_needs(); }
+            }
+        });
+    }
+
+    fn with_needs_transport(mut self, transport: Arc<Transport>) -> Self {
+        self.needs_transport = Some(transport);
+        self
     }
 
     fn with_activity_tick(mut self, tick: Arc<dyn Fn() + Send + Sync>) -> Self {
@@ -466,6 +544,43 @@ impl ClusterSession {
     }
 }
 
+/// Polls start once per second, measured start to start. The retained snapshot
+/// carries needs evidence with a 2 s lifetime, and a worker reply takes about
+/// 1.2–1.7 s on a full logbook. Waiting a further second after each reply made
+/// the period 2.2–2.7 s, so the evidence was expired most of the time and every
+/// companion needs read answered Unknown.
+/// A slow reply is followed by a short gap, never an immediate re-poll, so
+/// other worker requests still interleave.
+const POLL_PERIOD: Duration = Duration::from_secs(1);
+const POLL_MIN_GAP: Duration = Duration::from_millis(100);
+fn poll_wait(since_last_start: Duration) -> Duration {
+    POLL_PERIOD.saturating_sub(since_last_start).max(POLL_MIN_GAP)
+}
+
+/// Needs evidence lives two seconds. Its small dedicated reply is refreshed
+/// every half second, start to start, so a single slow or missed reply still
+/// leaves fresh evidence; the large spot snapshot keeps its own one-second poll.
+const NEEDS_POLL_PERIOD: Duration = Duration::from_millis(500);
+fn needs_poll_wait(since_last_start: Duration) -> Duration {
+    NEEDS_POLL_PERIOD.saturating_sub(since_last_start).max(POLL_MIN_GAP)
+}
+
+/// The dedicated needs evidence has one reader, the paired companion. Each
+/// needs poll is a full-logbook classification costing the worker hundreds of
+/// milliseconds, so it runs only while a companion has read needs recently;
+/// with no companion (full Nexus, or none) it costs nothing. 2026-11-19: two
+/// polls a second with no reader kept the Windows worker saturated.
+const NEEDS_READER_WINDOW_MS: u64 = 10_000;
+static NEEDS_READER_AT_MS: AtomicU64 = AtomicU64::new(0);
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
+}
+/// The companion read (or is about to read) the needs evidence.
+pub(crate) fn note_needs_reader() { NEEDS_READER_AT_MS.store(now_ms(), Ordering::Release); }
+fn needs_wanted(now: u64, last_reader: u64) -> bool {
+    last_reader != 0 && now.saturating_sub(last_reader) <= NEEDS_READER_WINDOW_MS
+}
+
 static OWNER: OnceLock<Arc<ClusterSession>> = OnceLock::new();
 static STOPPED: AtomicBool = AtomicBool::new(false);
 
@@ -481,16 +596,21 @@ pub fn owner(app: &tauri::AppHandle) -> Result<Arc<ClusterSession>, String> {
         .get_or_init(|| {
             let app = app.clone();
             Arc::new(ClusterSession::new(
-                Arc::new(crate::worker::request),
+                Arc::new(crate::worker::request_cluster_poll),
                 Arc::new(move |projection| {
                     if let Some(alerts) = crate::dx_alerts::existing() {
                         if let Err(error) = alerts.observe(&projection) { eprintln!("DX alert observation unavailable: {error}"); }
                     }
-                    for label in ["dx-cluster", "world-map", "dxpedition-map", "band-maps", "monitor"] {
+                    for label in ["dx-cluster", "world-map", "dxpedition-map", "band-maps", "monitor", "special"] {
                         let _ = app.emit_to(label, "xlog:cluster-projection", &projection);
                     }
+                    for band in crate::workspace_windows::BAND_MAP_BANDS {
+                        let _ = app.emit_to(format!("band-map-{band}").as_str(), "xlog:cluster-projection", &projection);
+                    }
                 }),
-            ).with_activity_tick(Arc::new(|| {
+            ).with_needs_transport(Arc::new(crate::worker::request_cluster_poll))
+            .with_activity_tick(Arc::new(|| {
+                if let Some(alerts) = crate::dx_alerts::existing() { alerts.refresh_chases(); }
                 // The Swift UDP receiver is only built for macOS.
                 if !cfg!(target_os = "macos") { return; }
                 if let Some(alerts) = crate::dx_alerts::existing() {
@@ -532,6 +652,16 @@ mod tests {
     fn request(method: &str) -> Value {
         json!({"id":"fixture-12345678","method":method,"params":{}})
     }
+    #[test]
+    fn polls_run_once_per_second_start_to_start_so_two_second_needs_evidence_stays_fresh() {
+        // A fast reply waits out the rest of the second.
+        assert_eq!(poll_wait(Duration::from_millis(300)), Duration::from_millis(700));
+        // A 1.5 s reply (measured on a full logbook) is followed only by the minimum gap,
+        // so polls start every 1.6 s rather than every 2.5 s as before.
+        assert_eq!(poll_wait(Duration::from_millis(1_500)), POLL_MIN_GAP);
+        assert!(Duration::from_millis(1_500) + poll_wait(Duration::from_millis(1_500)) < Duration::from_secs(2));
+        assert_eq!(poll_wait(Duration::ZERO), POLL_PERIOD);
+    }
     fn command_request(command: &str) -> Value {
         json!({"id":"fixture-12345678","method":"cluster_command","params":{"command":command}})
     }
@@ -547,6 +677,7 @@ mod tests {
             "cluster_history",
             "cluster_command",
             "cluster_console_clear",
+            "cluster_push_spots",
             "cluster_configure",
             "cluster_radio_spots_configure",
         ] {
@@ -558,7 +689,7 @@ mod tests {
         assert!(validate("dx-cluster", &request("cluster_password_set")).is_err());
         assert!(validate("settings", &request("cluster_snapshot")).is_ok());
         assert!(validate("settings", &request("cluster_radio_spots_configure")).is_ok());
-        assert!(validate("settings", &request("cluster_configure")).is_err());
+        assert!(validate("settings", &request("cluster_configure")).is_ok());
         for label in ["monitor", "world-map", "band-maps", "contest-setup"] {
             assert!(validate(label, &request("cluster_snapshot")).is_ok());
             assert!(validate(label, &request("cluster_connect")).is_err());
@@ -724,6 +855,30 @@ mod tests {
         owner.cycle(); owner.cycle();
         assert_eq!(published.load(Ordering::SeqCst), 2);
     }
+    #[test]
+    fn alert_refresh_uses_equivalent_current_native_report_without_reviving_old_authority() {
+        let owner = ClusterSession::new(Arc::new(|_| unreachable!()), Arc::new(|_| {}));
+        let report = json!({"id":"report","callsign":"3X4U","frequencyKHz":10107.0,"mode":"CW","band":"30m","comment":"old"});
+        let mut response = json!({"ok":true,"result":{"snapshot":{"spots":[report.clone()]},"contest_spots":[]}});
+        owner.accept(&response, crate::worker::generation()).unwrap();
+        let original = owner.projection_value().unwrap()["response"]["snapshot"]["spots"][0]["activation"].clone();
+        let mut entry = report.clone(); entry["test"] = json!(false); entry["source"] = json!("cluster");
+        response["result"]["snapshot"]["spots"][0]["comment"] = json!("updated metadata");
+        owner.accept(&response, crate::worker::generation()).unwrap();
+        assert!(owner.activation_spot(original["sourceEpoch"].as_str().unwrap(), "report", original["spotVersion"].as_str().unwrap()).is_err());
+        let current = owner.matching_alert_observation(&entry).unwrap().unwrap();
+        assert_ne!(current["activation"], original);
+        assert_eq!(owner.activation_spot(current["activation"]["sourceEpoch"].as_str().unwrap(), "report", current["activation"]["spotVersion"].as_str().unwrap()).unwrap()["frequencyHz"], 10_107_000);
+        for (field, value) in [("frequencyKHz", json!(10108)), ("mode", json!("SSB")), ("band", json!("20m")), ("callsign", json!("OTHER1")), ("source", json!("wsjtx")), ("test", json!(true))] {
+            let mut changed = entry.clone(); changed[field] = value;
+            assert!(owner.matching_alert_observation(&changed).unwrap().is_none(), "{field}");
+        }
+        owner.projection.lock().unwrap().received_at_ms = 0;
+        assert!(owner.matching_alert_observation(&entry).unwrap().is_none());
+        owner.unavailable();
+        assert!(owner.matching_alert_observation(&entry).unwrap().is_none());
+    }
+
     #[test]
     fn first_direct_reply_has_native_tokens_and_old_worker_payload_is_never_relabelled() {
         let owner = ClusterSession::new(Arc::new(|request| Ok(json!({"id":request["id"],"ok":true,"result":{
@@ -1000,5 +1155,162 @@ mod tests {
         let projection = owner.projection_value().unwrap();
         assert_eq!(projection["available"], false);
         assert_eq!(projection["response"]["query"], "last-good");
+    }
+
+    #[test]
+    fn retained_projection_drives_companion_spots_metadata_and_mutation_fence() {
+        use crate::companion_host::inspect_retained_cluster_for_test as inspect;
+        use crate::companion_projection::{now, NeedsFence};
+        // Actual owner accept/projection path, with no renderer, global owner,
+        // native worker, network, database or device connection.
+        let owner = ClusterSession::new(
+            Arc::new(|_| panic!("producer contract test must not dispatch")),
+            Arc::new(|_| {}),
+        );
+        let generation = crate::worker::generation();
+        let reply = |classification: u64, logbook: u64, call_status: &str| {
+            json!({"ok":true,"result":{
+                "snapshot":{"spots":[{"id":"producer-spot","callsign":"W1AW",
+                    "frequencyKHz":14025.0,"mode":"CW","source":"DX cluster",
+                    "receivedAt":now() as f64 / 1000.0 - 978307200.0,
+                    "callStatus":call_status,"dxccStatus":"","score":42,
+                    "scoreReasons":["Actual retained producer contract"]}],
+                    "contactRevision":classification,"logbookDataLoaded":true},
+                "contest_spots":[],"contact_refresh_state":"current",
+                "contact_refresh_error":null,"contact_logbook_revision":logbook,
+                "needs":{"generated_at_unix_ms":now(),"max_age_ms":2000,"readiness":"ready",
+                    "authority":{"classification_revision":classification,"logbook_revision":logbook,
+                        "country_reference_revision":"fixture-country-v1",
+                        "policy_revision":"xlog-call-dxcc-needs-v1"}}
+            }})
+        };
+        owner.accept_at_generation(&reply(5, 40, "New Call"), generation, generation).unwrap();
+        let projection = owner.projection_value().unwrap();
+        assert!(projection["response"].get("result").is_none(), "owner retains payload, not RPC envelope");
+        assert_eq!(projection["response"]["snapshot"]["spots"].as_array().unwrap().len(), 1);
+        let mut fence = NeedsFence::default();
+        let (missing_classification, missing_logbook, missing_rows, missing_metadata) = inspect(&Value::Null, &mut fence);
+        assert_eq!((missing_classification, missing_logbook), (None, None));
+        assert_eq!(missing_rows["spots"], json!([]));
+        assert_eq!(missing_metadata["readiness"], "unavailable");
+        assert!(missing_metadata["authority"].is_null());
+        let (classification, logbook, projected, metadata) = inspect(&projection, &mut fence);
+        assert_eq!((classification, logbook), (Some(5), Some(40)));
+        assert_eq!(projected["spots"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["spots"][0]["callsign"], "W1AW");
+        assert_eq!(projected["spots"][0]["need"]["status"], "needed");
+        assert_eq!(projected["spots"][0]["need"]["score"], 42);
+        assert_eq!(metadata["readiness"], "ready");
+        assert_eq!(metadata["authority"]["logbook_revision"], 40);
+
+        // Mutation admission uses the SAME revision reader as this inspection.
+        fence.begin("qso:producer-contract".into(), classification.unwrap());
+        let (_, _, held, held_metadata) = inspect(&projection, &mut fence);
+        assert_eq!(held["spots"][0]["need"]["status"], "unknown");
+        assert_ne!(held_metadata["readiness"], "ready");
+        assert!(held_metadata["authority"].is_null());
+        fence.complete("qso:producer-contract", &Ok(json!({"ok":true,
+            "result":{"status":"applied","logbook_revision":41}})));
+        assert_eq!(inspect(&projection, &mut fence).2["spots"][0]["need"]["status"], "unknown");
+        owner.accept_at_generation(&reply(6, 41, "Worked"), generation, generation).unwrap();
+        let settled = owner.projection_value().unwrap();
+        let (classification, _, projected, metadata) = inspect(&settled, &mut fence);
+        assert_eq!(projected["spots"][0]["need"]["status"], "worked");
+        assert_eq!(metadata["readiness"], "ready");
+        assert_eq!(metadata["authority"]["classification_revision"], 6);
+
+        // Legacy owner writes without a returned database revision must wait
+        // for classification newer than the retained pre-write baseline.
+        fence.begin("request:logbook_contact_apply:legacy".into(), classification.unwrap());
+        fence.complete("request:logbook_contact_apply:legacy", &Ok(json!({"ok":true,"result":{"status":"applied"}})));
+        assert_eq!(inspect(&settled, &mut fence).2["spots"][0]["need"]["status"], "unknown");
+        owner.accept_at_generation(&reply(7, 42, "Worked"), generation, generation).unwrap();
+        let settled = owner.projection_value().unwrap();
+        assert_eq!(inspect(&settled, &mut fence).3["readiness"], "ready");
+
+        // A real retained publication becoming unavailable must lose authority;
+        // its last rows may remain visible only as Unknown.
+        owner.unavailable();
+        let unavailable = owner.projection_value().unwrap();
+        let (_, _, projected, metadata) = inspect(&unavailable, &mut fence);
+        assert_eq!(projected["spots"][0]["need"]["status"], "unknown");
+        assert_eq!(metadata["readiness"], "unavailable");
+        assert!(metadata["authority"].is_null());
+        let mut expired = settled;
+        expired["received_at_ms"] = json!(now() - 60_001);
+        let (_, _, projected, metadata) = inspect(&expired, &mut fence);
+        assert_eq!(projected["spots"][0]["need"]["status"], "unknown");
+        assert_eq!(metadata["readiness"], "unavailable");
+    }
+    #[test]
+    fn needs_poll_refreshes_twice_a_second_so_one_slow_reply_still_leaves_fresh_evidence() {
+        assert_eq!(needs_poll_wait(Duration::from_millis(100)), Duration::from_millis(400));
+        assert_eq!(needs_poll_wait(Duration::from_millis(900)), POLL_MIN_GAP);
+        // Even a missed reply between two on-time ones stays inside the two-second lifetime.
+        assert!(NEEDS_POLL_PERIOD * 3 < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn needs_poll_runs_only_while_a_companion_has_read_needs_recently() {
+        assert!(!needs_wanted(50_000, 0), "no reader yet: no full-logbook needs poll");
+        assert!(needs_wanted(50_000, 45_000));
+        assert!(needs_wanted(50_000, 50_000 - NEEDS_READER_WINDOW_MS));
+        assert!(!needs_wanted(50_000, 50_000 - NEEDS_READER_WINDOW_MS - 1));
+    }
+
+    #[test]
+    fn dedicated_needs_evidence_is_retained_apart_from_the_spot_snapshot() {
+        let owner = ClusterSession::new(
+            Arc::new(|_| panic!("needs acceptance test must not dispatch")),
+            Arc::new(|_| panic!("needs evidence must never be emitted to renderers")),
+        );
+        let ready = || Ok(json!({"ok":true,"result":{"needs":{"readiness":"ready","generated_at_unix_ms":1}}}));
+        owner.accept_needs(ready(), 3, 3);
+        let projection = owner.projection_value().unwrap();
+        assert_eq!(projection["needs"]["readiness"], "ready");
+        assert!(projection["needs_received_at_ms"].as_u64().unwrap() > 0);
+        assert!(projection["response"].is_null(), "the spot projection is untouched");
+        assert_eq!(projection["revision"], 0);
+        // A replaced worker, a transport failure or a malformed body each clear it.
+        owner.accept_needs(ready(), 3, 4);
+        assert!(owner.projection_value().unwrap()["needs"].is_null());
+        owner.accept_needs(ready(), 3, 3);
+        owner.accept_needs(Err("timeout".into()), 3, 3);
+        let cleared = owner.projection_value().unwrap();
+        assert!(cleared["needs"].is_null());
+        assert_eq!(cleared["needs_received_at_ms"], 0);
+        owner.accept_needs(Ok(json!({"ok":true,"result":{"needs":null}})), 3, 3);
+        assert!(owner.projection_value().unwrap()["needs"].is_null());
+        owner.accept_needs(Ok(json!({"ok":false,"error":{"message":"busy"}})), 3, 3);
+        assert!(owner.projection_value().unwrap()["needs"].is_null());
+    }
+
+    #[test]
+    fn companion_needs_freshness_follows_the_dedicated_poll_not_the_slow_spot_snapshot() {
+        use crate::companion_host::inspect_retained_cluster_for_test as inspect;
+        use crate::companion_projection::{now, NeedsFence};
+        let authority = json!({"classification_revision":5,"logbook_revision":40,
+            "country_reference_revision":"fixture-country-v1","policy_revision":"xlog-call-dxcc-needs-v1"});
+        let needs = |generated: u64| json!({"generated_at_unix_ms":generated,"max_age_ms":2000,
+            "readiness":"ready","authority":authority});
+        // The spot snapshot arrived 1.8 s ago carrying evidence stamped 2.5 s ago: expired.
+        let mut cluster = json!({"available":true,"received_at_ms":now() - 1800,
+            "response":{"snapshot":{"spots":[],"contactRevision":5},"contact_logbook_revision":40,
+                "needs":needs(now() - 2500)}});
+        let mut fence = NeedsFence::default();
+        assert_eq!(inspect(&cluster, &mut fence).3["readiness"], "unavailable");
+        // The dedicated poll's evidence, 200 ms old, keeps the authority ready.
+        cluster["needs"] = needs(now() - 200);
+        cluster["needs_received_at_ms"] = json!(now() - 150);
+        let metadata = inspect(&cluster, &mut fence).3;
+        assert_eq!(metadata["readiness"], "ready");
+        assert_eq!(metadata["authority"]["logbook_revision"], 40);
+        // Stale dedicated evidence is not rescued by the older snapshot copy.
+        cluster["needs_received_at_ms"] = json!(now() - 2500);
+        assert_eq!(inspect(&cluster, &mut fence).3["readiness"], "unavailable");
+        // The spot snapshot must still be available: the fence reads its revisions.
+        cluster["needs_received_at_ms"] = json!(now() - 150);
+        cluster["available"] = json!(false);
+        assert_eq!(inspect(&cluster, &mut fence).3["readiness"], "unavailable");
     }
 }

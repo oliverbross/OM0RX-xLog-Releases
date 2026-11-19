@@ -1,12 +1,18 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
+import Foundation
+import XCatIntegrationCore
+#if os(Windows)
+import CClusterSocket
+import Crypto
+import XLogPortableCore
+#else
 import AppKit
 import CryptoKit
 import Darwin
-import Foundation
 import LocalAuthentication
 import Security
-import XCatIntegrationCore
 import XLogCore
+#endif
 
 /// A failed reply can still mean that the agent started transmitting. Keep the
 /// release obligation until a successful stop, without touching a read-only peer.
@@ -90,6 +96,8 @@ struct StationCarrierIntent {
     }
 }
 
+#endif
+#if os(macOS) || os(Windows)
 /// Enqueue before yielding: overlapping listener retirement and station
 /// shutdown must both wait for the same pending writes and release callbacks.
 struct StationCATRetirement {
@@ -334,7 +342,12 @@ actor LiveStationSession {
             let servers = EmbeddedCATServers(radio: client, configuration: nextConfiguration,
                 observedSnapshot: { await client.observedSnapshot() },
                 authorizeMutation: { [weak self] mutation in await self?.authorizeCATMutation(mutation, generation: generation, epoch: epoch) ?? false },
-                didCompleteMutation: { [weak self] mutation in await self?.completeCATMutation(mutation, generation: generation) })
+                didCompleteMutation: { [weak self] mutation in await self?.completeCATMutation(mutation, generation: generation) },
+                stationStateProvider: { Self.companionState(await client.observedSnapshot()) },
+                stationActionHandler: { name in
+                    guard let action = RemoteStationAction(rawValue: name) else { return false }
+                    do { try await client.performStationAction(action); return true } catch { return false }
+                })
             do { try servers.start() }
             catch { throw WorkerFailure("cat_listener_failed", "Cannot open CAT listeners. Check for conflicting ports and close the other CAT server first.") }
             catServers = servers; catConfiguration = nextConfiguration
@@ -344,22 +357,16 @@ actor LiveStationSession {
             let endpoint = try Self.validatedURL(params["base_url"])
             let enteredToken = params["token"] as? String
             guard params["token"] == nil || enteredToken != nil else { throw Self.invalidParams() }
-            if let rawInteraction = params["allow_keychain_interaction"] {
-                guard let value = rawInteraction as? NSNumber,
-                      CFGetTypeID(value) == CFBooleanGetTypeID() else { throw Self.invalidParams() }
-            }
-            let transmit: Bool
-            if let rawTransmit = params["allow_transmit"] {
-                guard let value = rawTransmit as? NSNumber,
-                      CFGetTypeID(value) == CFBooleanGetTypeID() else { throw Self.invalidParams() }
-                transmit = value.boolValue
-            } else {
-                transmit = false
-            }
+            _ = try Self.boolean(params["allow_keychain_interaction"])
+            let transmit = try Self.boolean(params["allow_transmit"]) ?? false
             let keychain = StationAgentKeychain(endpoint: endpoint, radioID: radioID)
             let token = try enteredToken?.trimmingCharacters(in: .whitespacesAndNewlines)
                 ?? credentialCache.resolve(endpoint: endpoint, interactionAllowed: false) {
-                    try keychain.load(interactionAllowed: $0)
+                    #if os(Windows)
+                    if endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == LocalStationAgent.address,
+                       let token = Self.installedLocalAgentToken() { return token }
+                    #endif
+                    return try keychain.load(interactionAllowed: $0)
                 }
             guard let token, !token.isEmpty, token.utf8.count <= 4_096 else {
                 throw WorkerFailure("station_credentials_required", "Enter a Remote Station Agent token.")
@@ -387,6 +394,10 @@ actor LiveStationSession {
             } catch {
                 throw WorkerFailure("invalid_params", "Invalid Remote Station Agent connection settings.")
             }
+            if enteredToken != nil {
+                try keychain.save(token)
+                credentialCache.remember(token, endpoint: endpoint)
+            }
             connectionGeneration = generation
             powerSession = StationPowerSessionState()
             powerEvents = nextPowerEvents
@@ -402,10 +413,6 @@ actor LiveStationSession {
             baseURL = endpoint
             recordState(nextPowerEvents.stamp(.connecting), generation: generation)
             allowTransmit = transmit
-            if enteredToken != nil {
-                try keychain.save(token)
-                credentialCache.remember(token, endpoint: endpoint)
-            }
             await next.start()
             guard !terminalShutdown, generation == connectionGeneration, client === next else {
                 await next.stop()
@@ -1073,6 +1080,32 @@ actor LiveStationSession {
         return true
     }
 
+    // Match standalone xCat's camel-case RigCtl extension. Only observed radio
+    // and Agent telemetry is reported; this listener does not own a rotor or feed.
+    private static func companionState(_ radio: XCatIntegrationCore.RadioSnapshot) -> String? {
+        guard let station = radio.remoteStationStatus else { return nil }
+        let observed = radio.isConnected && station.radioKnown && !station.radioStale
+        let state: [String: Any] = [
+            "available": true, "generatedAt": Date().timeIntervalSince1970,
+            "radio": ["observed": observed, "connected": radio.isConnected,
+                      "frequencyHz": radio.frequencyHz, "mode": radio.mode, "receiveFrequencyHz": radio.frequencyHz,
+                      "transmitFrequencyHz": radio.transmitFrequencyHz, "receiveVFO": radio.slice,
+                      "transmitVFO": radio.transmitSlice, "split": radio.slice != radio.transmitSlice || radio.frequencyHz != radio.transmitFrequencyHz,
+                      "isTransmitting": radio.isTransmitting] as [String: Any],
+            "station": ["available": observed, "commissioned": station.commissioned,
+                        "coordinatorState": station.coordinatorState, "allowedActions": station.allowedActions.sorted(),
+                        "kpaOperate": optional(station.kpaOperate), "band": station.band, "routeAlignment": station.routeAlignment,
+                        "interlockState": station.interlockState, "txPowerWatts": optional(station.txPowerWatts),
+                        "swr": optional(station.swr), "swrIsLive": station.swrIsLive, "rfDriveWatts": optional(radio.rfPowerWatts),
+                        "kpaDetailPrimary": station.kpaDetailPrimary, "kpaDetailSecondary": station.kpaDetailSecondary,
+                        "katDetailPrimary": station.katDetailPrimary, "katDetailSecondary": station.katDetailSecondary,
+                        "routeDetail": station.routeDetail, "alarmSummary": station.alarmSummary] as [String: Any],
+            "rotor": ["connected": false, "name": "", "targetLabel": "", "status": "Disconnected",
+                      "isMoving": false, "motionDirection": ""] as [String: Any],
+            "propagation": ["status": "Unavailable", "xRay": "", "bands": []] as [String: Any]]
+        return (try? JSONSerialization.data(withJSONObject: state)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
     private func authorizeCATMutation(_ mutation: EmbeddedCATServers.Mutation, generation: UInt64, epoch: UInt64) async -> Bool {
         guard !terminalShutdown, generation == connectionGeneration, let client else { return false }
         switch mutation {
@@ -1150,9 +1183,13 @@ actor LiveStationSession {
 
     private func ensureExclusiveWriter() async throws {
         try requireActive()
+        #if os(macOS)
         let companionAppRunning = await MainActor.run {
             !NSRunningApplication.runningApplications(withBundleIdentifier: "com.oliverbross.OM0RXXCat").isEmpty
         }
+        #else
+        let companionAppRunning = false
+        #endif
         try requireActive()
         let ownedPorts = Set([catConfiguration.catPort, catConfiguration.rigCtlPort].compactMap { $0 })
         guard !companionAppRunning, !Self.companionListenerActive(excluding: ownedPorts) else {
@@ -1174,6 +1211,12 @@ actor LiveStationSession {
     /// A TCP connect probe sends no CAT/RigCtlD bytes and cannot command a radio.
     private static func companionListenerActive(excluding ownedPorts: Set<UInt16>) -> Bool {
         for port in [UInt16(14_532), 4_532, 15_002, 5_002] where !ownedPorts.contains(port) {
+            #if os(Windows)
+            if let socket = xlog_socket_connect("127.0.0.1", port, 200, nil) {
+                xlog_socket_close(socket)
+                return true
+            }
+            #else
             let descriptor = socket(AF_INET, SOCK_STREAM, 0)
             guard descriptor >= 0 else { return true }
             defer { close(descriptor) }
@@ -1191,29 +1234,32 @@ actor LiveStationSession {
                 }
             }
             if result == 0 { return true }
+            #endif
         }
         return false
     }
 
+    #if os(Windows)
+    static func installedLocalAgentToken() -> String? {
+        guard let roaming = ProcessInfo.processInfo.environment["APPDATA"] else { return nil }
+        let file = URL(fileURLWithPath: roaming).appendingPathComponent("OM0RX Remote Station/agent.json")
+        guard let data = try? Data(contentsOf: file),
+              let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let server = config["server"] as? [String: Any] else { return nil }
+        return server["control_token"] as? String
+    }
+    #endif
+
     static func validatedURL(_ value: Any?) throws -> String {
         guard let raw = value as? String, (1...2_048).contains(raw.utf8.count),
               var components = URLComponents(string: raw),
-              components.scheme?.lowercased() == "https",
+              (components.scheme?.lowercased() == "https" || LocalStationAgent.isLocal(components)),
               components.host?.isEmpty == false,
               components.user == nil, components.password == nil,
               components.query == nil, components.fragment == nil else { throw invalidParams() }
         while components.path.count > 1 && components.path.hasSuffix("/") { components.path.removeLast() }
         guard let result = components.url?.absoluteString else { throw invalidParams() }
         return result
-    }
-
-    static func validatedRotorHost(_ value: Any?) throws -> String {
-        guard let raw = value as? String else { throw invalidParams() }
-        let host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (1...253).contains(host.utf8.count),
-              !host.contains(where: { $0.isWhitespace || $0.isNewline }),
-              !host.contains("/"), !host.contains("@"), !host.contains(":") else { throw invalidParams() }
-        return host
     }
 
     private func requireKeys(_ params: [String: Any], allowed: Set<String>) throws {
@@ -1229,14 +1275,14 @@ actor LiveStationSession {
     private static func boolean(_ value: Any?) throws -> Bool? {
         guard let value else { return nil }
         guard let number = value as? NSNumber,
-              CFGetTypeID(number) == CFBooleanGetTypeID() else { throw invalidParams() }
+              let encoded = try? JSONSerialization.data(withJSONObject: [number]),
+              encoded == Data("[true]".utf8) || encoded == Data("[false]".utf8) else { throw invalidParams() }
         return number.boolValue
     }
 
     private static func integer(_ value: Any?) throws -> Int64? {
         guard let value else { return nil }
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID(),
+        guard let number = LiveStationMethods.jsonNumber(value),
               number.doubleValue.isFinite,
               number.doubleValue.rounded() == number.doubleValue,
               number.doubleValue >= Double(Int64.min),
@@ -1345,6 +1391,7 @@ actor LiveStationSession {
         return ["source": "direct_agent", "available": observed.isConnected, "generation": generation,
                 "transport_state": transport.rawValue, "generated_at": now.timeIntervalSince1970,
                 "radio": radio, "station": station, "rotor": NSNull(),
+                "elecraft": optional(observed.remoteStationStatus?.instrumentReadings.flatMap { try? JSONSerialization.jsonObject(with: $0) }),
                 "measured_tx_power": measuredPower,
                 "power_session_id": optional(powerSessionStartedAt.map { _ in powerSessionID.uuidString }),
                 "power_session_started_at": optional(powerSessionStartedAt?.timeIntervalSince1970),
@@ -1366,6 +1413,19 @@ private struct StationAgentKeychain {
         legacyAccount = radioID == "radio1" ? digest : nil
     }
 
+    #if os(Windows)
+    func load(interactionAllowed: Bool) throws -> String? {
+        try NativeCredentialStore(service: service).load(account, allowInteraction: interactionAllowed)
+    }
+
+    func save(_ token: String) throws {
+        try NativeCredentialStore(service: service).save(token, account: account)
+    }
+
+    func delete() throws {
+        try NativeCredentialStore(service: service).remove(account)
+    }
+    #else
     func load(interactionAllowed: Bool) throws -> String? {
         var item: CFTypeRef?
         var status = SecItemCopyMatching(query(returnData: true, interactionAllowed: interactionAllowed) as CFDictionary, &item)
@@ -1427,6 +1487,35 @@ private struct StationAgentKeychain {
             fields[kSecUseAuthenticationContext as String] = authentication
         }
         return fields
+    }
+    #endif
+}
+#endif
+
+
+#if os(Windows)
+public enum WindowsXCatCompanion {
+    public static func run() async -> Int32 {
+        let session = LiveStationSession()
+        do {
+            _ = try await session.handle("station_connect", params: ["provider": "direct_agent",
+                "base_url": LocalStationAgent.address, "allow_transmit": false])
+            for _ in 0..<100 {
+                if (await session.snapshot())["available"] as? Bool == true { break }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            _ = try await session.handle("station_cat_servers", params: ["provider": "direct_agent",
+                "cat_port": 15002, "rigctl_port": 14532, "allow_transmit": false])
+            print("xCat connected. TS-480 CAT 127.0.0.1:15002 · RigCtl 127.0.0.1:14532")
+            print("Receive tuning is enabled. Press Enter to disconnect and quit.")
+            _ = readLine()
+            await session.terminate()
+            return 0
+        } catch {
+            await session.terminate()
+            FileHandle.standardError.write(Data("xCat could not start. Check the local Agent, radio connection and CAT ports.\n".utf8))
+            return 1
+        }
     }
 }
 #endif

@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import XLogPrototypeSupport
 
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import XCatIntegrationCore
 private actor RetirementGate {
     private var started = false
@@ -77,6 +77,7 @@ final class IndependentRotorTests: XCTestCase {
         await fulfillment(of: [stopped], timeout: 1)
     }
 
+    #if os(macOS)
     func testRadioDisconnectPreservesNativeRotorAndRetirementBlocksReconnect() async throws {
         let gate = RetirementGate()
         let rotor = LiveRotorSession(factory: { _, _, onState, _ in
@@ -124,5 +125,6 @@ final class IndependentRotorTests: XCTestCase {
             XCTAssertEqual(failure.code, "worker_stopping")
         }
     }
+    #endif
 }
 #endif

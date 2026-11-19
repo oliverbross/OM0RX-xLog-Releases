@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { waitForWorkerAdmission } from "./workerAdmission";
 import type { BandMapViewPreferences } from "./live/BandMaps";
 export const desktop = isTauri();
 export type DetachedMapKind = "world-map" | "band-maps";
@@ -93,9 +94,8 @@ export async function framedWorkerRequest<T = unknown>(
       "The browser cannot connect to station services. Launch OM0RX-xLog on your desktop.",
     );
   const operating = await invoke<{ context: string }>("operating_module_status");
-  return invoke<WorkerResponse<T>>("worker_request", {
-    request: { id: crypto.randomUUID(), method, params, operatingContext: operating.context },
-  });
+  const request = { id: crypto.randomUUID(), method, params, operatingContext: operating.context };
+  return waitForWorkerAdmission(() => invoke<WorkerResponse<T>>("worker_request", { request }));
 }
 export async function workerRequest(
   method: string,

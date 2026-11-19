@@ -1,3 +1,6 @@
+import { ErrorNotice } from "./ErrorNotice";
+import CompanionBridgePanel from "./CompanionBridgePanel";
+import { isMacOS } from "./platform";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import DisplaySettings from "./DisplaySettings";
 import { EquipmentSettings } from "./StationEquipment";
@@ -11,6 +14,8 @@ import "./ServiceSettings.css";
 
 type Data = Record<string, any>;
 type Request = (method: string, params?: Data) => Promise<Data>;
+const AlertSettings = lazy(() => import("./DetachedAlertsSurface").then(m => ({ default: m.AlertSettings })));
+const ElecraftSettings = lazy(() => import("./ElecraftSettings"));
 const NormalShortcutSettings = lazy(() => import("./NormalShortcutSettings").then(module => ({ default: module.NormalShortcutSettings })));
 const QRZLookupTest = lazy(() => import("./QRZLookupTest"));
 const RadioSpotSettings = lazy(() => import("./RadioSpotSettings"));
@@ -25,16 +30,39 @@ export type ServiceSettingsProps = { values: Data; savedValues?: Data; request: 
   onExternalContact?: () => void;
   availableTabs?: readonly Tab[]; requestedTab?: Tab; requestedTabRevision?: number; cwContext?: CWContext; cwState?: CWState;
   refreshCW?: () => Promise<void>; cwProvider?: string };
-const tabs = ["Station", "Radio", "Logbook", "Wavelog", "Sync", "Integrations", "Radio spots", "Cluster", "QRZ", "Online logs", "Reference data", "Rotator", "CW", "Display", "Workspace", "Backups", "Experimental"] as const;
+const tabs = ["Station", "Radio", "Logbook", "Wavelog", "Sync", "Integrations", "Radio spots", "Cluster", "QRZ", "Online logs", "Reference data", "Rotator", "KPA500 & KAT500", "CW", "Display", "Workspace", "Alerts", "Backups", "Experimental"] as const;
 type Tab = typeof tabs[number];
 const tabLabels: Partial<Record<Tab, string>> = { Station: "General", Integrations: "WSJT-X", QRZ: "Callsign lookup" };
+// Visual menu order; keyboard navigation follows the same order.
 const settingsGroups: { label: string; tabs: readonly Tab[] }[] = [
-  { label: "Station", tabs: ["Station", "Radio", "Rotator", "CW"] },
-  { label: "Logbook", tabs: ["Logbook", "Wavelog", "Sync"] },
-  { label: "Connections", tabs: ["Integrations", "Radio spots", "Cluster"] },
-  { label: "Services", tabs: ["QRZ", "Online logs", "Reference data"] },
-  { label: "Application", tabs: ["Display", "Workspace", "Backups", "Experimental"] },
+  { label: "Station", tabs: ["Station", "Radio", "Rotator", "KPA500 & KAT500", "CW"] },
+  { label: "Logbook", tabs: ["Logbook", "Wavelog", "Sync", "Online logs"] },
+  { label: "Spots & digital", tabs: ["Cluster", "Radio spots", "Integrations"] },
+  { label: "Lookup & data", tabs: ["QRZ", "Reference data", "Backups"] },
+  { label: "Application", tabs: ["Display", "Workspace", "Alerts", "Experimental"] },
 ];
+const menuOrder: readonly Tab[] = [...settingsGroups.flatMap(group => group.tabs), ...tabs.filter(name => !settingsGroups.some(group => group.tabs.includes(name)))];
+const tabDescriptions: Record<Tab, string> = {
+  Station: "Station identity, equipment, portable operation and draft behaviour.",
+  Radio: "Radio connections and CAT control.",
+  Logbook: "How contacts are stored in the integrated logbook.",
+  Wavelog: "Address and API access for your online Wavelog logbook.",
+  Sync: "Synchronize the integrated logbook with Wavelog.",
+  Integrations: "WSJT-X link for logged contacts and decodes.",
+  "Radio spots": "Spots shown on the radio and shared with other programs.",
+  Cluster: "DX cluster connection and spot filtering.",
+  QRZ: "Online callsign lookup service and its credentials.",
+  "Online logs": "Real-time upload of new contacts to QRZ Logbook and Club Log.",
+  "Reference data": "Country, CTY and LoTW reference data and its update schedule.",
+  Rotator: "Rotator controller connection and automatic pointing.",
+  "KPA500 & KAT500": "Elecraft amplifier and antenna tuner connection.",
+  CW: "Keyer output, speed and macros.",
+  Display: "Appearance and keyboard shortcuts.",
+  Workspace: "Panels and layouts in the main window.",
+  Alerts: "DX alert rules and notifications.",
+  Backups: "Local and remote backups of your logbook.",
+  Experimental: "Alpha tools shown in the application menus.",
+};
 
 function Credential({ account, label, request, leadingField, visible = false, showSavedStatus = false, savedStatus, missingStatus, allowRemove = false, inputType = "password", onChanged }: { account: string; label: string; request: Request; leadingField?: ReactNode; visible?: boolean; showSavedStatus?: boolean; savedStatus?: string; missingStatus?: string; allowRemove?: boolean; inputType?: "password" | "text"; onChanged?: () => void }) {
   const [value, setValue] = useState("");
@@ -81,7 +109,7 @@ function Credential({ account, label, request, leadingField, visible = false, sh
     onChange={event => setValue(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); void save(); } }} /></label>
     <button type="button" disabled={busy || !value} onClick={() => void save()}>{busy ? "Saving…" : `Save ${label}`}</button>
     {allowRemove && stored === "saved" && <button type="button" disabled={busy} onClick={() => void remove()}>{`Remove ${label}`}</button>}
-    {saveToast.toast}{showSavedStatus && status && <p className="service-credential-state" role="status">{status}</p>}</div>;
+    {saveToast.toast}{showSavedStatus && status && <ErrorNotice><p className="service-credential-state" role="status">{status}</p></ErrorNotice>}</div>;
 }
 
 type OnlineLogStatus = { enabled: boolean; enabled_at?: string | null; pending_new_contacts: number;
@@ -148,9 +176,9 @@ function OnlineLogUploadControl({ request, visible, refreshRevision, service, pr
       <button type="button" disabled={busy || !confirmed} onClick={() => void configure(true)}>Enable {provider} uploads</button>
       <button type="button" disabled={busy} onClick={() => { setConfirming(false); setConfirmed(false); }}>Cancel</button>
     </div>}
-    {status && <p role="status">Upload is {status.enabled ? "ON" : "OFF"}. {status.pending_new_contacts ?? 0} new contacts pending; {states.delivered ?? 0} delivered; {states.deferred ?? 0} deferred; {attention} require review.</p>}
+    {status && <ErrorNotice><p role="status">Upload is {status.enabled ? "ON" : "OFF"}. {status.pending_new_contacts ?? 0} new contacts pending; {states.delivered ?? 0} delivered; {states.deferred ?? 0} deferred; {attention} require review.</p></ErrorNotice>}
     {status?.latest_state && <p>Latest outcome: {status.latest_state.replace(/_/g, " ")}{status.latest_error_code ? ` (${status.latest_error_code.replace(/_/g, " ")})` : ""}.</p>}
-    {status?.provider_issue_code && <p role="status">Provider setup needs attention: {status.provider_issue_code.replace(/_/g, " ")}.</p>}
+    {status?.provider_issue_code && <ErrorNotice><p role="status">Provider setup needs attention: {status.provider_issue_code.replace(/_/g, " ")}.</p></ErrorNotice>}
     {(status?.attention?.length ?? 0) > 0 && <div className="service-settings-recovery" aria-label={`${provider} contacts requiring review`}>
       <p><strong>Contacts requiring review</strong></p>
       <p>These are historical outcomes. Verify each contact on {provider}; the app will not retry or change it automatically.</p>
@@ -172,22 +200,26 @@ function OnlineLogUploadControl({ request, visible, refreshRevision, service, pr
       </li>)}</ul>
     </div>}
     <button type="button" disabled={busy} onClick={() => { setStatus(null); setMessage(""); setReloadRevision(value => value + 1); }}>Refresh upload status</button>
-    {message && <p role="status">{message}</p>}{saveToast.toast}
+    {message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}{saveToast.toast}
   </div>;
 }
 
 export default function ServiceSettings({ values, savedValues, request, onChanged, onSave, saving = false, pending = false,
   conflict = false, workspaceChanged = false, dirty = false, sessionError = "", onReconcile, onRetry, onUseSaved, dataRequest, dataWorkspaceGeneration, onDataChanged,
   radioSettings, rotorSettings, clusterSettings, workspaceSettings, syncSettings, onExternalContact, availableTabs, requestedTab, requestedTabRevision, cwContext, cwState, refreshCW, cwProvider }: ServiceSettingsProps) {
-  const visibleTabs = useMemo(() => availableTabs?.filter((value, index, values) => tabs.includes(value) && values.indexOf(value) === index) ?? tabs, [availableTabs]);
+  const visibleTabs = useMemo(() => {
+    const available = availableTabs ?? tabs;
+    return menuOrder.filter(name => available.includes(name) &&
+      (name !== "KPA500 & KAT500" || isMacOS() || /Windows/i.test(navigator.userAgent)));
+  }, [availableTabs]);
   const initialTab = requestedTab && visibleTabs.includes(requestedTab) ? requestedTab : visibleTabs[0] ?? "Station";
   const [tab, setTab] = useState<Tab>(initialTab);
   const [countryRequested, setCountryRequested] = useState(initialTab === "Reference data");
   useEffect(() => { if (tab === "Reference data") setCountryRequested(true); }, [tab]);
   useEffect(() => { if (requestedTab && visibleTabs.includes(requestedTab)) setTab(requestedTab); }, [requestedTab, requestedTabRevision, visibleTabs]);
   useEffect(() => { if (!visibleTabs.includes(tab)) setTab(visibleTabs[0] ?? "Station"); }, [tab, visibleTabs]);
-  const showAccountHelp = ["Station", "Wavelog", "QRZ", "Reference data", "Rotator", "Backups"].includes(tab);
-  const showFormSave = ["Station", "Logbook", "Wavelog", "QRZ", "Reference data", "CW", "Experimental"].includes(tab);
+  const showAccountHelp = ["Station", "Wavelog", "QRZ", "Reference data", "Backups"].includes(tab);
+  const showFormSave = ["Station", "Logbook", "Wavelog", "QRZ", "Reference data", "CW", "Experimental", "Backups"].includes(tab);
   const form = values;
   const lookupProvider = form.qrzEnabled === true ? String(form.callsignLookupProvider ?? "qrz") : "disabled";
   const savedForm = savedValues ?? form;
@@ -206,13 +238,18 @@ export default function ServiceSettings({ values, savedValues, request, onChange
     : sessionError ? "failed" : submission.status;
   const [onlineLogRevision, setOnlineLogRevision] = useState(0);
   const blocked = pending || conflict || workspaceChanged;
+  const saveState = formSaving ? { tone: "busy", text: "Saving…" }
+    : dirty ? { tone: "dirty", text: "Unsaved changes" }
+    : submissionStatus === "failed" ? { tone: "error", text: "Not saved" }
+    : submission.status === "applied" ? { tone: "saved", text: "All changes saved" }
+    : { tone: "idle", text: "No unsaved changes" };
   const update = (change: Partial<Data>) => {
     const next = { ...form, ...change };
     onChanged(next);
   };
   const updateFTPBackup = (change: Partial<Data>) => update({ ftpBackup: { ...ftpBackup, ...change } });
   const field = (key: string, label: string, type = "text") => <label key={key}>{label}<input aria-label={label} type={type} value={form[key] ?? ""}
-    min={key === "wavelogStationID" ? 1 : undefined} step={key === "wavelogStationID" ? 1 : undefined}
+    min={key === "wavelogStationID" ? 0 : undefined} step={key === "wavelogStationID" ? 1 : undefined}
     onChange={event => update({ [key]: event.target.value })} /></label>;
   const save = async (event: FormEvent) => {
     event.preventDefault(); if (saving || blocked || submitting.current) return;
@@ -247,22 +284,25 @@ export default function ServiceSettings({ values, savedValues, request, onChange
       })}</div> : null;
     })}</div></nav>
     <div className="service-settings-content"><div id="service-settings-panel" role="tabpanel" aria-labelledby={`service-tab-${tabs.indexOf(tab)}`}>
-    <p hidden={!showAccountHelp}>URLs and account details are grouped with their credentials. Save settings for non-secret fields; each credential has its own secure Save button.</p>
+    <header className="service-page-header">{/* The selected tab already names this panel; the visual title avoids a duplicate heading. */}<div className="service-page-title" aria-hidden="true">{tabLabels[tab] ?? tab}</div><p>{tabDescriptions[tab]}</p></header>
+    <p className="service-settings-hint" hidden={!showAccountHelp}>URLs and account details are grouped with their credentials. Save settings for non-secret fields; each credential has its own secure Save button.</p>
     {tab === "Sync" && <div>{syncSettings ?? <p>Synchronization tools are unavailable in this view.</p>}</div>}
     <div hidden={tab !== "Workspace"}>{workspaceSettings ?? <p>Workspace arrangements are unavailable in this view.</p>}</div>
-    <div hidden={tab !== "Display"}><DisplaySettings />{tab==="Display"&&<Suspense fallback={<p role="status">Loading keyboard shortcuts…</p>}><NormalShortcutSettings/></Suspense>}</div>
+    <div hidden={tab !== "Display"}><DisplaySettings />{tab==="Display"&&<Suspense fallback={<ErrorNotice><p role="status">Loading keyboard shortcuts…</p></ErrorNotice>}><NormalShortcutSettings/></Suspense>}</div>
     <div hidden={tab !== "Radio"}>{radioSettings ?? <p>Radio setup is available in the main Settings window.</p>}</div>
     <div hidden={tab !== "Rotator"}>{rotorSettings ?? <p>Rotator settings are unavailable in this view.</p>}</div>
+    {tab === "KPA500 & KAT500" && <Suspense fallback={<p>Loading instrument settings…</p>}><ElecraftSettings request={request} /></Suspense>}
+    {tab === "Alerts" && <Suspense fallback={<p>Loading alert settings…</p>}><AlertSettings /></Suspense>}
     {tab === "Cluster" && (clusterSettings ?? <p>Cluster settings unavailable.</p>)}
-    {tab === "Radio spots" && <Suspense fallback={<p role="status">Loading radio spot settings…</p>}>
+    {tab === "Radio spots" && <Suspense fallback={<ErrorNotice><p role="status">Loading radio spot settings…</p></ErrorNotice>}>
       <RadioSpotSettings request={request} visible />
       <SpotBridgePanel request={request} configurationOnly />
     </Suspense>}
-    {tab === "Integrations" && <Suspense fallback={<p role="status">Loading WSJT-X settings…</p>}><WSJTXPanel request={request} onImported={onExternalContact} /></Suspense>}
+    {tab === "Integrations" && <Suspense fallback={<ErrorNotice><p role="status">Loading integration settings…</p></ErrorNotice>}>{!isMacOS() && <CompanionBridgePanel />}<WSJTXPanel request={request} onImported={onExternalContact} /></Suspense>}
     <ReferenceScheduleControl request={request} visible={tab === "Reference data"} />
-    {countryRequested && <Suspense fallback={tab === "Reference data" ? <p role="status">Loading country controls…</p> : null}><CountryReferenceControl request={request} visible={tab === "Reference data"} /></Suspense>}
+    {countryRequested && <Suspense fallback={tab === "Reference data" ? <ErrorNotice><p role="status">Loading country controls…</p></ErrorNotice> : null}><CountryReferenceControl request={request} visible={tab === "Reference data"} /></Suspense>}
     {(sessionError || pending || conflict || workspaceChanged) && <div className="service-settings-recovery" role="status">
-      {sessionError && <p>{sessionError}</p>}
+      {sessionError && <ErrorNotice when={true}><p>{sessionError}</p></ErrorNotice>}
       {pending && <><button type="button" disabled={saving} onClick={() => void onReconcile?.()}>Check saved Settings</button>
         <button type="button" disabled={saving} onClick={() => void onRetry?.()}>Retry same save</button></>}
       {!pending && (dirty || conflict || workspaceChanged) && <button type="button" disabled={saving} onClick={onUseSaved}>Use saved Settings</button>}
@@ -289,7 +329,7 @@ export default function ServiceSettings({ values, savedValues, request, onChange
         <label>Logbook mode<select aria-label="Logbook mode" value={form.logbookMode ?? "local"} onChange={event => update({ logbookMode: event.target.value })}>
           <option value="local">Integrated logbook only</option><option value="wavelog">Integrated logbook + Wavelog synchronization</option>
         </select></label>
-        <p role="status"><strong>Selected mode (save to apply): {(form.logbookMode ?? "local") === "local" ? "Integrated only" : "Integrated + Wavelog"}</strong> · {(form.logbookMode ?? "local") === "local" ? "Wavelog synchronization and catalog checks are disabled; logging, awards, QRZ, cluster, radio and rotator remain available." : "Contacts are saved locally first. Wavelog synchronization follows your Sync settings."}</p>
+        <ErrorNotice><p role="status"><strong>Selected mode (save to apply): {(form.logbookMode ?? "local") === "local" ? "Integrated only" : "Integrated + Wavelog"}</strong> · {(form.logbookMode ?? "local") === "local" ? "Wavelog synchronization and catalog checks are disabled; logging, awards, QRZ, cluster, radio and rotator remain available." : "Contacts are saved locally first. Wavelog synchronization follows your Sync settings."}</p></ErrorNotice>
         <p>Save settings to apply. Switching modes keeps contacts, pending changes and saved credentials. Switching back to Wavelog leaves synchronization off until you explicitly synchronize or enable it in Sync. Wait for any running synchronization to finish before changing modes.</p>
       </section>
       <section hidden={tab !== "Wavelog"}><h2>Wavelog synchronization</h2><p>The URL and station ID identify the online logbook; the API v2 token authorizes access. Configure synchronization in Sync.</p><div className="service-fields">{field("wavelogURL", "Wavelog URL", "url")}{field("wavelogStationID", "Wavelog station ID", "number")}</div><Credential account="wavelog-token" label="Wavelog API v2 token" request={request} visible={tab === "Wavelog"} showSavedStatus /></section>
@@ -302,7 +342,7 @@ export default function ServiceSettings({ values, savedValues, request, onChange
           visible={tab === "QRZ"} showSavedStatus allowRemove savedStatus="QRZ password saved securely." missingStatus="No saved QRZ password." />}
         {lookupProvider === "hamqth" && <Credential account="hamqth-password" label="HamQTH password" request={request} leadingField={field("hamqthUsername", "HamQTH username")}
           visible={tab === "QRZ"} showSavedStatus allowRemove savedStatus="HamQTH password saved securely." missingStatus="No saved HamQTH password." />}
-        {lookupProvider !== "disabled" && <Suspense fallback={<p role="status">Loading callsign lookup test…</p>}><QRZLookupTest request={request}
+        {lookupProvider !== "disabled" && <Suspense fallback={<ErrorNotice><p role="status">Loading callsign lookup test…</p></ErrorNotice>}><QRZLookupTest request={request}
           provider={lookupProvider === "hamqth" ? "HamQTH" : "QRZ"} applied={lookupConfigurationApplied}
           defaultCall={String(form.operatorCall || (lookupProvider === "hamqth" ? form.hamqthUsername : form.qrzUsername) || "")} /></Suspense>}
       </section>
@@ -335,9 +375,12 @@ export default function ServiceSettings({ values, savedValues, request, onChange
         <Credential account="ftp-backup-password" label="FTP / FTPS password" request={request} visible={tab === "Backups"}
           showSavedStatus allowRemove savedStatus="Saved securely. It has not been sent to the server."
           missingStatus="No saved FTP / FTPS password." />
-        <div className="live-actions"><button type="submit" className="primary">{formSaving ? "Saving settings…" : "Save backup settings"}</button></div>
       </section>
-      <div className="live-actions" hidden={!showFormSave}><button type="submit" className="primary">{formSaving ? "Saving settings…" : "Save settings"}</button></div>
+      <div className="service-save-bar" hidden={!showFormSave}>
+        <span className="service-save-state" data-tone={saveState.tone}>{saveState.text}</span>
+        <button type="submit" className="primary">{formSaving ? "Saving settings…" : tab === "Backups" ? "Save backup settings" : "Save settings"}</button>
+      </div>
+
     </fieldset></form>
     {(visibleTabs.includes("Reference data") || visibleTabs.includes("Backups")) && <div hidden={tab !== "Reference data" && tab !== "Backups"}>{dataRequest ? <Suspense fallback={<p>Loading data tools…</p>}><DataManagementPanel onRequest={dataRequest} onChanged={onDataChanged ?? (() => {})} workspaceGeneration={dataWorkspaceGeneration} visible={tab === "Reference data" || tab === "Backups"} section={tab === "Backups" ? "backups" : "references"} sourceSettings={savedValues ?? form} /></Suspense> : <p>Reference and backup tools are unavailable in this view.</p>}</div>}
     <p className="service-security-note" hidden={!showAccountHelp && tab !== "Online logs" && tab !== "Display"}>Credentials stay in the integrated app’s separate system credential store. Existing application credentials are not changed. Never paste credentials into a support chat.</p>

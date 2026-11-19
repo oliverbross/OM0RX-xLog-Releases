@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useState } from "react";
 import { loadStationSession, stationSessionRequest, type RadioID, type StationReceipt, type StationSession } from "./stationSession";
 type Data = Record<string, any>;
@@ -58,6 +59,6 @@ export function TCIReceiveFilter({ radioId, snapshot, now, transport }:
     <label>Upper edge (Hz)<input value={upper} onChange={e => setUpper(e.target.value)} inputMode="numeric" /></label>
     <button type="button" disabled={!!pending || !valid || !filterAdmission(snapshot, now)} onClick={() => void apply()}>Apply receive filter</button>
     {pending && <><button type="button" onClick={() => void inspect()}>Check filter receipt</button>{reviewable && <button type="button" onClick={() => void inspect(true)}>Acknowledge unknown filter outcome</button>}</>}
-    {message && <p role="status">{message}</p>}
+    {message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}
   </fieldset>;
 }

@@ -1,3 +1,5 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { formatRadioFrequency } from "./radioFrequency";
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import WorldMap from "../Map";
 import { workerRequest } from "../worker";
@@ -145,10 +147,10 @@ function Detail({ operation, shown, now, locale, radio, closeButtonRef, onClose,
     <h3>{t.history}</h3><p>{operation.history ? `${operation.history.worked_count} ${t.worked} · ${operation.history.confirmed_count} ${t.confirmed}` : t.unknown}</p>
     {operation.history && <p className="dxp-notes">{t.worked}: {operation.history.worked_modes.join(" · ") || "—"}<br />{t.confirmed}: {operation.history.confirmed_modes.join(" · ") || "—"}</p>}
     {operation.dxccHistory && <p className="dxp-notes">DXCC {operation.dxccHistory.entity}<br />{t.worked}: {operation.dxccHistory.worked_modes.join(" · ") || "—"}<br />{t.confirmed}: {operation.dxccHistory.confirmed_modes.join(" · ") || "—"}</p>}
-    {actionReason && <p className="dxp-action-reason" role="status">{actionReason}</p>}
+    {actionReason && <ErrorNotice><p className="dxp-action-reason" role="status">{actionReason}</p></ErrorNotice>}
     <h3>{t.observations}</h3>
     <div className="dxp-observations">{operation.observations.slice(0, 8).map((spot, index) => <div key={spot.id} className={index === 0 ? "is-latest" : ""}>
-      <div><strong>{(spot.frequencyHz / 1_000_000).toFixed(6)} MHz</strong><span>{spot.band || "?"} · {spot.mode || "?"} · {fmtAge(spot.reportedAt, now, locale)}</span>
+      <div><strong>{formatRadioFrequency(spot.frequencyHz)} MHz</strong><span>{spot.band || "?"} · {spot.mode || "?"} · {fmtAge(spot.reportedAt, now, locale)}</span>
         <small>{spot.callsign}{spot.spotter ? ` · ${spot.spotter}` : ""}{spot.comment ? ` · ${spot.comment}` : ""}</small></div>
       <button type="button" title={!spot.activation ? t.archived : actionReason} disabled={tuning || !!actionReason || !spot.activation} onClick={() => onTune(spot)}>{spot.activation ? t.tune : t.archived}</button>
     </div>)}</div>
@@ -214,7 +216,9 @@ export function DetachedDXpeditionMapSurface() {
   const rawSpots = (map.context?.cluster.response?.contest_spots ?? []) as DXpeditionClusterSpot[];
   const operations = useMemo(() => buildDXpeditionOperations(snapshot?.items ?? [], [...(snapshot?.observations ?? []), ...rawSpots], clock), [snapshot, rawSpots, clock]);
   const filtered = useMemo(() => filterDXpeditionOperations(operations, status, band, query), [operations, status, band, query]);
-  const selected = operations.find(item => item.id === selectedID) ?? null;
+  const lastSelected = useRef<DXpeditionOperation | null>(null);
+  const selected = selectedID ? operations.find(item => item.id === selectedID)
+    ?? (lastSelected.current?.id === selectedID ? lastSelected.current : null) : null;
   const shown = !!selected && filtered.some(item => item.id === selected.id), t = text[locale];
   const counts = { live: operations.filter(item => item.status === "live").length, active: operations.filter(item => ["live", "active"].includes(item.status)).length,
     dx: operations.filter(item => item.status !== "upcoming").length };
@@ -222,6 +226,7 @@ export function DetachedDXpeditionMapSurface() {
   const actionReason = moduleAllowed === null ? t.checkingModule : moduleAllowed ? "" : t.moduleBlocked;
   const selectOperation = (id: string) => {
     selectionTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    lastSelected.current = operations.find(item => item.id === id) ?? null;
     setSelectedID(id);
   };
   return <div className="app live dxp-app"><main aria-label="DXpedition Map">
@@ -247,7 +252,7 @@ export function DetachedDXpeditionMapSurface() {
         onLoad={() => { setError(""); if (!selected.activation) { setError("Refresh the catalogue before loading this callsign."); return; }
           void loadCall.activate({ id: selected.id, activation: selected.activation }).catch(cause => setError(cause instanceof Error ? cause.message : "Callsign load could not be verified.")); }} />}
     </div>
-    <StableFeedbackLayer>{(error || map.error) && <p className="live-error" role="alert">{error || map.error}</p>}
+    <StableFeedbackLayer>{(error || map.error) && <ErrorNotice><p className="live-error" role="alert">{error || map.error}</p></ErrorNotice>}
       <SpotActivationStatus status={tune.status ?? loadCall.status} error={tune.error || loadCall.error} checking={tune.requesting || loadCall.requesting}
         reconcile={() => void (tune.status?.operationId ? tune.reconcile() : loadCall.reconcile())} /></StableFeedbackLayer>
   </main></div>;

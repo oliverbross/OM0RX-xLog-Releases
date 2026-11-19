@@ -1,4 +1,4 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
 
 /// Bounded, instance-scoped evidence from WSJT-X v3.0.2 schema 2/3.
@@ -22,7 +22,7 @@ struct WSJTXDecodeDesk {
         expire(now)
         switch activity {
         case .close, .clear: rows.removeAll{$0.sender==sender&&$0.instance==activity.instance};if case .close=activity{contexts[key]=nil}
-        case .status(_,let frequency,let mode):
+        case .status(_,let frequency,let mode,_):
             if let old=contexts[key],old.frequency != frequency || old.mode != mode{rows.removeAll{$0.sender==sender&&$0.instance==activity.instance}}
             contexts[key]=(frequency,mode,contexts[key]?.version ?? "Unknown",now)
         case .heartbeat:

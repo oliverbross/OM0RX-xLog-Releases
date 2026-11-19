@@ -28,7 +28,7 @@ export type ContestRuleID = string;
 export type ContestRuleIdentity = { id: ContestRuleID; version: string; edition: string; sourceRevision: string };
 export type ContestReportDescriptor = { format: "cwRST" | "phoneRS" | "digitalRST" | "none"; defaultSent: string; defaultReceived: string; maximumUTF8Bytes: number };
 export type ContestExchangeFieldDescriptor = {
-  id: string; label: string; acceptedKinds: ("operatorName" | "subdivision" | "dxccPrefix" | "serialNumber" | "gridSquare" | "cqZone" | "jarlPrefectureNumber" | "power" | "nonnegativeInteger" | "locationText")[];
+  id: string; label: string; acceptedKinds: ("operatorName" | "subdivision" | "dxccPrefix" | "serialNumber" | "gridSquare" | "maidenheadGrid4" | "cqZone" | "jarlPrefectureNumber" | "power" | "nonnegativeInteger" | "alphaToken" | "locationText")[];
   required: boolean; maximumUTF8Bytes: number; adifField: "STX" | "SRX" | "NAME" | "MY_NAME" | "STATE" | "MY_STATE" | "GRIDSQUARE" | "MY_GRIDSQUARE" | null;
 };
 export type ContestStationFieldDescriptor = {

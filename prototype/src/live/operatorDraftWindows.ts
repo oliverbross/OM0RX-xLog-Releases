@@ -94,7 +94,7 @@ export function protectOperatorDraftClose(blocked: () => boolean, explain: () =>
     void invoke(closeCommand).catch(() => {
       if (active) {
         closing = false; closingChanged(false);
-        failed(closeCommand === "close_main_window" ? "Could not close the Desk. Try again after resolving the draft." : "Could not close Log QSO. Try again after resolving the draft.");
+        failed(closeCommand === "close_main_window" ? "Could not close the Desk. Use File → Exit to quit." : "Could not close Log QSO. Try again after resolving the draft.");
       }
     });
   }).then(dispose => { if (active) stop = dispose; else dispose(); })

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRightLeft, Database, FileUp, ShieldCheck } from "lucide-react";
 import { contestLogTransferAPI, type ContestLogTransferAPI, type LegacyContestPreview, type LegacyPreview, type TransferContext, type TransferResult } from "./contestLogTransferNative";
@@ -95,8 +96,8 @@ export function ContestLogTransferWindow({ api = contestLogTransferAPI }: { api?
       <button role="tab" aria-selected={mode === "legacy"} onClick={() => { setMode("legacy"); setConfirming(null); }}><FileUp size={15}/> Legacy Not1MM</button>
       <button role="tab" aria-selected={mode === "transfer"} onClick={() => { void showTransfer(); }}><ArrowRightLeft size={15}/> Active contest to Logbook</button>
     </div>
-    {error && <p className="contest-alert is-error" role="alert">{error}</p>}
-    {notice && <p className="contest-alert" role="status">{notice}</p>}
+    {error && <ErrorNotice><p className="contest-alert is-error" role="alert">{error}</p></ErrorNotice>}
+    {notice && <ErrorNotice><p className="contest-alert" role="status">{notice}</p></ErrorNotice>}
 
     {mode === "legacy" ? <section className="contest-transfer-pane" aria-labelledby="legacy-title">
       <header><div><h2 id="legacy-title">Import a legacy contest</h2><p>The native picker reads one Not1MM SQLite database. Its path stays outside this web view.</p></div>

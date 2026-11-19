@@ -41,6 +41,17 @@ struct State {
     revision: u64,
     intent_id: Option<String>,
     last_observed: Option<Instant>,
+    // Unlike motion generation, this identity survives Goto/Park/Stop. It is
+    // renewed for each connection and never authorizes a replacement transport.
+    companion_route: Option<String>,
+    companion_worker: Option<u64>,
+}
+
+fn companion_route(state: &State) -> Option<&str> {
+    if state.owner == Some(Owner::NativeDcu1) && state.companion_worker.is_none() {
+        return None;
+    }
+    state.companion_route.as_deref()
 }
 
 /// This is the sole in-process rotor ingress. The lock serializes retirement
@@ -48,6 +59,9 @@ struct State {
 /// disconnect. It does not assert that physical movement has ceased.
 pub struct RotorCoordinator {
     state: Mutex<State>,
+    // Short-lived admission lock: never held across transport or while waiting
+    // for state. It makes early automatic revocation specific to one route.
+    companion_admission: Mutex<Option<String>>,
     automatic: Arc<crate::auto_rotor::AutomaticRotor>,
 }
 
@@ -55,12 +69,13 @@ impl RotorCoordinator {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(State::default()),
+            companion_admission: Mutex::new(None),
             automatic: crate::auto_rotor::owner().clone(),
         }
     }
     #[cfg(test)]
     pub(crate) fn with_authority(automatic: Arc<crate::auto_rotor::AutomaticRotor>) -> Self {
-        Self { state: Mutex::new(State::default()), automatic }
+        Self { state: Mutex::new(State::default()), companion_admission: Mutex::new(None), automatic }
     }
 
     pub fn handle<F>(&self, request: Value, backend: F) -> Result<Value, String>
@@ -143,7 +158,7 @@ impl RotorCoordinator {
                     id,
                     json!({"owner":current.owner.map(Owner::name),
                     "generation":current.generation,"state":phase_name(current.phase),
-                    "intent_id":current.intent_id,
+                    "intent_id":current.intent_id,"companion_route_id":companion_route(&current),
                     "backend":null,"backend_available":false}),
                 ));
             }
@@ -163,7 +178,7 @@ impl RotorCoordinator {
                 json!({
                     "owner": owner.map(Owner::name), "generation": generation,
                     "state": phase_name(current.phase), "backend": backend_result,
-                    "intent_id":current.intent_id,
+                    "intent_id":current.intent_id,"companion_route_id":companion_route(&current),
                     "backend_available": backend_available,
                 }),
             ));
@@ -181,12 +196,18 @@ impl RotorCoordinator {
                 }
                 state.generation = state.generation.wrapping_add(1);
                 state.owner = Some(owner);
+                state.companion_route = Some(format!("{}:{}", owner.name(), uuid::Uuid::new_v4()));
+                state.companion_worker = None;
                 state.phase = Some(Phase::Uncertain);
                 state.last_observed = None;
                 state.intent_id = None;
                 let (backend_method, backend_params) = map_new(method, owner, params)?;
                 let reply = backend(envelope(id, backend_method, backend_params))?;
                 let value = unpack(reply, id)?;
+                if owner == Owner::NativeDcu1 {
+                    state.companion_worker = value["companion_worker_generation"].as_u64().filter(|v| *v > 0);
+                }
+                *self.companion_admission.lock().map_err(|_| "Rotor admission lock failed")? = companion_route(&state).map(str::to_owned);
                 state.phase = Some(Phase::Active);
                 return Ok(success(
                     id,
@@ -247,7 +268,10 @@ impl RotorCoordinator {
                 state.phase = Some(Phase::Active);
             }
             if method == "rotor_disconnect" {
+                *self.companion_admission.lock().map_err(|_| "Rotor admission lock failed")? = None;
                 state.owner = None;
+                state.companion_route = None;
+                state.companion_worker = None;
                 state.phase = None;
                 state.generation = state.generation.wrapping_add(1);
                 state.intent_id = None;
@@ -322,6 +346,62 @@ impl RotorCoordinator {
         let state = self.state.try_lock().map_err(|_| "Rotor is busy; automatic turn was not queued.")?;
         Ok(state.owner.filter(|_| automatic_observation(&state)).map(|owner| (owner.name().to_owned(), state.generation)))
     }
+    fn companion_owner(&self, route: &str) -> Result<String, String> {
+        let state = self.state.lock().map_err(|_| "Rotor owner lock failed")?;
+        if companion_route(&state) != Some(route) {
+            return Err("Rotor connection changed; observe the new route before sending a command.".into());
+        }
+        Ok(state.owner.ok_or("Rotor connection is unavailable")?.name().into())
+    }
+    fn retire_worker(&self) -> Result<(), String> {
+        self.automatic.revoke();
+        let mut state = self.state.lock().map_err(|_| "Rotor owner lock failed")?;
+        *self.companion_admission.lock().map_err(|_| "Rotor admission lock failed")? = None;
+        state.owner = None;
+        state.companion_route = None;
+        state.companion_worker = None;
+        state.phase = None;
+        state.intent_id = None;
+        state.last_observed = None;
+        state.generation = state.generation.saturating_add(1);
+        state.revision = state.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Independent companion Stop: stale telemetry and newer motion are fine;
+    /// a different connection, worker, or revoked pairing is never fine.
+    pub(crate) fn stop_companion(&self, route: &str, guard: impl Fn() -> Result<(), String>,
+        backend: impl FnOnce(Value, Option<u64>) -> Result<Value, String>) -> Result<Value, String> {
+        guard()?;
+        {
+            let current = self.companion_admission.lock().map_err(|_| "Rotor admission lock failed")?;
+            if current.as_deref() != Some(route) {
+                return Err("Rotor connection changed; Stop was not admitted for a replacement.".into());
+            }
+            // Do not wait for an admitted driver before cancelling queued
+            // automatic work. Lifecycle cannot publish a replacement while
+            // this route-specific revocation is in progress.
+            self.automatic.revoke_authority(); // atomic only; no authority metadata lock
+        }
+        let mut state = self.state.lock().map_err(|_| "Rotor owner lock failed")?;
+        if companion_route(&state) != Some(route) {
+            return Err("Rotor connection changed; Stop was not sent to a replacement.".into());
+        }
+        let owner = state.owner.ok_or("Rotor connection is unavailable")?;
+        guard()?; // recheck authorization after any serialized driver wait
+        self.automatic.revoke();
+        state.generation = state.generation.wrapping_add(1);
+        state.revision = state.revision.wrapping_add(1);
+        state.phase = Some(Phase::Uncertain);
+        state.intent_id = None;
+        let id = uuid::Uuid::new_v4().to_string();
+        let (method, params) = map_new("rotor_stop", owner, &Map::new())?;
+        let value = unpack(backend(envelope(&id, method, params), state.companion_worker)?, &id)?;
+        state.phase = Some(Phase::Active);
+        Ok(success(&id, json!({"owner":owner.name(),"generation":state.generation,
+            "state":"active","companion_route_id":companion_route(&state),"backend":value})))
+    }
+
     pub(crate) fn with_automatic_owner<T>(&self, owner: &str, generation: u64, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let state = self.state.try_lock().map_err(|_| "Rotor is busy; observe it before arming automatic turns.")?;
         if state.owner.map(Owner::name) != Some(owner) || state.generation != generation {
@@ -494,9 +574,18 @@ fn coordinator() -> &'static RotorCoordinator {
 fn dispatch(request: Value) -> Result<Value, String> {
     if request["method"].as_str().is_some_and(|method| method.starts_with("hamlib_")) {
         hamlib::request(request)
+    } else if request["method"] == "station_rotor_connect" {
+        let (generation, reply) = worker::request_with_generation(request)?;
+        Ok(bind_worker_reply(reply, generation))
     } else {
         worker::request(request)
     }
+}
+fn bind_worker_reply(mut reply: Value, generation: u64) -> Value {
+    if reply["ok"] == true && reply["result"].is_object() {
+        reply["result"]["companion_worker_generation"] = json!(generation);
+    }
+    reply
 }
 pub fn request(request: Value) -> Result<Value, String> {
     coordinator().handle(request, dispatch)
@@ -510,23 +599,19 @@ pub(crate) fn request_startup(request: Value) -> Result<Value, String> {
 }
 pub(crate) fn request_startup_with(
     request: Value,
+    worker_generation: u64,
     dispatch: impl FnOnce(Value) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    coordinator().handle_scoped(request, None, true, None, dispatch)
+    // The caller owns this exact Session transport; do not sample a later global
+    // counter and accidentally relabel a response from a retired worker.
+    coordinator().handle_scoped(request, None, true, None,
+        |request| dispatch(request).map(|reply| bind_worker_reply(reply, worker_generation)))
 }
 pub(crate) fn request_startup_observation(request: Value, expected_epoch: u64) -> Result<Value, String> {
     coordinator().handle_scoped(request, None, false, Some(expected_epoch), dispatch)
 }
 pub(crate) fn worker_restarted() -> Result<(), String> {
-    crate::auto_rotor::revoke();
-    let mut state = coordinator().state.lock().map_err(|_| "Rotor owner lock failed")?;
-    state.owner = None;
-    state.phase = None;
-    state.intent_id = None;
-    state.last_observed = None;
-    state.generation = state.generation.saturating_add(1);
-    state.revision = state.revision.saturating_add(1);
-    Ok(())
+    coordinator().retire_worker()
 }
 pub(crate) fn automatic_owner() -> Result<Option<(String, u64)>, String> { coordinator().automatic_owner() }
 pub(crate) fn with_automatic_owner<T>(owner: &str, generation: u64, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -576,6 +661,195 @@ pub(crate) fn supersede_spot_turn() -> Result<(), String> {
 }
 pub fn monitor_stop(owner: &str) -> Result<Value, String> {
     request(envelope(&uuid::Uuid::new_v4().to_string(), "monitor_rotor_stop", json!({"owner":owner})))
+}
+pub(crate) fn companion_owner(route: &str) -> Result<String, String> {
+    coordinator().companion_owner(route)
+}
+pub(crate) fn companion_stop(route: &str, guard: impl Fn() -> Result<(), String>) -> Result<Value, String> {
+    coordinator().stop_companion(route, guard, |request, worker| {
+        dispatch_companion_stop(request, worker, worker::request_existing_generation, hamlib::request)
+    })
+}
+fn dispatch_companion_stop(request: Value, worker: Option<u64>,
+    native: impl FnOnce(Value, u64) -> Result<Value, String>,
+    local: impl FnOnce(Value) -> Result<Value, String>) -> Result<Value, String> {
+    if request["method"] == "hamlib_control" { return local(request); }
+    native(request, worker.filter(|v| *v > 0).ok_or("Rotor worker identity is unavailable")?)
+}
+
+#[cfg(test)]
+mod companion_route_tests {
+    use super::*;
+    use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
+
+    fn coordinator() -> Arc<RotorCoordinator> {
+        Arc::new(RotorCoordinator::with_authority(Arc::new(crate::auto_rotor::AutomaticRotor::testing())))
+    }
+    fn connect(c: &RotorCoordinator, owner: &str, worker: u64) -> String {
+        c.handle(envelope("connect", "rotor_connect", json!({"owner":owner})), |request| {
+            Ok(bind_worker_reply(success(request["id"].as_str().unwrap(), json!({"connected":true})), worker))
+        }).unwrap();
+        companion_route(&c.state.lock().unwrap()).unwrap().to_owned()
+    }
+    fn observe(c: &RotorCoordinator) {
+        c.handle(envelope("read", "rotor_snapshot", json!({})), |request|
+            Ok(success(request["id"].as_str().unwrap(), json!({"connected":true,"azimuth":42,"fields":{"position":{"Azimuth":"42"}}})))).unwrap();
+    }
+    fn ack(request: Value, _: Option<u64>) -> Result<Value, String> {
+        Ok(success(request["id"].as_str().unwrap(), json!({"accepted":true})))
+    }
+
+    #[test]
+    fn same_family_replacement_rejects_old_route_for_both_owners() {
+        for owner in ["native_dcu1", "hamlib"] {
+            let c = coordinator();
+            let old = connect(&c, owner, 7);
+            let generation = c.state.lock().unwrap().generation;
+            c.handle(envelope("disconnect", "rotor_disconnect", json!({"owner":owner,"generation":generation})),
+                |request| ack(request, None)).unwrap();
+            let new = connect(&c, owner, 7);
+            assert_ne!(old, new);
+            let generation = c.state.lock().unwrap().generation;
+            c.automatic.arm(owner, generation).unwrap();
+            let epoch = c.automatic.test_epoch();
+            assert!(c.companion_owner(&old).is_err());
+            assert!(c.stop_companion(&old, || Ok(()), |_,_| panic!("old route reached replacement")).is_err());
+            assert!(c.automatic.test_armed());
+            assert_eq!(c.automatic.test_epoch(), epoch, "stale Stop revoked replacement authority");
+            c.stop_companion(&new, || Ok(()), ack).unwrap();
+        }
+    }
+    #[test]
+    fn uncertain_disconnect_retains_stop_route_but_failed_native_connect_does_not_grant_one() {
+        for owner in ["native_dcu1", "hamlib"] {
+            let c = coordinator(); let route = connect(&c, owner, 7);
+            let generation = c.state.lock().unwrap().generation;
+            assert!(c.handle(envelope("disconnect", "rotor_disconnect", json!({"owner":owner,"generation":generation})),
+                |_| Err("lost disconnect acknowledgement".into())).is_err());
+            c.stop_companion(&route, || Ok(()), ack).unwrap();
+        }
+        let c = coordinator();
+        assert!(c.handle(envelope("failed", "rotor_connect", json!({"owner":"native_dcu1"})),
+            |_| Err("lost connect acknowledgement".into())).is_err());
+        assert!(c.companion_admission.lock().unwrap().is_none());
+        assert!(companion_route(&c.state.lock().unwrap()).is_none());
+    }
+    #[test]
+    fn same_route_stop_survives_motion_stale_observation_and_lost_reply() {
+        for owner in ["native_dcu1", "hamlib"] {
+            let c = coordinator(); let route = connect(&c, owner, 7); observe(&c);
+            let generation = c.state.lock().unwrap().generation;
+            c.handle(envelope("goto", "rotor_goto", json!({"owner":owner,"generation":generation,"bearing":90})),
+                |request| ack(request, None)).unwrap();
+            c.state.lock().unwrap().last_observed = None;
+            assert_eq!(companion_route(&c.state.lock().unwrap()), Some(route.as_str()));
+            assert!(c.stop_companion(&route, || Ok(()), |_, worker| {
+                assert_eq!(worker, (owner == "native_dcu1").then_some(7)); Err("lost acknowledgement".into())
+            }).is_err());
+            c.stop_companion(&route, || Ok(()), ack).unwrap();
+        }
+    }
+    #[test]
+    fn retired_worker_and_unknown_connect_identity_cannot_authorize_companion_stop() {
+        let c = coordinator(); let old = connect(&c, "native_dcu1", 7);
+        c.retire_worker().unwrap();
+        assert!(c.stop_companion(&old, || Ok(()), |_,_| panic!("retired worker reached")).is_err());
+        let new = connect(&c, "native_dcu1", 8);
+        assert_ne!(old, new);
+        c.stop_companion(&new, || Ok(()), |request, worker| { assert_eq!(worker, Some(8)); ack(request, worker) }).unwrap();
+        let c = coordinator();
+        c.handle(envelope("unknown", "rotor_connect", json!({"owner":"native_dcu1"})), |r| ack(r, None)).unwrap();
+        assert_eq!(companion_route(&c.state.lock().unwrap()), None);
+        // Existing native emergency Stop remains available for an uncertain binding.
+        c.handle(envelope("native-stop", "monitor_rotor_stop", json!({"owner":"native_dcu1"})), |r| ack(r, None)).unwrap();
+    }
+    #[test]
+    fn stop_dispatch_uses_connection_worker_even_after_worker_replacement() {
+        let c = coordinator(); let route = connect(&c, "native_dcu1", 7);
+        assert!(c.stop_companion(&route, || Ok(()), |request, captured| {
+            dispatch_companion_stop(request, captured, |_, expected| {
+                assert_eq!(expected, 7); // current worker 8 must not be substituted
+                Err("existing generation 7 retired".into())
+            }, |_| panic!("native stop used local transport"))
+        }).is_err());
+        assert!(dispatch_companion_stop(json!({"method":"station_rotor_stop"}), None,
+            |_,_| panic!("missing identity dispatched"), |_| panic!("wrong route")).is_err());
+    }
+    #[test]
+    fn companion_stop_bypasses_slow_snapshot_and_discards_old_readback() {
+        let c = coordinator(); let route = connect(&c, "native_dcu1", 7);
+        let (started_tx, started_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+        let reading = c.clone();
+        let read = std::thread::spawn(move || reading.handle(envelope("slow-read", "rotor_snapshot", json!({})), |request| {
+            started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            ack(request, None)
+        }).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.stop_companion(&route, || Ok(()), ack).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(read.join().unwrap()["result"]["backend_available"], false);
+    }
+    #[test]
+    fn queued_stop_rejects_replacement_connect_after_driver_wait() {
+        for owner in ["native_dcu1", "hamlib"] {
+            let c = coordinator(); let old = connect(&c, owner, 7);
+            let generation = c.state.lock().unwrap().generation;
+            c.handle(envelope("disconnect", "rotor_disconnect", json!({"owner":owner,"generation":generation})),
+                |request| ack(request, None)).unwrap();
+            let (started_tx, started_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+            let connecting = c.clone();
+            let replacement = std::thread::spawn(move || connecting.handle(
+                envelope("replacement", "rotor_connect", json!({"owner":owner})), |request| {
+                    started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(bind_worker_reply(ack(request, None).unwrap(), 8))
+                }).unwrap());
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let stopping = c.clone();
+            let stop = std::thread::spawn(move || stopping.stop_companion(&old, || Ok(()),
+                |_,_| panic!("queued old Stop reached replacement")));
+            release_tx.send(()).unwrap(); replacement.join().unwrap();
+            assert!(stop.join().unwrap().is_err());
+        }
+    }
+    #[test]
+    fn pairing_revocation_is_rechecked_after_waiting_for_driver() {
+        use std::sync::atomic::AtomicUsize;
+        let c = coordinator(); let route = connect(&c, "native_dcu1", 7); observe(&c);
+        let generation = c.state.lock().unwrap().generation;
+        let (started_tx, started_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+        let moving = c.clone();
+        let motion = std::thread::spawn(move || moving.handle(envelope("move", "rotor_goto",
+            json!({"owner":"native_dcu1","generation":generation,"bearing":90})), |request| {
+            started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(2)).unwrap(); ack(request, None)
+        }).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let epoch = c.automatic.test_epoch();
+        let lease = Arc::new(AtomicBool::new(true)); let stop_lease = lease.clone(); let stopping = c.clone();
+        let guards = Arc::new(AtomicUsize::new(0)); let stop_guards = guards.clone();
+        let dispatches = Arc::new(AtomicUsize::new(0)); let stop_dispatches = dispatches.clone();
+        let (first_guard_tx, first_guard_rx) = mpsc::channel();
+        let stop = std::thread::spawn(move || stopping.stop_companion(&route,
+            || {
+                let allowed = stop_lease.load(Ordering::Acquire);
+                if stop_guards.fetch_add(1, Ordering::AcqRel) == 0 {
+                    assert!(allowed); first_guard_tx.send(()).unwrap();
+                }
+                if allowed { Ok(()) } else { Err("revoked".into()) }
+            },
+            |request, worker| { stop_dispatches.fetch_add(1, Ordering::AcqRel); ack(request, worker) }));
+        first_guard_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while c.automatic.test_epoch() == epoch && Instant::now() < deadline { std::thread::yield_now(); }
+        // Epoch changes only after the first guard returns successfully. The
+        // admitted Goto is still held, so the second guard cannot run yet.
+        assert_ne!(c.automatic.test_epoch(), epoch);
+        assert!(c.state.try_lock().is_err());
+        assert_eq!(guards.load(Ordering::Acquire), 1);
+        lease.store(false, Ordering::Release); release_tx.send(()).unwrap();
+        motion.join().unwrap(); assert_eq!(stop.join().unwrap().unwrap_err(), "revoked");
+        assert_eq!(guards.load(Ordering::Acquire), 2);
+        assert_eq!(dispatches.load(Ordering::Acquire), 0);
+    }
 }
 
 #[cfg(test)]

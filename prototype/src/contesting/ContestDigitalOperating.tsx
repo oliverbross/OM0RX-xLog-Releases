@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import {useEffect,useRef,useState} from "react";
 import {digitalPlatformLimitation} from "../live/digitalPlatform";
 type Decode={id:string;sender:string;instanceID:string;engineVersion:string;periodMS:number;snr:number;deltaSeconds:number;message:string;mode:string;frequencyHz:number;lowConfidence:boolean;offAir:boolean;replyLimitation:string};
@@ -40,11 +41,11 @@ function SupportedDigitalOperating({scope,serviceRequest,onApply,disabled,identi
         if(reviewedCompleted!==`${identity}/${row.id}`)throw Error("Review this completed event and current target lane first.");
         await serviceRequest("fldigi_accept_completed",{id:row.id,sessionID:scope.sessionID,workspaceGeneration:scope.workspaceGeneration,laneID:scope.selectedLaneID??"laneA",bindingVersion:scope.bindingVersion??0});setReviewedCompleted("");})}>Accept completed QSO</button></div>)}
     <button type="button" disabled={disabled||busy} onClick={()=>void run(async()=>{const origin=identity,value=await serviceRequest("fldigi_rx_text");if(current.current===origin){setReceived(value);setSelected(null);setToken("");}})}>Read fldigi received text</button>
-    {snapshot?.fldigi?.recovery_error&&<p role="alert">{snapshot.fldigi.recovery_error}</p>}
+    {snapshot?.fldigi?.recovery_error&&<ErrorNotice><p role="alert">{snapshot.fldigi.recovery_error}</p></ErrorNotice>}
     {evidence&&<><p>{selected?`Selected candidate ${selected.instanceID}`:`fldigi ${received.engineVersion}`} · evidence only</p><pre style={{whiteSpace:"pre-wrap",maxHeight:160,overflow:"auto"}}>{evidence}</pre>
       <label>Received token<select aria-label="Received token" value={token} onChange={e=>setToken(e.target.value)}><option value="">Choose an exact token</option>{[...new Set<string>(evidence.split(/\s+/).filter((item:string)=>item&&item.length<=128))].map(item=><option key={item}>{item}</option>)}</select></label>
       <label>Plugin field<select aria-label="Digital target field" value={field} onChange={e=>setField(e.target.value)}>{scope.fields.filter(item=>!item.readOnly&&item.enabled!==false).map(item=><option key={item.id} value={item.id}>{item.label??item.id}</option>)}</select></label>
       <button type="button" disabled={disabled||busy||!token} onClick={()=>void run(apply)}>Load token into empty field</button><p>Conflicting text stays evidence. Occupied fields and stale drafts are protected. Use the existing Call Stack to park a reviewed caller.</p></>}
-    {error&&<p role="alert">{error}</p>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section>;
 }

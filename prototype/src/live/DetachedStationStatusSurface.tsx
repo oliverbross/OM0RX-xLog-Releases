@@ -1,3 +1,5 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { formatRadioFrequency } from "./radioFrequency";
 import { useEffect, useState } from "react";
 import { connectStationStatus } from "./stationStatus";
 import { monitorRadioFresh, monitorStation, type MonitorContext } from "./monitorContext";
@@ -5,7 +7,7 @@ import "./StationPanel.css";
 import "./DetachedTaskSurface.css";
 
 const providers = { direct_agent: "Remote Station Agent", direct_flex_lan: "Direct FLEX LAN", direct_tci: "Direct TCI · receive control", hamlib: "Local Hamlib" };
-const frequency = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0 ? `${(value / 1e6).toFixed(6)} MHz` : "Unavailable";
+const frequency = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0 ? `${formatRadioFrequency(value)} MHz` : "Unavailable";
 const text = (value: unknown) => typeof value === "string" && value.trim() ? value : "Unavailable";
 const freshTime = (time: unknown, now: number) => typeof time === "number" && Number.isFinite(time) && Math.abs(now - time * 1000) <= 5000;
 
@@ -29,7 +31,7 @@ export function DetachedStationStatusSurface() {
     (provider !== "hamlib" || ["frequency", "mode"].every(field => freshTime(context?.radio?.snapshot?.field_observed_at_ms?.[field] / 1000, clock)));
   const fieldFresh = (field: string) => fresh && (provider !== "hamlib" || freshTime(context?.radio?.snapshot?.field_observed_at_ms?.[field] / 1000, clock));
   return <div className="app live detached-task-app detached-station-status-app"><main aria-label="Detached Station Status"><section className="live-station" aria-label="Station state">
-    <p role="status">{!provider ? "No retained selected radio. Choose and connect a radio in Desk." : `${providers[provider]} · ${fresh ? "Observed current" : "Unavailable or stale · retained values are display only"}`}</p>
+    <ErrorNotice><p role="status">{!provider ? "No retained selected radio. Choose and connect a radio in Desk." : `${providers[provider]} · ${fresh ? "Observed current" : "Unavailable or stale · retained values are display only"}`}</p></ErrorNotice>
     <div className="live-station-readback"><div><span>{fresh ? "Observed receive" : "Retained receive"}</span>
       <strong>{frequency(radio.receive_frequency_hz ?? radio.frequency_hz)}</strong><span>{text(radio.mode)}</span></div></div>
     <dl><dt>PTT</dt><dd>{fieldFresh("ptt") && typeof radio.transmitting === "boolean" ? radio.transmitting ? "Transmitting" : "Receive" : "Unavailable"}</dd>
@@ -45,6 +47,6 @@ export function DetachedStationStatusSurface() {
       {Array.isArray(safety.inhibitors) && safety.inhibitors.filter((value: unknown) => typeof value === "string").map((value: string, index: number) => <p key={index}>{value}</p>)}
       {typeof safety.alarm_summary === "string" && <p>{safety.alarm_summary}</p>}
     </section>}
-    {error && <p role="alert">{error}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section></main></div>;
 }

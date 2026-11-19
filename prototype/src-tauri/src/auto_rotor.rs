@@ -180,7 +180,7 @@ impl AutomaticRotor {
             state.enabled = false; state.attempted = None; state.error.clear();
         }
     }
-    fn revoke_authority(&self) {
+    pub(crate) fn revoke_authority(&self) {
         self.advance_epoch(true);
     }
     fn note_reconcile_error(&self, expected_epoch: u64, error: &str) {
@@ -709,6 +709,53 @@ mod tests {
         assert_eq!(result["requested"], true);
         assert_eq!(motion.load(Ordering::SeqCst), 1);
         assert_eq!(owner.snapshot().unwrap()["enabled"], true);
+    }
+    #[test]
+    fn companion_stop_revokes_queued_automatic_turn_before_waiting_for_driver() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let owner = Arc::new(AutomaticRotor::new());
+        let coordinator = Arc::new(crate::rotor::RotorCoordinator::with_authority(owner.clone()));
+        let connected = coordinator.handle(json!({"id":"connect","method":"rotor_connect","params":{"owner":"native_dcu1"}}),
+            |request| Ok(json!({"id":request["id"],"ok":true,"result":{"connected":true,"companion_worker_generation":7}}))).unwrap();
+        let generation = connected["result"]["generation"].as_u64().unwrap();
+        let observed = coordinator.handle(json!({"id":"observe","method":"rotor_snapshot","params":{}}),
+            |request| Ok(json!({"id":request["id"],"ok":true,"result":{"connected":true,"azimuth":42}}))).unwrap();
+        let route = observed["result"]["companion_route_id"].as_str().unwrap().to_owned();
+        owner.arm("native_dcu1", generation).unwrap();
+        let permit = owner.begin(target("OM0RX"), false, Some(("native_dcu1".into(), generation))).unwrap();
+        let (entered, ready) = mpsc::channel(); let (release, released) = mpsc::channel();
+        let moving_owner = owner.clone(); let moving = coordinator.clone();
+        let motion = std::thread::spawn(move || moving_owner.turn(&permit, || Ok(target("OM0RX")),
+            |_| Ok(json!({"call":"OM0RX","bearing":90})), |permit, bearing| {
+                moving.handle_automatic(permit.request(bearing)?, permit, |request| {
+                    entered.send(()).unwrap(); released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(json!({"id":request["id"],"ok":true,"result":{"accepted":true}}))
+                })
+            }).unwrap());
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let queued_permit = owner.begin(target("K1ABC"), false, Some(("native_dcu1".into(), generation))).unwrap();
+        let queued_owner = owner.clone(); let queued_rotor = coordinator.clone();
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let queued = std::thread::spawn(move || queued_owner.turn(&queued_permit, || Ok(target("K1ABC")),
+            |_| Ok(json!({"call":"K1ABC","bearing":120})), |permit, bearing| {
+                queued_tx.send(()).unwrap();
+                queued_rotor.handle_automatic(permit.request(bearing)?, permit,
+                    |_| panic!("queued automatic turn passed companion Stop"))
+                    .map(|reply| reply["result"].clone())
+            }).unwrap());
+        queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stopping = coordinator.clone();
+        let stop = std::thread::spawn(move || stopping.stop_companion(&route, || Ok(()), |request, worker| {
+            assert_eq!(worker, Some(7));
+            Ok(json!({"id":request["id"],"ok":true,"result":{"accepted":true}}))
+        }).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.armed() && Instant::now() < deadline { std::thread::yield_now(); }
+        let revoked_before_driver_return = !owner.armed();
+        release.send(()).unwrap(); motion.join().unwrap();
+        assert_eq!(queued.join().unwrap()["requested"], false); stop.join().unwrap();
+        assert!(revoked_before_driver_return, "companion Stop waited for driver before revoking queued turns");
     }
     #[test]
     fn revocation_does_not_wait_for_admitted_driver_and_stop_stays_after_goto() {

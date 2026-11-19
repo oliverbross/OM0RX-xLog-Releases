@@ -6,6 +6,8 @@
 .rotor-auto-settings legend { margin-bottom:7px; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
 .rotor-auto-bands { display:grid; grid-template-columns:repeat(auto-fit,minmax(68px,1fr)); gap:6px; }
 .rotor-auto-bands label { display:flex; align-items:center; gap:6px; min-height:32px; padding:4px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); }
+.service-settings .rotor-auto-start, .service-settings .rotor-auto-bands label { flex-direction:row; align-items:center; }
+.rotor-panel > .live-actions { flex-wrap:wrap; }
 .rotor-panel-layout { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(240px,1fr); gap:12px; padding:0 14px 14px; align-items:start; }
 .rotor-panel-bearing { display:block; margin:10px 0; font:700 32px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .rotor-panel-layout .live-station-inline { flex-wrap:wrap; }

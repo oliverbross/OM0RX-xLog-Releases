@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 export type RadioID = "radio1" | "radio2";
-export type StationReceipt = { operation_id: string; status: "pending" | "unknown" | "saved" | "acknowledged" | "confirmed" | "reviewed"; request: { action: string } };
+export type StationReceipt = { operation_id: string; status: "pending" | "unknown" | "saved" | "acknowledged" | "confirmed" | "reviewed" | "rejected"; request: { action: string } };
 export type StationSession = {
   radio_id: RadioID;
   active_radio: RadioID;
@@ -28,7 +28,9 @@ export function radioConnected(value: StationSession | null): boolean {
   const live = value?.radio, snapshot = live?.snapshot;
   return !!live && live.provider === value?.selection.provider && live.selection_id === value?.selection.selection_id
     && live.selection_generation === value?.selection.generation
-    && snapshot?.radio?.connected === true && snapshot.radio.observed === true && snapshot?.station?.radio_stale === false;
+    && snapshot?.radio?.connected === true && snapshot.radio.observed === true
+    && (live.provider === "direct_flex_lan" ? snapshot.source === live.provider && snapshot.available === true && snapshot.transport_state === "ready"
+      : snapshot.station?.radio_stale === false);
 }
 export function validTCIConfiguration(configuration: TCIConfiguration): boolean {
   try {

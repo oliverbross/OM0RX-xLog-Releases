@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { workerRequest } from "../worker";
 import { CanonicalDraftFollower, intelligenceIdentity } from "./callsignIntelligenceContext";
@@ -100,13 +101,13 @@ export function PreviousQSOsSurface({ request = requestDetachedPreviousQSOs }: {
   }, [key, call, matched, request, refresh]);
   const current = history?.key === key ? history : null;
   return <div className="app live monitor-app detached-previous-qsos-app"><main aria-label="Previous QSOs">
-    {(warning || state.error) && <p className="live-error" role="alert">{warning || state.error}</p>}
-    {historyWarning && <p className="live-error" role="status">{historyWarning}</p>}
+    {(warning || state.error) && <ErrorNotice><p className="live-error" role="alert">{warning || state.error}</p></ErrorNotice>}
+    {historyWarning && <ErrorNotice><p className="live-error" role="status">{historyWarning}</p></ErrorNotice>}
     <div className="previous-qsos-context"><strong>{call || "—"}</strong><span>{matched && current && !current.error ? `${current.count.toLocaleString()} worked · ${current.confirmed.toLocaleString()} confirmed` : "Enter a callsign in Log QSO"}</span></div>
-    {current?.error ? <p className="live-error" role="alert">{current.error} <button type="button" onClick={() => setRefresh(value => value + 1)}>Retry history</button></p>
-      : !matched ? <p className="secondary" role="status">{state.error ? "Shared draft unavailable" : "Previous contacts follow the callsign in Log QSO."}</p>
-      : !current ? <p className="secondary" role="status">Loading local contacts…</p>
-      : !current.rows.length ? <p className="secondary" role="status">No previous QSOs with {call}.</p>
+    {current?.error ? <ErrorNotice><p className="live-error" role="alert">{current.error} <button type="button" onClick={() => setRefresh(value => value + 1)}>Retry history</button></p></ErrorNotice>
+      : !matched ? <ErrorNotice when={Boolean(state.error) || undefined}><p className="secondary" role="status">{state.error ? "Shared draft unavailable" : "Previous contacts follow the callsign in Log QSO."}</p></ErrorNotice>
+      : !current ? <ErrorNotice><p className="secondary" role="status">Loading local contacts…</p></ErrorNotice>
+      : !current.rows.length ? <ErrorNotice><p className="secondary" role="status">No previous QSOs with {call}.</p></ErrorNotice>
       : <><div className="previous-qsos-table" tabIndex={0} role="region" aria-label={`Previous contacts with ${call}, scroll for more columns`}><table style={{ minWidth: totalWidth }}>
         <colgroup>{columns.map(([id]) => <col key={id} style={{ width: `${widths[id] / totalWidth * 100}%` }} />)}</colgroup><thead><tr>
         {columns.map(([id, label]) => <ColumnHeader key={id} id={id} label={label} width={widths[id]} onWidth={resizeColumn} />)}

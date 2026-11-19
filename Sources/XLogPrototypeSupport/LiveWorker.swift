@@ -66,6 +66,22 @@ public actor LiveWorker {
     }
     private let diagnostics = PrototypeWorker()
     private var terminalShutdown = false
+    // A timed-out native caller does not release this slot. Keep it until the
+    // actual owner read returns, so repeated requests cannot queue behind it.
+    private var companionDetailInFlight = false
+    private actor CompanionDetailLane {
+        func read(_ service: LiveLogbookMethods, params: [String: Any]) throws -> [String: Any] {
+            try service.handle(method: "logbook_companion_contact_detail", params: params)
+        }
+    }
+    private let companionDetailLane = CompanionDetailLane()
+    private var companionBearingInFlight = false
+    private actor CompanionBearingLane {
+        func read(_ service: LiveLogbookMethods, params: [String: Any]) throws -> [String: Any] {
+            try service.handle(method: "logbook_companion_bearing", params: params)
+        }
+    }
+    private let companionBearingLane = CompanionBearingLane()
     // Disk-backed logbook work is synchronous. Run it on its own actor so a
     // slow import/backup cannot monopolize the station and service router.
     private actor LogbookLane {
@@ -260,7 +276,7 @@ public actor LiveWorker {
         let backupService = remoteBackup ?? LiveRemoteBackupService(logbook: logbook,
             accountVerifier: backupVerifier)
         self.remoteBackup = backupService
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         let ftpPresentation = ownsProcessSessions && runtimeProfile.externalIOAllowed && !localAcceptance && remoteBackupEnvironment == nil
             ? LiveFTPBackupPresentation(logbook: logbook, service: backupService) : nil
         #else
@@ -372,7 +388,7 @@ public actor LiveWorker {
         await services.startAutomaticSync()
         guard !terminalShutdown, !Task.isCancelled else { return }
         await onlineLogs.startAutomaticDelivery()
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         guard !terminalShutdown, !Task.isCancelled else { return }
         if ownsProcessSingletons {
             await LiveWSJTXBridge.shared.install { [weak self] in
@@ -404,7 +420,7 @@ public actor LiveWorker {
         let delivery = powerDelivery
         powerCapture.install(changed: { delivery.enqueue { await lane.reconcilePower() } },
                              received: { reading in delivery.enqueue { await lane.capturePower(reading) } })
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         if registerStation { await stationRegistry?.installPowerCapture(powerCapture) }
         #endif
         await lane.reconcilePower()
@@ -428,7 +444,7 @@ public actor LiveWorker {
         await remoteBackup.terminate()
         await services.beginTermination()
         await references.terminate()
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         if ownsProcessSingletons && runtimeProfile.externalIOAllowed && !localAcceptance {
             await LiveWSJTXBridge.shared.stopForShutdown()
             await LiveFldigiBridge.shared.stopForShutdown()
@@ -445,7 +461,7 @@ public actor LiveWorker {
             return .resolve(onlineLogsRetired: onlineLogsRetired, contestSpotsRetired: contestSpotsRetired,
                             stationRetired: stationRetired)
         }
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         if ownsProcessSingletons && runtimeProfile.externalIOAllowed {
             await LiveSpotBridge.shared.stopForShutdown()
             // Seal/drain accepted publications, but leave cosmetic removal on
@@ -465,7 +481,7 @@ public actor LiveWorker {
     }
 
     private func retireStationOwners() async -> Bool {
-        #if os(macOS)
+        #if os(macOS) || os(Windows)
         // Shared owners are installed only for an eligible process factory.
         // An explicitly injected private registry still owns its fixture cleanup
         // when the worker profile correctly prohibits external station I/O.
@@ -519,12 +535,19 @@ public actor LiveWorker {
             if ["sync_run", "sync_configure", "sync_retry", "sync_resolve"].contains(method) {
                 throw WorkerFailure("sync_owner_required", "Use the shared generation-bound Sync mutation owner.")
             }
-            if terminalShutdown && !terminalStationRetirement && (method.hasPrefix("contest_") || method.hasPrefix("reference_") || method.hasPrefix("sync_") || method.hasPrefix("secret_") || method.hasPrefix("online_log_") || method.hasPrefix("station_") || method.hasPrefix("spot_bridge_") || method.hasPrefix("wsjtx_") || method.hasPrefix("fldigi_") || method.hasPrefix("spot_history_") || method.hasPrefix("spot_draft_") || method.hasPrefix("opportunities_") || method.hasPrefix("operating_goals_") || method.hasPrefix("cluster_") || method.hasPrefix("logbook_operator_draft") || method.hasPrefix("logbook_contact") || ["weather", "propagation_snapshot", "propagation_refresh", "lookup_call", "workspace_create", "backup_restore"].contains(method)) {
+            if terminalShutdown && !terminalStationRetirement && (method.hasPrefix("contest_") || method.hasPrefix("reference_") || method.hasPrefix("sync_") || method.hasPrefix("secret_") || method.hasPrefix("online_log_") || method.hasPrefix("station_") || method.hasPrefix("spot_bridge_") || method.hasPrefix("wsjtx_") || method.hasPrefix("fldigi_") || method.hasPrefix("spot_history_") || method.hasPrefix("spot_draft_") || method.hasPrefix("opportunities_") || method.hasPrefix("operating_goals_") || method.hasPrefix("cluster_") || method.hasPrefix("logbook_operator_draft") || method.hasPrefix("logbook_contact") || method.hasPrefix("logbook_companion_") || ["weather", "propagation_snapshot", "propagation_refresh", "lookup_call", "workspace_create", "backup_restore"].contains(method)) {
                 throw WorkerFailure("worker_stopping", "The worker is shutting down; no new service request was started.")
             }
             if method == "health" {
                 guard params.isEmpty else { throw WorkerFailure("invalid_params", "Health takes no parameters.") }
                 var health = Self.health
+                #if os(Windows) || os(macOS)
+                health["native_dcu1"] = ownsProcessSingletons && !localAcceptance && runtimeProfile.externalIOAllowed
+                let directRadioAvailable = !localAcceptance && runtimeProfile.externalIOAllowed && stationRegistry != nil
+                health["direct_flex_lan"] = directRadioAvailable
+                health["direct_tci"] = directRadioAvailable
+                health["direct_agent"] = directRadioAvailable
+                #endif
                 if localAcceptance {
                     health["mode"] = "isolated_local_acceptance"
                     health["platform_services"] = false
@@ -558,12 +581,17 @@ public actor LiveWorker {
             if ["parse_adif", "self_test", "integration_self_test", "cluster_classify"].contains(method) {
                 return diagnostics.response(to: data)
             }
-            #if os(macOS)
+            #if os(macOS) || os(Windows)
             if method == "contest_station_tune" {
                 guard runtimeProfile == .production, operatingModule == .contesting else {
                     throw WorkerFailure("inactive_operating_module", "Contest tuning belongs to the inactive operating module.")
                 }
-                let tuned = try await LiveStationMethods.handle("station_tune", params: params, registry: stationRegistry ?? .shared)
+                #if os(macOS)
+                let registry = stationRegistry ?? .shared
+                #else
+                guard let registry = stationRegistry else { throw WorkerFailure("station_unavailable", "Station services are unavailable.") }
+                #endif
+                let tuned = try await LiveStationMethods.handle("station_tune", params: params, registry: registry)
                 return encode(["id": id, "ok": true, "result": tuned])
             }
             #endif
@@ -674,13 +702,34 @@ public actor LiveWorker {
                 guard !terminalShutdown else { throw WorkerFailure("worker_stopping", "The worker is shutting down.") }
                 result = try await logbookMethods.countryReview(params: params)
                 guard !terminalShutdown else { throw WorkerFailure("worker_stopping", "The worker is shutting down.") }
-            } else if method == "logbook_stats" || method == "logbook_catalog" || method == "logbook_list" || method == "logbook_award_progress" || (method == "logbook_export_adif" && params["action"] as? String == "begin") {
+            } else if method == "logbook_stats" || method == "logbook_catalog" || method == "logbook_list" || method == "logbook_award_progress" {
+                // Export "begin" is no longer an aggregate read: it captures only
+                // identities, and each page decodes its own contacts.
                 guard !terminalShutdown else { throw WorkerFailure("worker_stopping", "The worker is shutting down.") }
                 let reply = try await aggregateReads.handle(method: method, params: params)
                 guard !terminalShutdown else { throw WorkerFailure("worker_stopping", "The worker is shutting down.") }
                 // No await separates this last owner fence from serialization.
                 try logbookMethods.confirmAggregateOwner(reply.owner)
                 result = reply.payload
+            } else if method == "logbook_companion_bearing" {
+                guard operatingModule == .normalLogging, requestOperatingModule == .normalLogging else {
+                    throw WorkerFailure("operating_module_unavailable", "Bearing belongs to Normal Logging.")
+                }
+                guard !companionBearingInFlight else { throw WorkerFailure("workspace_busy", "Bearing is temporarily unavailable.") }
+                companionBearingInFlight = true
+                defer { companionBearingInFlight = false }
+                // Retain this slot until the actual read completes, even when
+                // a native caller has abandoned its five-second wait.
+                result = try await companionBearingLane.read(logbookMethods, params: params)
+                guard !terminalShutdown else { throw WorkerFailure("worker_stopping", "The worker is shutting down.") }
+            } else if method == "logbook_companion_contact_detail" {
+                guard !companionDetailInFlight else { throw WorkerFailure("workspace_busy", "Contact detail is temporarily unavailable.") }
+                companionDetailInFlight = true
+                defer { companionDetailInFlight = false }
+                // Do not enqueue behind imports/backups in LogbookLane. The
+                // existing owner's try-lock returns busy without creating it.
+                result = try await companionDetailLane.read(logbookMethods, params: params)
+                guard !terminalShutdown else { throw WorkerFailure("worker_stopping", "The worker is shutting down.") }
             } else if method == "hm_control_logbook" || method == "cluster_history" || method.hasPrefix("spot_draft_") || method.hasPrefix("workspace_") || method.hasPrefix("logbook_") || method.hasPrefix("settings_") || method.hasPrefix("backup_") {
                 if method == "logbook_operator_draft_apply", params["action"] as? String == "save" {
                     // Include the callback prefix already emitted before Save
@@ -703,7 +752,7 @@ public actor LiveWorker {
                     powerCapture.suspend(true)
                     await onlineLogs.suspendForOwnershipChange()
                     await references.suspendForWorkspaceChange()
-                    #if os(macOS)
+                    #if os(macOS) || os(Windows)
                     if ownsProcessSingletons {
                         await LiveWSJTXBridge.shared.suspendForWorkspaceChange()
                         await LiveFldigiBridge.shared.suspendForWorkspaceChange()
@@ -730,7 +779,7 @@ public actor LiveWorker {
                     // rebuild its invalidated projection without hiding error.
                     if changingWorkspace {
                         await references.finishWorkspaceChange()
-                        #if os(macOS)
+                        #if os(macOS) || os(Windows)
                         if ownsProcessSingletons && normalBackgroundEnabled {
                             await LiveWSJTXBridge.shared.finishWorkspaceChange()
                         }
@@ -754,7 +803,7 @@ public actor LiveWorker {
                 }
                 if changingWorkspace {
                     await references.finishWorkspaceChange()
-                    #if os(macOS)
+                    #if os(macOS) || os(Windows)
                     if ownsProcessSingletons && normalBackgroundEnabled {
                         await LiveWSJTXBridge.shared.finishWorkspaceChange()
                     }
@@ -773,7 +822,7 @@ public actor LiveWorker {
                     && result["status"] as? String == "applied"
                 let countryChanged = ["logbook_country_correction_apply", "logbook_country_correction_undo"].contains(method)
                     && result["status"] as? String == "applied" && result["replayed"] as? Bool != true
-                let contactChanged = (method == "logbook_contact_apply" && result["status"] as? String == "applied") || countryChanged
+                let contactChanged = (["logbook_contact_apply", "logbook_companion_apply"].contains(method) && result["status"] as? String == "applied") || countryChanged
                 if method == "settings_save" { await references.resetAutomaticDeadline() }
                 let imported = method == "logbook_import_adif" && !["preview", "retire"].contains(params["action"] as? String ?? "")
                 if draftLogged || contactChanged || imported || ["logbook_save", "logbook_delete", "logbook_undo"].contains(method) {
@@ -782,7 +831,7 @@ public actor LiveWorker {
                 if normalBackgroundEnabled && (draftLogged || contactChanged || imported || ["workspace_create", "logbook_save", "logbook_delete", "logbook_undo", "backup_restore"].contains(method)) {
                     queueContactRefresh()
                 }
-                if normalBackgroundEnabled && (draftLogged || method == "logbook_save") {
+                if normalBackgroundEnabled && (draftLogged || method == "logbook_save" || method == "logbook_companion_apply" && params["expectedRevision"] == nil && result["status"] as? String == "applied") {
                     queueOnlineLogDelivery()
                 }
             } else if method == "remote_backup_request" {
@@ -812,6 +861,13 @@ public actor LiveWorker {
                         }
                     }
                     result = serviceResult
+                    // A reviewed conflict merge may change paper/LoTW flags,
+                    // callsign, band or mode without starting a full sync run.
+                    if method == "sync_mutation", params["method"] as? String == "sync_resolve",
+                       serviceResult["status"] as? String == "acknowledged" {
+                        await aggregateReads.observeContactChange()
+                        if normalBackgroundEnabled { queueContactRefresh() }
+                    }
                     if method == "sync_summary", let revision = result["logbook_revision"] as? Int64 {
                         await aggregateReads.observeRevision(revision)
                     }
@@ -831,15 +887,11 @@ public actor LiveWorker {
                     await aggregateReads.observeContactChange()
                     if normalBackgroundEnabled { queueContactRefresh() }
                 }
+            } else if method == LiveConnectionDoctorMethods.method {
+                result = try LiveConnectionDoctorMethods.handle(params)
             } else {
-                #if os(macOS)
-                if method == LiveConnectionDoctorMethods.method {
-                    result = try LiveConnectionDoctorMethods.handle(params)
-                } else if method.hasPrefix("station_") {
-                result = try await LiveStationMethods.handle(method, params: params, registry: stationRegistry ?? .shared)
-                } else if method.hasPrefix("spot_bridge_") {
-                    result = try await LiveSpotBridge.shared.handle(method: method, params: params)
-                } else if method.hasPrefix("wsjtx_") {
+                #if os(macOS) || os(Windows)
+                if method.hasPrefix("wsjtx_") {
                     let route = Self.wsjtxRoute(for: requestOperatingModule)
                     var destinationProvider: (@Sendable () async throws -> WSJTXContestDestination)?
                     var contestImporter: (@Sendable (ADIFRecord, WSJTXContestDestination) async throws -> Bool)?
@@ -871,7 +923,27 @@ public actor LiveWorker {
                         transmitDestination: transmitDestination, contestImporter: contestImporter,
                         transmitDestinationProvider: transmitDestinationProvider)
                 } else {
+                    #if os(macOS)
+                if method.hasPrefix("station_") {
+                result = try await LiveStationMethods.handle(method, params: params, registry: stationRegistry ?? .shared)
+                } else if method.hasPrefix("spot_bridge_") {
+                    result = try await LiveSpotBridge.shared.handle(method: method, params: params)
+                } else {
                     result = try await services.handle(method: method, params: params)
+                }
+                #elseif os(Windows)
+                if method.hasPrefix("spot_bridge_") {
+                    result = try await LiveSpotBridge.shared.handle(method: method, params: params)
+                } else if method.hasPrefix("station_rotor_"), ownsProcessSingletons, let stationRegistry {
+                    result = try await LiveStationMethods.handle(method, params: params, registry: stationRegistry)
+                } else if method.hasPrefix("station_"), let stationRegistry {
+                    result = try await LiveStationMethods.handle(method, params: params, registry: stationRegistry)
+                } else if method == "lookup_call" {
+                    result = try await services.handle(method: method, params: params)
+                } else {
+                    throw WorkerFailure("platform_pending", "This service is unavailable on Windows.")
+                }
+                    #endif
                 }
                 #else
                 if method == "lookup_call" {
@@ -952,7 +1024,7 @@ public actor LiveWorker {
          "contest_scp_select", "contest_scp_import_private"].contains(method)
     }
 
-    #if os(macOS)
+    #if os(macOS) || os(Windows)
     static func wsjtxRoute(for module: WorkerOperatingModule) -> WSJTXLoggingRoute {
         module == .normalLogging ? .normalLogging : .contestSurfaceOrdinaryLogbook
     }

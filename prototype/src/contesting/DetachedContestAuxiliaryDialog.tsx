@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useState, type FormEvent } from "react";
 import { closeContestSetupDialog, saveContestRoverDialog, setupDialogRequest, type SetupDialogSnapshot } from "./contestSetupDialogs";
 import "./ContestWorkspace.css";
@@ -35,7 +36,7 @@ export function DetachedContestAuxiliaryDialog() {
         maxLength={10} value={location} onChange={event => setLocation(event.target.value.toUpperCase())}/></label>
       <div className="contest-aux-actions"><button type="button" onClick={() => void closeContestSetupDialog()}>Cancel</button>
         <button type="submit" className="contest-primary" disabled={!snapshot || saving || !location.trim()}>{saving ? "Saving…" : "OK"}</button></div>
-    </form>{error && <p role="alert">{error}</p>}
+    </form>{error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </main>;
   return <main className="contest-aux-dialog contest-about-dialog" aria-label="About Not1MM">
     <h1>Not1MM</h1>
@@ -45,10 +46,10 @@ export function DetachedContestAuxiliaryDialog() {
         <div><dt>Plugin</dt><dd>{snapshot.auxiliary.diagnostics.plugin}</dd></div>
         <div><dt>Version</dt><dd>{snapshot.auxiliary.diagnostics.version}</dd></div>
         <div><dt>Source</dt><dd>{snapshot.auxiliary.diagnostics.source}</dd></div>
-        <div><dt>Reference</dt><dd>{snapshot.auxiliary.diagnostics.reference}</dd></div></dl> : <p role="status">Loading contest details…</p>}
+        <div><dt>Reference</dt><dd>{snapshot.auxiliary.diagnostics.reference}</dd></div></dl> : <ErrorNotice><p role="status">Loading contest details…</p></ErrorNotice>}
       <h2>To donate visit:</h2><p>paypal.me/k6gte</p><p>or</p><p>patreon.com/K6GTE</p>
       <h2>Donors</h2>{donors.map(donor => <p key={donor}>{donor}</p>)}
     </section>
-    {error && <p role="alert">{error}</p>}<footer><button type="button" onClick={() => void closeContestSetupDialog()}>Close</button></footer>
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}<footer><button type="button" onClick={() => void closeContestSetupDialog()}>Close</button></footer>
   </main>;
 }

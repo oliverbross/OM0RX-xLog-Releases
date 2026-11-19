@@ -21,3 +21,7 @@ The Contest Country Files #3533 were released on 12 October 2025.
    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+
+Bundled cty.dat: CTY-3636, 7 November 2026, Jim Reisert AD1C.
+Source: https://www.country-files.com/cty/cty.dat
+The permission notice above also applies to this file.

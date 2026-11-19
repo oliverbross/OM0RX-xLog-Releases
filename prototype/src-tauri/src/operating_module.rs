@@ -429,6 +429,7 @@ pub fn shared_worker_mutation(request: &Value) -> bool {
             "settings_save"
                 | "secret_save"
                 | "online_log_configure"
+                | "online_log_reconcile"
                 | "sync_mutation"
                 | "reference_refresh"
                 | "reference_country_import"

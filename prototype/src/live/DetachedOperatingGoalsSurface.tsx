@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { evaluateOperatingGoals, type OperatingGoal, type OperatingGoalEvaluation, type OperatingGoalResult } from "./operatingGoals";
 import "./DetachedOperatingGoalsSurface.css";
@@ -108,7 +109,7 @@ export function OperatingGoalsSurface({ evaluate = evaluateOperatingGoals }: { e
         <button className="primary" type="button" disabled={!goals.length || busy} onClick={() => void run()}>{busy ? "Evaluating…" : "Evaluate selected"}</button>
       </div>
     </section>
-    {error && <p className="live-error" role="alert">{error}</p>}
+    {error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
     {result && <>
       <section className="operating-goal-source-summary" aria-label="Evaluation sources"><dl>
         <div><dt>Station scope</dt><dd>{result.station_scope.all_stations ? "All retained stations" : [result.station_scope.callsign, result.station_scope.profile_id && `Profile ${result.station_scope.profile_id}`].filter(Boolean).join(" · ")}</dd></div>

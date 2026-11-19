@@ -29,5 +29,18 @@ XLogSocket *xlog_socket_connect(const char *host, uint16_t port, int timeout_ms,
 int xlog_socket_read(XLogSocket *socket, void *bytes, int capacity, int timeout_ms);
 /* write: >0 bytes (possibly partial), -1 failure, -2 would block. */
 int xlog_socket_write(XLogSocket *socket, const void *bytes, int count);
+#ifdef _WIN32
+XLogSocket *xlog_tcp_listen_loopback(uint16_t port, uint16_t *bound_port);
+XLogSocket *xlog_tcp_accept_loopback(XLogSocket *listener);
+/* Exclusive, nonblocking IPv4 loopback listener for private spot datagrams. */
+XLogSocket *xlog_spot_udp_listen(uint16_t port);
+int xlog_local_agent_http(const char *path, const char *method, const char *authorization,
+                          const void *body, int length, void *response, int capacity, int *size);
+/* Digital receivers accept only loopback or an explicitly joined IPv4 multicast group. */
+XLogSocket *xlog_digital_udp_listen(const char *group, uint16_t port);
+int xlog_digital_udp_read(XLogSocket *socket, void *bytes, int capacity, uint32_t *sender_ip, uint16_t *sender_port);
+/* >0 bytes, -2 no datagram yet, -3 empty/oversized, -1 terminal error. */
+int xlog_spot_udp_read(XLogSocket *socket, void *bytes, int capacity);
+#endif
 void xlog_socket_close(XLogSocket *socket);
 #endif

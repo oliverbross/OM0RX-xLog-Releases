@@ -8,6 +8,14 @@ $pinHelper = Join-Path $PSScriptRoot 'portable-swift-lock.py'
 if ($env:XLOG_SQLITE_PREFIX) {
     $arguments += @('-Xcc', "-I$env:XLOG_SQLITE_PREFIX/include", '-Xlinker', "/LIBPATH:$env:XLOG_SQLITE_PREFIX/lib")
 }
+$zlibPrefix = if ($env:XLOG_ZLIB_PREFIX) { $env:XLOG_ZLIB_PREFIX } else { $env:XLOG_SQLITE_PREFIX }
+if (!$zlibPrefix -or !(Test-Path (Join-Path $zlibPrefix 'include/zlib.h'))) {
+    throw 'Install zlib:x64-windows-static-md via vcpkg and set XLOG_ZLIB_PREFIX to its installation prefix.'
+}
+if (!(Test-Path (Join-Path $zlibPrefix 'lib/libcurl.lib'))) {
+    throw 'Install curl[non-http,ssl,sspi]:x64-windows-static-md alongside zlib in XLOG_ZLIB_PREFIX.'
+}
+$arguments += @('-Xcc', "-I$zlibPrefix/include", '-Xlinker', "/LIBPATH:$zlibPrefix/lib")
 & python3 $pinHelper run --root $repoRoot -- swift build @arguments --product xlog-prototype-worker
 if ($LASTEXITCODE -ne 0) { throw 'Worker build failed.' }
 $binaryDir = (& python3 $pinHelper run --root $repoRoot -- swift build @arguments --show-bin-path | Select-Object -Last 1).Trim()

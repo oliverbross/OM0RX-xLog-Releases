@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { ClusterPanel } from "./ClusterPanel";
 import { clusterInitializationPending, initializeNativeClusterResume } from "./clusterResume";
@@ -45,9 +46,9 @@ export function DetachedClusterSurface() {
   return <div className="app live monitor-app detached-cluster-app">
     <main className="live-feedback-host">
       <StableFeedbackLayer>
-      {error && <p className="live-error" role="alert">{error}</p>}
+      {error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
       <SpotActivationStatus status={activation.status} error={activation.error} checking={activation.requesting} reconcile={() => void activation.reconcile()} />
-      {projection && (!projection.available || receivedAt > 0 && clock - receivedAt > 5_000) && <p className="live-cluster-note" role="status">Cluster service updates paused; the last received spots remain visible. Refresh to check the service.</p>}
+      {projection && (!projection.available || receivedAt > 0 && clock - receivedAt > 5_000) && <ErrorNotice><p className="live-cluster-note" role="status">Cluster service updates paused; the last received spots remain visible. Refresh to check the service.</p></ErrorNotice>}
       </StableFeedbackLayer>
       {!projection?.response && <p className="secondary">Loading the shared cluster session…</p>}
       <ClusterPanel taskOnly passive snapshot={projection?.response ?? null} selectedSpotId={projection?.selected ?? null} onRequest={requestViaSession}

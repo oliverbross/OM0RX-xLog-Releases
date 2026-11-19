@@ -13,10 +13,16 @@ public struct WSJTXContestDestination: Codable, Equatable, Sendable {
     }
 }
 
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
+#if os(Windows)
+import WinSDK
+import CClusterSocket
+import XLogPortableCore
+#else
 import Darwin
 import XLogCore
+#endif
 
 protocol WSJTXDatagramReceiving: AnyObject {
     func start(address: String, port: UInt16) throws
@@ -82,6 +88,7 @@ enum WSJTXMessageParser {
 
 /// Receive-only IPv4 UDP endpoint. Multicast joins are supported because the
 /// WSJT-X protocol explicitly permits several logging clients on one feed.
+#if os(macOS)
 final class WSJTXUDPReceiver: WSJTXDatagramReceiving, @unchecked Sendable {
     typealias DatagramHandler = @Sendable (Data, String) -> Void
     typealias EventHandler = @Sendable (String) -> Void
@@ -92,7 +99,7 @@ final class WSJTXUDPReceiver: WSJTXDatagramReceiving, @unchecked Sendable {
     private let onEvent: EventHandler
     private var source: DispatchSourceRead?
     private var descriptor: Int32 = -1
-    private var generation: UUID?
+    private var generation: Foundation.UUID?
 
     init(onDatagram: @escaping DatagramHandler, onEvent: @escaping EventHandler = { _ in }) {
         self.onDatagram = onDatagram
@@ -145,7 +152,7 @@ final class WSJTXUDPReceiver: WSJTXDatagramReceiving, @unchecked Sendable {
             throw WorkerFailure("wsjtx_bind_failed", "Could not configure the WSJT-X UDP listener.")
         }
 
-        let session = UUID()
+        let session = Foundation.UUID()
         let reader = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         let accepted = lock.withLock { () -> Bool in
             guard source == nil else { return false }
@@ -173,7 +180,7 @@ final class WSJTXUDPReceiver: WSJTXDatagramReceiving, @unchecked Sendable {
         old?.cancel()
     }
 
-    private func drain(fd: Int32, generation: UUID) {
+    private func drain(fd: Int32, generation: Foundation.UUID) {
         while lock.withLock({ self.generation == generation && descriptor == fd }) {
             var buffer = [UInt8](repeating: 0, count: 65_535)
             var sender = sockaddr_in(), senderSize = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -198,15 +205,70 @@ final class WSJTXUDPReceiver: WSJTXDatagramReceiving, @unchecked Sendable {
     }
 }
 
+#else
+final class WSJTXUDPReceiver: WSJTXDatagramReceiving, @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let onDatagram: @Sendable (Data, String) -> Void
+    private let onEvent: @Sendable (String) -> Void
+    private var socket: OpaquePointer?
+    private var buffer = [UInt8](repeating: 0, count: 65_535)
+
+    init(onDatagram: @escaping @Sendable (Data, String) -> Void,
+                onEvent: @escaping @Sendable (String) -> Void = { _ in }) {
+        self.queue = DispatchQueue(label: "xlog.digital.udp")
+        self.onDatagram = onDatagram
+        self.onEvent = onEvent
+    }
+
+    func start(address: String, port: UInt16) throws {
+        try queue.sync {
+            guard socket == nil, let listener = address.withCString({ xlog_digital_udp_listen($0, port) }) else {
+                throw WorkerFailure("wsjtx_bind_failed", "Could not bind the configured digital UDP address and port.")
+            }
+            socket = listener
+            queue.async { [weak self] in self?.receive() }
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            if let socket { xlog_socket_close(socket) }
+            socket = nil
+        }
+    }
+
+    deinit { if let socket { xlog_socket_close(socket) } }
+
+    private func receive() {
+        guard let socket else { return }
+        var ip: UInt32 = 0, port: UInt16 = 0
+        let count = buffer.withUnsafeMutableBytes { xlog_digital_udp_read(socket, $0.baseAddress, Int32($0.count), &ip, &port) }
+        if count == -1 {
+            xlog_socket_close(socket)
+            self.socket = nil
+            onEvent("UDP listener failed: receive error")
+            return
+        }
+        if count > 0 {
+            let sender = "\(ip >> 24).\((ip >> 16) & 255).\((ip >> 8) & 255).\(ip & 255):\(port)"
+            onDatagram(Data(buffer.prefix(Int(count))), sender)
+        }
+        queue.async { [weak self] in self?.receive() }
+    }
+}
+#endif
+
 private struct WSJTXBridgeConfiguration: Codable, Equatable {
     var enabled = false
     var address = "127.0.0.1"
     var port: UInt16 = 2_237
     var destination = "ordinary_logbook"
+    /// Fill the Active QSO with the station the engine is working (on by default).
+    var followActiveQSO = true
 }
 
 private extension WSJTXBridgeConfiguration {
-    enum CodingKeys: String, CodingKey { case enabled, address, port, destination }
+    enum CodingKeys: String, CodingKey { case enabled, address, port, destination, followActiveQSO }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -214,6 +276,7 @@ private extension WSJTXBridgeConfiguration {
         address = try values.decode(String.self, forKey: .address)
         port = try values.decode(UInt16.self, forKey: .port)
         destination = try values.decodeIfPresent(String.self, forKey: .destination) ?? "ordinary_logbook"
+        followActiveQSO = try values.decodeIfPresent(Bool.self, forKey: .followActiveQSO) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -222,6 +285,7 @@ private extension WSJTXBridgeConfiguration {
         try values.encode(address, forKey: .address)
         try values.encode(port, forKey: .port)
         try values.encode(destination, forKey: .destination)
+        try values.encode(followActiveQSO, forKey: .followActiveQSO)
     }
 }
 
@@ -242,7 +306,7 @@ public actor LiveWSJTXBridge {
                                              @escaping @Sendable (String) -> Void) -> WSJTXDatagramReceiving
     private var configuration: WSJTXBridgeConfiguration?
     private var receiver: WSJTXDatagramReceiving?
-    private var receiverGeneration: UUID?
+    private var receiverGeneration: Foundation.UUID?
     private var workspaceSuspensionDepth = 0
     private var terminalShutdown = false
     private var onImported: (@Sendable () -> Void)?
@@ -254,6 +318,9 @@ public actor LiveWSJTXBridge {
     private var ignoredCount = 0
     private var rejectedCount = 0
     private var status = "Off"
+    /// The last contact an engine logged here (or that was already logged), so
+    /// the native follower can clear an Active QSO it filled for that station.
+    private var lastLogged: (call: String, at: UInt64)?
     private let ingress = SpotIngressGate(limit: 64)
     private var activity = WSJTXActivity()
     private var decodeDesk = WSJTXDecodeDesk()
@@ -388,7 +455,7 @@ public actor LiveWSJTXBridge {
         await ingest(data, sender: sender, generation: generation)
     }
 
-    private func ingest(_ data: Data, sender: String, generation: UUID) async {
+    private func ingest(_ data: Data, sender: String, generation: Foundation.UUID) async {
         guard receiverGeneration == generation, receiver != nil, configuration?.enabled == true else { return }
         receivedCount += 1
         do {
@@ -421,6 +488,9 @@ public actor LiveWSJTXBridge {
             guard receiverGeneration == generation else { return }
             importedCount += imported
             duplicateCount += duplicate ? 1 : 0
+            if let call = ADIFParser().records(in: message.text).first?.fields["CALL"]?.uppercased(), !call.isEmpty {
+                lastLogged = (call, UInt64(Date().timeIntervalSince1970 * 1000))
+            }
             status = imported > 0 ? (contestDestination == nil ? "Logged 1 WSJT-X contact locally." : "Logged 1 WSJT-X contact to the active contest.")
                 : "WSJT-X contact already exists; duplicate suppressed."
             if imported > 0 { onImported?() }
@@ -442,7 +512,7 @@ public actor LiveWSJTXBridge {
         }
         try requireStartAvailable()
         if receiver != nil { return }
-        let generation = UUID(); receiverGeneration = generation
+        let generation = Foundation.UUID(); receiverGeneration = generation
         let ingress = self.ingress
         let next = receiverFactory({ [weak self] data, sender in
             guard ingress.admit(bytes: data.count) else { return }
@@ -480,7 +550,7 @@ public actor LiveWSJTXBridge {
         }
     }
 
-    private func receiverEvent(_ event: String, generation: UUID) {
+    private func receiverEvent(_ event: String, generation: Foundation.UUID) {
         guard receiverGeneration == generation else { return }
         if event.hasPrefix("UDP listener failed") { stopReceiver(); status = "WSJT-X UDP listener failed and stopped." }
     }
@@ -515,7 +585,7 @@ public actor LiveWSJTXBridge {
         let destination = config.destination
         let activeContest: Any = availableContest.map { ["session_id": $0.sessionID, "plugin_id": $0.pluginID] } ?? NSNull()
         return ["configuration": ["enabled": config.enabled, "address": config.address, "port": Int(config.port),
-                                  "destination": destination],
+                                  "destination": destination, "followActiveQSO": config.followActiveQSO],
                 "logging_destination": destination, "request_origin": route.rawValue,
                 "contest_target_supported": availableContest != nil, "mutation_available": true,
                 "active_contest": activeContest,
@@ -524,6 +594,7 @@ public actor LiveWSJTXBridge {
                 "dropped_count": ingress.droppedCount, "status": status, "receive_only": true,
                 "decodes":decodeDesk.snapshot(now:now),"selected_instance":selectedInstance.map{["sender":$0.sender,"instanceID":$0.instance]} as Any? ?? NSNull(),
                 "completion_policy":"An explicit selected instance may submit a completed ADIF event. Selection is not a durable QSO. Restart retires the selection.",
+                "last_logged": lastLogged.map { ["call": $0.call, "at_ms": $0.at] as [String: Any] } as Any? ?? NSNull(),
                 "activity": activity.snapshot(now: now, available: receiver != nil,
                     classificationRevision: activityClassificationRevision, classifications: classifications)]
     }
@@ -544,21 +615,23 @@ public actor LiveWSJTXBridge {
         try validate(value); try validatePath()
         let directory = configurationURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
+                                                attributes: LocalFilePermissions.directoryAttributes)
         try JSONEncoder().encode(value).write(to: configurationURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configurationURL.path)
+        try LocalFilePermissions.protectFile(configurationURL)
     }
 
     private func decode(_ object: [String: Any]) throws -> (WSJTXBridgeConfiguration, String) {
         let keys = Set(object.keys), baseKeys: Set<String> = ["enabled", "address", "port"]
-        guard (keys == baseKeys || keys == baseKeys.union(["destination"])), let enabled = object["enabled"] as? Bool,
+        guard keys.isSuperset(of: baseKeys), keys.isSubset(of: baseKeys.union(["destination", "followActiveQSO"])),
+              object["followActiveQSO"] == nil || object["followActiveQSO"] is Bool, let enabled = object["enabled"] as? Bool,
               let address = object["address"] as? String, let port = object["port"] as? NSNumber,
-              CFGetTypeID(port) != CFBooleanGetTypeID(), port.doubleValue.rounded() == port.doubleValue,
+              String(cString: port.objCType) != "c", port.doubleValue.rounded() == port.doubleValue,
               (1...65_535).contains(port.intValue) else { throw invalid() }
         let destination = object["destination"] as? String ?? "ordinary_logbook"
         guard ["ordinary_logbook", "active_contest"].contains(destination) else { throw invalid() }
         let value = WSJTXBridgeConfiguration(enabled: enabled, address: address, port: UInt16(port.intValue),
-                                             destination: destination)
+                                             destination: destination,
+                                             followActiveQSO: object["followActiveQSO"] as? Bool ?? true)
         try validate(value); return (value, destination)
     }
 
@@ -567,7 +640,7 @@ public actor LiveWSJTXBridge {
         var parsed = in_addr()
         guard value.address.utf8.count <= 45,
               value.address.withCString({ inet_pton(AF_INET, $0, &parsed) }) == 1 else { throw invalid() }
-        let hostOrder = UInt32(bigEndian: parsed.s_addr), firstOctet = hostOrder >> 24
+        let hostOrder = withUnsafeBytes(of: parsed) { $0.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) } }, firstOctet = hostOrder >> 24
         guard hostOrder == 0x7f00_0001 || (224...239).contains(firstOctet),
               ["ordinary_logbook", "active_contest"].contains(value.destination) else { throw invalid() }
     }

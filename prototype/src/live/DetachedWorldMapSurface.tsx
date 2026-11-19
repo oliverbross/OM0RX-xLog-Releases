@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import WorldMap from "../Map";
 import { mapRadioFrequency, mapSpots } from "./mapContext";
 import { useMapContext } from "./useMapContext";
@@ -17,9 +18,9 @@ export function DetachedWorldMapSurface() {
       dxccStatuses={view.context?.metadata.dxccStatuses} target={target}
       frequencyHz={mapRadioFrequency(view.context)} onSpot={view.activate}
       spotActionLabel="Activate report" locationLabel="Country approximations · retained reports" /></div>
-    <StableFeedbackLayer>{view.error && <p className="live-error" role="alert">{view.error}</p>}
+    <StableFeedbackLayer>{view.error && <ErrorNotice><p className="live-error" role="alert">{view.error}</p></ErrorNotice>}
       <SpotActivationStatus status={view.activation.status} error={view.activation.error} checking={view.activation.requesting} reconcile={() => void view.activation.reconcile()} />
-      {view.context && view.stale && <p className="live-cluster-note" role="status">Shared service updates paused; retained reports may be stale. Refresh to retry.</p>}
-      {selected && <p className="live-message" role="status">Selected report: {selected.callsign} · {selected.frequencyKHz} kHz · {selected.mode || "Mode unavailable"}.</p>}</StableFeedbackLayer>
+      {view.context && view.stale && <ErrorNotice><p className="live-cluster-note" role="status">Shared service updates paused; retained reports may be stale. Refresh to retry.</p></ErrorNotice>}
+      {selected && <ErrorNotice><p className="live-message" role="status">Selected report: {selected.callsign} · {selected.frequencyKHz} kHz · {selected.mode || "Mode unavailable"}.</p></ErrorNotice>}</StableFeedbackLayer>
   </main></div>;
 }

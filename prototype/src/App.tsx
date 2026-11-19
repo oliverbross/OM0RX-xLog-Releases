@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./live/ErrorNotice";
 import {
   useCallback,
   useEffect,
@@ -747,9 +748,9 @@ export default function App() {
                 </div>
               </form>
               {state.error && (
-                <p className="error" role="alert">
+                <ErrorNotice><p className="error" role="alert">
                   {state.error}
-                </p>
+                </p></ErrorNotice>
               )}
             </section>
             <Intelligence state={state} />
@@ -912,7 +913,7 @@ export default function App() {
             </div>
             <div className="cluster-console">
               <h2>Fixture console</h2>
-              <p role="status" data-cluster-classification={Object.keys(classifications).length === spots.length ? "ready" : "unavailable"}>{clusterStatus}</p>
+              <ErrorNotice><p role="status" data-cluster-classification={Object.keys(classifications).length === spots.length ? "ready" : "unavailable"}>{clusterStatus}</p></ErrorNotice>
               <button disabled={!desktop || clusterStatus.startsWith("Classifying")} onClick={() => setClassificationRetry(n => n + 1)}>Refresh classification</button>
               <pre>{`[P2] ${spots.length} synthetic spots · no network feed.\n[P2] Native parser and classification rules from xCluster.\n[P2] No live cluster, FLEX forwarding or compatibility listener.`}</pre>
             </div>
@@ -992,7 +993,7 @@ export default function App() {
                 Check integration contracts
               </button>
             </div>
-            {checking && <p role="status">Waiting for worker response…</p>}
+            {checking && <ErrorNotice><p role="status">Waiting for worker response…</p></ErrorNotice>}
             <pre className="check-output">
               {checkResult ||
                 "Launch the desktop prototype to inspect worker responses. Browser preview cannot run the Swift worker."}
@@ -1010,9 +1011,9 @@ export default function App() {
           </section>
         )}
         <footer className="status-line" aria-live="polite">
-          <span className={state.error ? "error" : "teal"}>
+          <ErrorNotice><span className={state.error ? "error" : "teal"}>
             {state.error || message || state.notice}
-          </span>
+          </span></ErrorNotice>
           <span className="secondary">
             F2 callsign · Esc clear · ⌘ / Ctrl Enter log
           </span>

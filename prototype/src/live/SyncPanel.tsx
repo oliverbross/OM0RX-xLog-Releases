@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./SyncPanel.css";
 import { connectSyncChanges } from "./syncChanges";
@@ -139,7 +140,7 @@ export default function SyncPanel({ request, onChanged, journalKey = "xlog.sync.
     <h2>Wavelog synchronization</h2>
     <button type="button" disabled={busy || checkingSetup} onClick={() => { setError(""); void refresh(); }}>Refresh Sync state</button>
     <p>Sync sends pending local changes and reconciles Wavelog edits and deletions. Stop the original xLog and every other sync writer before using this logbook as the active Wavelog writer.</p>
-    {state?.mode === "local" && <p role="status">Integrated-only mode keeps your contacts and pending changes here. To use Wavelog, save Integrated logbook + Wavelog synchronization in Settings → Logbook, then explicitly synchronize or enable automatic sync.</p>}
+    {state?.mode === "local" && <ErrorNotice><p role="status">Integrated-only mode keeps your contacts and pending changes here. To use Wavelog, save Integrated logbook + Wavelog synchronization in Settings → Logbook, then explicitly synchronize or enable automatic sync.</p></ErrorNotice>}
     <div className="sync-setup"><button disabled={locked || !available || checkingSetup} onClick={() => void checkSetup()}>{checkingSetup ? "Checking setup…" : "Check setup"}</button><p aria-live="polite">{setupMessage || "Queued contacts with 0 attempts have not been uploaded yet. Conflicting edits always need your review."}</p></div>
     {!automatic && <label className="sync-confirm"><input type="checkbox" checked={confirmed} disabled={locked} onChange={event => setConfirmed(event.target.checked)} />I have stopped the other sync applications; this logbook is the only writer.</label>}
     <div className="sync-schedule">
@@ -148,10 +149,10 @@ export default function SyncPanel({ request, onChanged, journalKey = "xlog.sync.
       {automatic ? <><button disabled={locked || !validInterval || Number(interval) === state?.interval_minutes} onClick={() => void configure(true)}>Save interval</button><button disabled={locked} onClick={() => void configure(false)}>Turn off</button></> : <button className="primary" disabled={!available || !confirmed || locked || !validInterval} onClick={() => void configure(true)}>Enable automatic sync</button>}
       <button disabled={!available || !(confirmed || automatic) || locked} onClick={() => void act("sync_run", { confirm_single_writer: true }, "Synchronization started. Progress appears below.")}>{state?.running ? "Synchronizing…" : "Synchronize now"}</button>
     </div>
-    {!validInterval && <p className="sync-error">Choose a whole number from 1 to 60 minutes.</p>}
+    {!validInterval && <ErrorNotice><p className="sync-error">Choose a whole number from 1 to 60 minutes.</p></ErrorNotice>}
     <p className="secondary">{automatic ? "Saved for this logbook and Wavelog destination. Runs while xLog is open; failures retry with backoff." : "Enable once to keep this logbook synchronized whenever xLog is open."}{state?.running ? " Wait for the current run to finish before changing its schedule." : ""}</p>
     <div className="sync-evidence" role="status"><strong>{state?.status || "Reading sync state…"}</strong><span>Last finished: {syncTime(state?.finished_at)}</span><span>Next attempt: {automatic ? state?.running ? "After this run" : state?.next_attempt ? syncTime(state.next_attempt) : "Within 15 seconds" : "Not scheduled"}</span></div>
-    {state && !verified && <p className="secondary" role="status">Sync state is being refreshed or is unavailable. Retained values are display only; actions are disabled.</p>}
+    {state && !verified && <ErrorNotice><p className="secondary" role="status">Sync state is being refreshed or is unavailable. Retained values are display only; actions are disabled.</p></ErrorNotice>}
     {state?.finished_at && typeof state.pulled === "number" && <p className="secondary">{state.pushed} local contacts acknowledged · {state.pulled.toLocaleString()} remote records checked · {state.deleted} deletions reconciled · {state.failed} failures</p>}
     {state && <section aria-label="Sync run history">
       <h2>Recent sync runs</h2>
@@ -164,7 +165,7 @@ export default function SyncPanel({ request, onChanged, journalKey = "xlog.sync.
           {run.upload_tracking ? <>
             <p>Confirmed remote writes: {run.confirmed_creates} creates · {run.confirmed_updates} updates · {run.confirmed_deletes} deletes.</p>
             {!run.upload_counts_complete && <p className="secondary">Upload totals are incomplete. Counts show confirmed writes so far.</p>}
-            {Number(run.unknown_writes) > 0 && <p className="sync-error">{run.unknown_writes} write attempts have an unknown outcome. Confirmed counts are partial.</p>}
+            {Number(run.unknown_writes) > 0 && <p className="secondary">{Number(run.unknown_writes) === 1 ? "1 upload got" : `${run.unknown_writes} uploads got`} no reply from Wavelog during this run, so the counts above include only confirmed writes.</p>}
           </> : <p>Upload counts unavailable for this run.</p>}
           {run.report_counts && <p>{run.report_counts.acknowledged_contacts} local contacts acknowledged · {run.report_counts.remote_contacts_processed} remote records processed · {run.report_counts.deletions_reconciled} deletions reconciled · {run.report_counts.failures} failures.</p>}
           {run.local_counts_complete === true && run.report_counts ? <p>
@@ -173,9 +174,9 @@ export default function SyncPanel({ request, onChanged, journalKey = "xlog.sync.
           <p className="secondary">Acknowledged contacts can include unchanged records. Remote records processed are not a count of new local contacts.</p>
         </details>)}
     </section>}
-    {state?.run_receipt_error && <p className="sync-error">{String(state.run_receipt_error)}</p>}
+    {state?.run_receipt_error && <ErrorNotice><p className="sync-error">{String(state.run_receipt_error)}</p></ErrorNotice>}
     {Number(state?.held) > 0 && <div className="sync-held">
-      <p role="status"><strong>{Number(state?.held).toLocaleString()} Wavelog records held for review.</strong> The same logging identity appears under multiple distinct Wavelog record IDs. Confirmation services may legitimately update ADIF fields, but xLog cannot determine which exported row belongs to which ID. These contacts and their pending edits remain unchanged; other contacts continue to synchronize.</p>
+      <ErrorNotice><p role="status"><strong>{Number(state?.held).toLocaleString()} Wavelog records held for review.</strong> The same logging identity appears under multiple distinct Wavelog record IDs. Confirmation services may legitimately update ADIF fields, but xLog cannot determine which exported row belongs to which ID. These contacts and their pending edits remain unchanged; other contacts continue to synchronize.</p></ErrorNotice>
       {heldGroups.length > 0 && <div className="sync-held-groups" aria-label="Held Wavelog record groups">{heldGroups.map(group => <details className="sync-held-group" key={`${group.identity}:${group.remote_ids.join(",")}`}>
         <summary>{heldIdentityLabel(group.identity)} · {group.remote_ids.length.toLocaleString()} Wavelog IDs · {group.differing_fields.length.toLocaleString()} differing {group.differing_fields.length === 1 ? "field" : "fields"}</summary>
         <dl>
@@ -186,13 +187,13 @@ export default function SyncPanel({ request, onChanged, journalKey = "xlog.sync.
       </details>)}</div>}
       <p>Review the listed record IDs in Wavelog before editing or removing either record.</p>
     </div>}
-    {error && <p className="sync-error" role="alert">{error}</p>}
+    {error && <ErrorNotice><p className="sync-error" role="alert">{error}</p></ErrorNotice>}
     {unresolved && <button disabled={busy || !state} onClick={() => {
       try { mutation.current!.discard(); setUnresolved(false); setError(""); void refresh(); }
       catch (cause) { setError(errorText(cause)); }
     }}>I reviewed the current state; dismiss unresolved Sync intent</button>}
-    {subscriptionError && <p className="sync-error" role="alert">{subscriptionError}</p>}
-    {message && <p className="sync-success" role="status">{message}</p>}
+    {subscriptionError && <ErrorNotice><p className="sync-error" role="alert">{subscriptionError}</p></ErrorNotice>}
+    {message && <ErrorNotice><p className="sync-success" role="status">{message}</p></ErrorNotice>}
     {saveToast.toast}
     <h2>Conflicts <span className="sync-count">{state ? conflicts.length : "—"}</span></h2>
     <p className="secondary">Compare changed fields, choose which values to keep, then save the merged contact. This queues a local change for the next {automatic ? "automatic" : "manual"} sync.</p>
@@ -218,7 +219,7 @@ function ConflictMerge({ conflict, disabled, onSave }: { conflict: Conflict; dis
     return remote ? field.remote : field.local;
   };
   return <div className="sync-merge">
-    {changed && <div className="sync-stale" role="alert"><p>This contact changed while you were choosing fields. Review the updated values before saving.</p><button disabled={disabled} onClick={() => { setRemoteFields(new Set()); setReviewedRevision(conflict.revision); }}>Review updated values</button></div>}
+    {changed && <ErrorNotice><div className="sync-stale" role="alert"><p>This contact changed while you were choosing fields. Review the updated values before saving.</p><button disabled={disabled} onClick={() => { setRemoteFields(new Set()); setReviewedRevision(conflict.revision); }}>Review updated values</button></div></ErrorNotice>}
     <div className="live-actions"><button disabled={disabled || changed} onClick={() => setRemoteFields(new Set())}>All local</button><button disabled={disabled || changed} onClick={() => setRemoteFields(new Set(conflict.fields.map(field => field.key)))}>All remote</button><span className="secondary">{remoteCount} Wavelog · {conflict.fields.length - remoteCount} local</span></div>
     {!conflict.fields.length ? <p>The contact values match. Save to clear this conflict and retain the local contact.</p> : <div className="sync-table-scroll"><table className="sync-field-table"><thead><tr><th scope="col">Field</th><th scope="col">Local logbook</th><th scope="col">Wavelog</th></tr></thead><tbody>{conflict.fields.map(field => <tr key={field.key}>
       <th scope="row">{field.label}</th>{[false, true].map(remote => <td key={String(remote)}><label className={`sync-choice ${remoteFields.has(field.key) === remote ? "chosen" : ""}`}><input type="radio" name={`${conflict.id}.${field.key}`} aria-label={`${field.label} ${remote ? "remote" : "local"}`} checked={remoteFields.has(field.key) === remote} disabled={disabled || changed} onChange={() => choose(field.key, remote)} /><span>{display(field, remote)}</span></label></td>)}

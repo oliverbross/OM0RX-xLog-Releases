@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import Foundation
+#if canImport(Network)
 import Network
+#endif
+#if canImport(FoundationXML)
+import FoundationXML
+#endif
 
 public enum SpotFeed: String, Codable, CaseIterable, Sendable {
     case logbook = "Logbook"
@@ -267,6 +272,7 @@ private final class SpotXMLDelegate: NSObject, XMLParserDelegate {
     }
 }
 
+#if canImport(Network)
 public final class UDPSpotReceiver: @unchecked Sendable {
     private final class StartupGate: @unchecked Sendable {
         private let lock = NSLock()
@@ -417,3 +423,54 @@ public final class UDPSpotReceiver: @unchecked Sendable {
         }
     }
 }
+#elseif os(Windows)
+import CClusterSocket
+
+public final class UDPSpotReceiver: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let onDatagram: @Sendable (Data) -> Void
+    private let onEvent: @Sendable (String) -> Void
+    private var socket: OpaquePointer?
+    private var buffer = [UInt8](repeating: 0, count: 16_384)
+
+    public init(label: String, onDatagram: @escaping @Sendable (Data) -> Void,
+                onEvent: @escaping @Sendable (String) -> Void = { _ in }) {
+        self.queue = DispatchQueue(label: label)
+        self.onDatagram = onDatagram
+        self.onEvent = onEvent
+    }
+
+    public func start(port: UInt16) throws {
+        try queue.sync {
+            guard socket == nil, let listener = xlog_spot_udp_listen(port) else {
+                throw XCatError.server("The RUMlog UDP port is invalid or already in use.")
+            }
+            socket = listener
+            queue.async { [weak self] in self?.receive() }
+        }
+    }
+
+    public func stop() {
+        queue.sync {
+            if let socket { xlog_socket_close(socket) }
+            socket = nil
+        }
+    }
+
+    deinit { if let socket { xlog_socket_close(socket) } }
+
+    private func receive() {
+        guard let socket else { return }
+        let count = buffer.withUnsafeMutableBytes { xlog_spot_udp_read(socket, $0.baseAddress, Int32($0.count)) }
+        if count == -1 {
+            xlog_socket_close(socket)
+            self.socket = nil
+            onEvent("UDP listener failed: receive error")
+            return
+        }
+        if count > 0 { onDatagram(Data(buffer.prefix(Int(count)))) }
+        if count == -3 { onDatagram(Data()) }
+        queue.async { [weak self] in self?.receive() }
+    }
+}
+#endif

@@ -9,5 +9,17 @@ fn main() {
     let identity=if dirty{format!("{head}-dirty")}else{head};
     println!("cargo:rustc-env=XLOG_SOURCE_COMMIT={identity}");
     println!("cargo:rerun-if-env-changed=XLOG_SOURCE_COMMIT");
+    #[cfg(windows)]
+    {
+        let source = root.join("Sources/CWindowsOfflineProfile/private_path.c");
+        println!("cargo:rerun-if-changed={}", source.display());
+        cc::Build::new().file(source).compile("xlog_windows_offline");
+        println!("cargo:rustc-link-lib=advapi32");
+        let source = root.join("prototype/src-tauri/src/companion_rx_windows.cpp");
+        println!("cargo:rerun-if-changed={}", source.display());
+        cc::Build::new().cpp(true).file(source).flag("/std:c++17").compile("xlog_companion_rx");
+        println!("cargo:rustc-link-lib=ole32");
+        println!("cargo:rustc-link-lib=uuid");
+    }
     tauri_build::build()
 }

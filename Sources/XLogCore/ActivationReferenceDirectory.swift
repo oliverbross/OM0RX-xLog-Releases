@@ -64,6 +64,7 @@ public struct ActivationReference: Codable, Equatable, Hashable, Sendable {
 
 public struct ActivationReferenceDirectory: Sendable {
     private var records: [ActivationReferenceKind: [String: ActivationReference]]
+    private var availableKinds: Set<ActivationReferenceKind> = []
 
     /// Metadata-only cache identity. Preserve native subsecond precision and
     /// physical identity so an equal-size atomic replacement cannot reuse a view.
@@ -104,13 +105,15 @@ public struct ActivationReferenceDirectory: Sendable {
         }.joined(separator: ";")
     }
 
-    public init(directory: URL, kinds: Set<ActivationReferenceKind> = Set(ActivationReferenceKind.allCases)) throws {
+    public init(directory: URL, kinds: Set<ActivationReferenceKind> = Set(ActivationReferenceKind.allCases), references: [ActivationReferenceKind: Set<String>]? = nil) throws {
         var loaded: [ActivationReferenceKind: [String: ActivationReference]] = [:]
         for kind in ActivationReferenceKind.allCases where kinds.contains(kind) {
             let url = directory.appendingPathComponent(kind.fileName)
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            let parsed = try Self.parse(data: data, kind: kind)
+            let parsed = try Self.parse(data: data, kind: kind, references: references?[kind])
+            let selectivelyLoadedCSV = [ActivationReferenceKind.pota, .sota, .wwff].contains(kind) && references?[kind] != nil
+            if selectivelyLoadedCSV || !parsed.isEmpty { availableKinds.insert(kind) }
             loaded[kind] = Dictionary(parsed.map { (Self.normalize($0.reference), $0) }, uniquingKeysWith: { first, _ in first })
         }
         records = loaded
@@ -127,7 +130,7 @@ public struct ActivationReferenceDirectory: Sendable {
     }
 
     public func hasData(for kind: ActivationReferenceKind) -> Bool {
-        !(records[kind]?.isEmpty ?? true)
+        availableKinds.contains(kind) || !(records[kind]?.isEmpty ?? true)
     }
 
     public func count(for kind: ActivationReferenceKind) -> Int {
@@ -144,19 +147,19 @@ public struct ActivationReferenceDirectory: Sendable {
             .map(\.value)
     }
 
-    public static func parse(data: Data, kind: ActivationReferenceKind) throws -> [ActivationReference] {
+    public static func parse(data: Data, kind: ActivationReferenceKind, references: Set<String>? = nil) throws -> [ActivationReference] {
         switch kind {
-        case .pota: return try parsePOTA(data)
-        case .sota: return try parseSOTA(data)
+        case .pota: return try parsePOTA(data, references: references)
+        case .sota: return try parseSOTA(data, references: references)
         case .iota: return try parseIOTA(data)
-        case .wwff: return try parseWWFF(data)
+        case .wwff: return try parseWWFF(data, references: references)
         case .castle:
             return try JSONDecoder().decode([ActivationReference].self, from: data)
         }
     }
 
-    private static func parsePOTA(_ data: Data) throws -> [ActivationReference] {
-        let rows = try csvRows(data)
+    private static func parsePOTA(_ data: Data, references: Set<String>? = nil) throws -> [ActivationReference] {
+        let rows = try csvRows(data, firstColumn: "reference", columns: ["reference", "name", "locationdesc", "active", "latitude", "longitude", "grid"], references: references)
         guard let headerIndex = rows.firstIndex(where: { $0.first?.lowercased() == "reference" }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -179,8 +182,8 @@ public struct ActivationReferenceDirectory: Sendable {
         }
     }
 
-    private static func parseSOTA(_ data: Data) throws -> [ActivationReference] {
-        let rows = try csvRows(data)
+    private static func parseSOTA(_ data: Data, references: Set<String>? = nil) throws -> [ActivationReference] {
+        let rows = try csvRows(data, firstColumn: "summitcode", columns: ["summitcode", "summitname", "associationname", "regionname", "latitude", "longitude", "points", "validfrom", "validto"], references: references)
         guard let headerIndex = rows.firstIndex(where: { $0.first?.lowercased() == "summitcode" }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -227,8 +230,8 @@ public struct ActivationReferenceDirectory: Sendable {
         }
     }
 
-    private static func parseWWFF(_ data: Data) throws -> [ActivationReference] {
-        let rows = try csvRows(data)
+    private static func parseWWFF(_ data: Data, references: Set<String>? = nil) throws -> [ActivationReference] {
+        let rows = try csvRows(data, firstColumn: "reference", columns: ["reference", "name", "country", "status", "latitude", "longitude", "iarulocator"], references: references)
         guard let headerIndex = rows.firstIndex(where: { $0.first?.lowercased() == "reference" }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -251,40 +254,64 @@ public struct ActivationReferenceDirectory: Sendable {
         }
     }
 
-    private static func csvRows(_ data: Data) throws -> [[String]] {
-        guard let text = String(data: data, encoding: .utf8) else { throw CocoaError(.fileReadInapplicableStringEncoding) }
-        return text.split(whereSeparator: \.isNewline).map(parseCSVLine)
-    }
-
-    private static func parseCSVLine(_ line: Substring) -> [String] {
-        var fields: [String] = []
-        var field = ""
-        var quoted = false
-        var index = line.startIndex
-        while index < line.endIndex {
-            let character = line[index]
-            if character == "\"" {
-                let next = line.index(after: index)
-                if quoted, next < line.endIndex, line[next] == "\"" {
-                    field.append("\"")
-                    index = line.index(after: next)
-                    continue
-                }
-                quoted.toggle()
-            } else if character == ",", !quoted {
-                fields.append(field.trimmingCharacters(in: .whitespaces))
-                field = ""
-            } else {
-                field.append(character)
+    private static func csvRows(_ data: Data, firstColumn: String, columns: Set<String>, references: Set<String>? = nil) throws -> [[String]] {
+        guard String(data: data, encoding: .utf8) != nil else { throw CocoaError(.fileReadInapplicableStringEncoding) }
+        // CSV delimiters are ASCII. Scanning UTF-8 avoids repeated grapheme
+        // traversal and String appends across multi-megabyte public catalogues.
+        // Decode each field once, preserving Unicode and quoted CSV contents.
+        return data.withUnsafeBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            var rows: [[String]] = [], fields: [String] = [], field: [UInt8] = []
+            var includedColumns: Set<Int>?
+            var keepField = true
+            let wanted = references.map { Set($0.map(Self.normalize)) }
+            var keepRow = true
+            var quoted = false
+            var index = bytes.starts(with: [0xef, 0xbb, 0xbf]) ? 3 : 0
+            func finishField() {
+                fields.append(keepField ? String(decoding: field, as: UTF8.self).trimmingCharacters(in: .whitespaces) : "")
+                if fields.count == 1, includedColumns != nil, let wanted { keepRow = wanted.contains(Self.normalize(fields[0])) }
+                field.removeAll(keepingCapacity: true)
+                keepField = keepRow && (includedColumns?.contains(fields.count) ?? true)
             }
-            index = line.index(after: index)
+            func finishRow() {
+                guard !field.isEmpty || !fields.isEmpty else { return }
+                finishField()
+                if includedColumns == nil, fields.first?.lowercased() == firstColumn {
+                    includedColumns = Set(fields.enumerated().compactMap { columns.contains($0.element.lowercased()) ? $0.offset : nil })
+                }
+                if keepRow { rows.append(fields) }; fields.removeAll(keepingCapacity: true)
+                keepRow = true
+                keepField = includedColumns?.contains(0) ?? true
+            }
+            while index < bytes.count {
+                let byte = bytes[index]
+                if byte == 34 {
+                    if quoted, index + 1 < bytes.count, bytes[index + 1] == 34 {
+                        if keepField { field.append(34) }; index += 2; continue
+                    }
+                    quoted.toggle()
+                } else if byte == 44, !quoted {
+                    finishField()
+                } else if !quoted, byte == 10 || byte == 13 || byte == 11 || byte == 12 {
+                    finishRow()
+                } else if !quoted, byte == 0xc2, index + 1 < bytes.count, bytes[index + 1] == 0x85 {
+                    finishRow(); index += 1
+                } else if !quoted, byte == 0xe2, index + 2 < bytes.count,
+                          bytes[index + 1] == 0x80, bytes[index + 2] == 0xa8 || bytes[index + 2] == 0xa9 {
+                    finishRow(); index += 2
+                } else {
+                    if keepField { field.append(byte) }
+                }
+                index += 1
+            }
+            finishRow()
+            return rows
         }
-        fields.append(field.trimmingCharacters(in: .whitespaces))
-        return fields
     }
 
     private static func columnMap(_ header: [String]) -> [String: Int] {
-        Dictionary(uniqueKeysWithValues: header.enumerated().map { ($0.element.lowercased(), $0.offset) })
+        Dictionary(header.enumerated().map { ($0.element.lowercased(), $0.offset) }, uniquingKeysWith: { first, _ in first })
     }
 
     private static func value(_ name: String, _ row: [String], _ header: [String: Int]) -> String? {

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 
 type Request = (method: string, params?: Record<string, unknown>) => Promise<any>;
@@ -197,8 +198,8 @@ export function CountryCorrectionReview({ onRequest, refreshKey, queryContext = 
     <p>Compare the complete current Logbook selection against one country snapshot at each QSO date. Recorded values, including manual or unknown-origin imports, stay protected until you select specific changes.</p>
     <button type="button" disabled={busy || !!review} onClick={() => void read()}>Read country field differences</button>
     {scan && <button type="button" onClick={() => void cancelScan()}>Cancel country scan</button>}
-    {busy && <p role="status">Checking local country evidence…</p>}
-    {error && <p role="alert">{error}</p>}{message && <p role="status">{message}</p>}
+    {busy && <ErrorNotice><p role="status">Checking local country evidence…</p></ErrorNotice>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{message && <ErrorNotice><p role="status">{message}</p></ErrorNotice>}
     {page && <>
       <p>{page.comparedCount.toLocaleString()} contacts compared · {page.affectedCount.toLocaleString()} requiring review · {page.unresolvedCount.toLocaleString()} unresolved. Nothing is selected automatically.</p>
       <div className="cty-correction-table" role="region" aria-label="Country field differences" tabIndex={0}><table>
@@ -219,7 +220,7 @@ export function CountryCorrectionReview({ onRequest, refreshKey, queryContext = 
         {row.changes.map(change => <label key={change.field} style={{ display: "block" }}><input type="checkbox" checked={choices[row.contactID]?.includes(change.field) ?? false}
           onChange={event => setChoices(items => ({ ...items, [row.contactID]: event.target.checked ? [...(items[row.contactID] ?? []), change.field] : (items[row.contactID] ?? []).filter(field => field !== change.field) }))} />
           {change.field}: {change.retained || "Not recorded"} → {change.proposed || "Clear"}<small> · {change.reason}</small></label>)}
-        {row.dependentConflict && <p role="status">{row.dependentConflict}</p>}
+        {row.dependentConflict && <ErrorNotice><p role="status">{row.dependentConflict}</p></ErrorNotice>}
       </fieldset>)}
       <button type="button" disabled={busy || !selection.length} onClick={() => void apply()}>Apply selected country changes</button>
       <button type="button" disabled={busy} onClick={() => void cancel()}>Keep recorded values</button>

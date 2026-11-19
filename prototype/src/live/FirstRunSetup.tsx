@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { HamlibModelPicker } from "./HamlibModelPicker";
 import { loadHamlibCatalogue, type HamlibModel } from "./hamlibCatalogue";
@@ -19,11 +20,20 @@ export default function FirstRunSetup({ initialSettings, onFinish, loadModels = 
   const [models, setModels] = useState<Partial<Record<"radio" | "rotor", HamlibModel[]>>>({});
   const [loading, setLoading] = useState<"radio" | "rotor" | null>(null);
   const [directServices, setDirectServices] = useState(false);
+  const [directRotor, setDirectRotor] = useState(false);
+  const [directTCI, setDirectTCI] = useState(false);
+  const [directFlex, setDirectFlex] = useState(false);
   const [capabilitiesReady, setCapabilitiesReady] = useState(false);
   const capabilityLoader = useRef(loadCapabilities);
   useEffect(() => {
     let active = true;
-    void capabilityLoader.current().then(health => { if (active) setDirectServices(firstRunDirectServicesAvailable(health)); }, () => {})
+    void capabilityLoader.current().then(health => { if (active) {
+      const full = firstRunDirectServicesAvailable(health);
+      setDirectServices(full || (health as { direct_agent?: boolean } | null)?.direct_agent === true);
+      setDirectTCI(full || (health as { direct_tci?: boolean } | null)?.direct_tci === true);
+      setDirectRotor(full || (health as { native_dcu1?: boolean } | null)?.native_dcu1 === true);
+      setDirectFlex(full || (health as { direct_flex_lan?: boolean } | null)?.direct_flex_lan === true);
+    } }, () => {})
       .finally(() => { if (active) setCapabilitiesReady(true); });
     return () => { active = false; };
   }, []);
@@ -68,9 +78,9 @@ export default function FirstRunSetup({ initialSettings, onFinish, loadModels = 
         </div></>}
         {step === 1 && <><p>Save a connection now, or use xLog without a connected radio. Setup never connects or enables transmit.</p>
           <label>Radio connection<select aria-label="Setup radio connection" value={values.radio} onChange={event => update({ radio: event.target.value as FirstRunValues["radio"] })}>
-            <option value="skip">No radio for now</option><option value="hamlib">USB / Serial or network CAT · Hamlib</option>{directServices && <><option value="direct_flex_lan">Direct FLEX · LAN / VPN</option><option value="direct_tci">ExpertSDR TCI</option><option value="direct_agent">Remote Station Agent</option></>}
+            <option value="skip">No radio for now</option><option value="hamlib">USB / Serial or network CAT · Hamlib</option>{directFlex && <option value="direct_flex_lan">Direct FLEX · LAN / VPN</option>}{directTCI && <option value="direct_tci">ExpertSDR TCI</option>}{directServices && <option value="direct_agent">Remote Station Agent</option>}
           </select></label>
-          {!directServices && <p role="status">{capabilitiesReady ? "Direct station services are unavailable in this runtime. Hamlib remains available, or skip radio setup for now." : "Checking available radio providers. Hamlib and Skip remain available."}</p>}
+          {!directServices && !directFlex && !directTCI && <ErrorNotice><p role="status">{capabilitiesReady ? "Direct station services are unavailable in this runtime. Hamlib remains available, or skip radio setup for now." : "Checking available radio providers. Hamlib and Skip remain available."}</p></ErrorNotice>}
           {values.radio !== "skip" && <div className="setup-fields">{field("radioName", "Radio name (optional)", "text", { maxLength: 64 })}
             {values.radio === "hamlib" && <>{modelPicker("radio")}{field("radioPath", "Radio serial device or host:port")}{field("radioBaud", "Radio baud rate", "number", { min: 300, max: 921600 })}</>}
             {values.radio === "direct_flex_lan" && <>{field("radioHost", "FLEX radio address")}{field("radioPort", "FLEX port", "number", { min: 1, max: 65535 })}</>}
@@ -80,7 +90,7 @@ export default function FirstRunSetup({ initialSettings, onFinish, loadModels = 
         </>}
         {step === 2 && <><p>A rotator is optional. Saved connection details do not connect, arm automatic rotation or move an antenna.</p>
           <label>Rotator connection<select aria-label="Setup rotator connection" value={values.rotor} onChange={event => update({ rotor: event.target.value as FirstRunValues["rotor"] })}>
-            <option value="skip">No rotator for now</option>{directServices && <option value="native_dcu1">DCU-1 network rotator</option>}<option value="hamlib">USB / Serial or network rotator · Hamlib</option>
+            <option value="skip">No rotator for now</option>{directRotor && <option value="native_dcu1">DCU-1 network rotator</option>}<option value="hamlib">USB / Serial or network rotator · Hamlib</option>
           </select></label>
           {values.rotor === "native_dcu1" && <div className="setup-fields">{field("rotorHost", "Rotator address")}{field("rotorPort", "Rotator port", "number", { min: 1, max: 65535 })}</div>}
           {values.rotor === "hamlib" && <div className="setup-fields">{modelPicker("rotor")}{field("rotorPath", "Rotator serial device or host:port")}{field("rotorBaud", "Rotator baud rate", "number", { min: 300, max: 921600 })}</div>}
@@ -95,7 +105,7 @@ export default function FirstRunSetup({ initialSettings, onFinish, loadModels = 
           <p>Finish setup saves these choices. Connect hardware explicitly from Settings when you are ready.</p>
         </>}
       </fieldset>
-      {error && <p role="alert" className="live-error">{error}</p>}
+      {error && <ErrorNotice><p role="alert" className="live-error">{error}</p></ErrorNotice>}
       <footer>{step > 0 && <button type="button" disabled={busy} onClick={() => go(step - 1)}>Back</button>}
         {(step === 1 || step === 2) && <button type="button" disabled={busy} onClick={() => { update(step === 1 ? { radio: "skip" } : { rotor: "skip" }); go(step + 1); }}>Skip {step === 1 ? "radio" : "rotator"}</button>}
         <button className="primary" disabled={busy} type="submit">{busy ? "Saving setup…" : step === 3 ? "Finish setup" : "Continue"}</button>

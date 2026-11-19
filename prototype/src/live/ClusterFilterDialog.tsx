@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useId } from "react";
 import { clusterFilterChoices, defaultClusterFilter, type ClusterFilter } from "./clusterFilters";
 import SpecialFilterOptions from "./SpecialFilterOptions";
@@ -19,7 +20,7 @@ export function ClusterFilterDialog({ filter, specialChoices, error = "", dialog
     <section id={dialogID} className="operator-filter-dialog" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`}
       onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); onClose(); } }}>
       <header><h2 id={`${id}-title`}>Cluster filters</h2><button type="button" onClick={onClose}>Done</button></header>
-      {error && <p className="operator-filter-error" role="alert">{error}</p>}
+      {error && <ErrorNotice><p className="operator-filter-error" role="alert">{error}</p></ErrorNotice>}
       <div className="operator-filter-primary">
         <label>Search spots<input autoFocus placeholder="Callsign, country or note" value={filter.query} maxLength={128}
           onChange={event => onChange({ ...filter, query: event.target.value })} /></label>

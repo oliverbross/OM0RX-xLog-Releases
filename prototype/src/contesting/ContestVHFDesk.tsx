@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestRequest } from "./types";
 import type { StrategyMutation, StrategyScope } from "./ContestReminders";
@@ -29,7 +30,7 @@ export function ContestVHFDesk({scope,request,disabled,onMutate,onTune,canMapTun
   const saved=data?.mappings?.[scope.selectedLaneID??"laneA"],mapping:ContestTransverterMapping={band:String(scope.band),loHz:Number(lo),inverted,ifLowHz:Number(low),ifHighHz:Number(high)};
   const savedIF=saved?(saved.mapping.inverted?saved.mapping.loHz-scope.frequencyHz:scope.frequencyHz-saved.mapping.loHz):null;
   return <section className="contest-productivity-section" aria-label="VHF sites and transverters"><h2>VHF sites & transverters</h2>
-    {error&&<p role="alert">{error}</p>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     {!data?.available?<p>Site operation requires a supported grid contest definition. No station settings have changed.</p>:<>
       <p>Current station {data.stationLocator} · {data.locatorBasis}. Historical contacts retain the site actually recorded with them.</p>
       {grid&&bounds&&<svg role="img" aria-label="Station locator grid and unverified beacon overlay" viewBox="0 0 600 240" style={{display:"block",width:"100%",maxWidth:900,background:"var(--panel,#101c2c)"}}>

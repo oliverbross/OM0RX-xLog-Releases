@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { clusterStatusColors, paletteColor } from "./clusterPalette";
 import { ownSpotWindowMinutes, useOwnSpotWindowPreference } from "./ownSpotPreferences";
@@ -9,7 +10,7 @@ type Configuration = {
   radioSpotColorPolicy?: "callsign" | "dxcc";
   palette: { status: Record<string, string> };
 };
-type Snapshot = { configuration: Configuration; flex_forwarding_available: boolean; tci_forwarding_available?: boolean;
+type Snapshot = { flex_provider?: string; configuration: Configuration; flex_forwarding_available: boolean; tci_forwarding_available?: boolean;
   forwarding?: { accepted_count: number; status: string; flex_status?: string; tci_status?: string } };
 type Request = (method: string, params?: Record<string, unknown>) => Promise<any>;
 const callsignStatuses = ["New Call", "New Band", "New Mode", "New Band+Mode"];
@@ -85,16 +86,16 @@ export default function RadioSpotSettings({ request, visible }: { request: Reque
         {ownSpotWindowMinutes.map(minutes => <option key={minutes} value={minutes}>{minutes} minutes{minutes === 15 ? " · Default" : ""}</option>)}
       </select></label>
       <p>Saved automatically for human/operator spots. RBN reports always expire after 10 minutes by their source timestamp in every current pickup view.</p>
-      {ownSpotWindow.error && <p role="alert">{ownSpotWindow.error}</p>}
+      {ownSpotWindow.error && <ErrorNotice><p role="alert">{ownSpotWindow.error}</p></ErrorNotice>}
     </fieldset>
     <fieldset disabled={busy || !snapshot}>
       <legend>FLEX / Maestro</legend>
       <label><input type="checkbox" checked={enabled} disabled={!snapshot?.flex_forwarding_available && !enabled}
-        onChange={event => setEnabled(event.target.checked)} /> Forward spots through the connected Remote Station Agent</label>
+        onChange={event => setEnabled(event.target.checked)} /> Forward spots through the connected {snapshot?.flex_provider === "direct_flex_lan" ? "FLEX radio" : "Remote Station Agent"}</label>
       <p>{snapshot?.flex_forwarding_available
-        ? "Requires an agent that advertises add_spot. A command accepted by the agent does not prove that the radio or Maestro displayed it. Direct FLEX LAN and xCat loopback do not provide this output."
+        ? snapshot?.flex_provider === "direct_flex_lan" ? "Connect the radio using Direct FLEX LAN. The radio returns its own index for each published spot." : "Requires an agent that advertises add_spot. A command accepted by the agent does not prove that the radio or Maestro displayed it. Direct FLEX LAN and xCat loopback do not provide this output."
         : "FLEX forwarding is unavailable on this platform. A saved enabled preference can be turned off."}</p>
-      <p role="status">Saved: {savedEnabled ? "on" : "off"}. Runtime: {snapshot?.forwarding?.flex_status ?? snapshot?.forwarding?.status ?? "Status unavailable"}</p>
+      <ErrorNotice><p role="status">Saved: {savedEnabled ? "on" : "off"}. Runtime: {snapshot?.forwarding?.flex_status ?? snapshot?.forwarding?.status ?? "Status unavailable"}</p></ErrorNotice>
     </fieldset>
     <fieldset disabled={busy || !snapshot}>
       <legend>Spot colour</legend>
@@ -112,13 +113,13 @@ export default function RadioSpotSettings({ request, visible }: { request: Reque
       <p>{snapshot?.tci_forwarding_available
         ? "Requires an active TCI connection under Station control. A successful WebSocket send does not prove that SunSDR displayed the marker."
         : "TCI spot forwarding is unavailable on this platform. A saved enabled preference can be turned off."}</p>
-      <p role="status">Saved: {savedTCIEnabled ? "on" : "off"}. Runtime: {snapshot?.forwarding?.tci_status ?? "Status unavailable"}</p>
+      <ErrorNotice><p role="status">Saved: {savedTCIEnabled ? "on" : "off"}. Runtime: {snapshot?.forwarding?.tci_status ?? "Status unavailable"}</p></ErrorNotice>
     </fieldset>
     <button type="button" disabled={busy || !dirty
       || (!snapshot?.flex_forwarding_available && enabled && enabled !== baseEnabled)
       || (!snapshot?.tci_forwarding_available && tciEnabled && tciEnabled !== baseTCIEnabled)} onClick={() => void save()}>Save radio spot output</button>
     <button type="button" disabled={busy} onClick={() => void refresh(true)}>Refresh status</button>
-    {dirty && <p role="status">Changes are unsaved. Runtime remains FLEX {savedEnabled ? "on" : "off"}, TCI {savedTCIEnabled ? "on" : "off"}, with {savedPolicy === "dxcc" ? "DXCC" : "callsign"} colours and the saved palette.</p>}
-    {saveToast.toast}{error && <p role="alert">{error}</p>}
+    {dirty && <ErrorNotice><p role="status">Changes are unsaved. Runtime remains FLEX {savedEnabled ? "on" : "off"}, TCI {savedTCIEnabled ? "on" : "off"}, with {savedPolicy === "dxcc" ? "DXCC" : "callsign"} colours and the saved palette.</p></ErrorNotice>}
+    {saveToast.toast}{error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section>;
 }

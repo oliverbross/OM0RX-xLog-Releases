@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Antenna } from "lucide-react";
 import { HamlibDevice } from "./HamlibPanel";
@@ -103,7 +104,7 @@ export default function RotorPanel({ snapshot, request, onManual = () => {}, con
     throw new Error("Use the independent rotor motion controls below.");
   }, [request, onManual]);
 
-  if (!configuration) return <section className="live-station rotor-panel" aria-label={configurationOnly ? "Rotor configuration" : "Independent rotor"}><p role="status">Loading shared rotor configuration…</p></section>;
+  if (!configuration) return <section className="live-station rotor-panel" aria-label={configurationOnly ? "Rotor configuration" : "Independent rotor"}><ErrorNotice><p role="status">Loading shared rotor configuration…</p></ErrorNotice></section>;
   const native = configuration.native_dcu1;
   const updateNative = (field: keyof typeof native, value: string | number) => edit({ ...configuration,
     native_dcu1: { ...native, [field]: value } });
@@ -118,8 +119,22 @@ export default function RotorPanel({ snapshot, request, onManual = () => {}, con
     finally { setAutomaticBusy(false); }
   };
   const blocked = busy || configurationState.saving || !!configurationState.pending || !!configurationState.conflict || configurationState.workspaceChanged;
-  const savedOwner = configurationState.base?.configuration.owner;
-  const ownerApplied = snapshot?.owner ? snapshot.owner === owner : savedOwner === owner && !dirty;
+  const differentOwner = !!snapshot?.owner && snapshot.owner !== owner;
+  const nativeReady = !!native.host.trim() && Number.isInteger(native.port) && native.port > 0 && native.port <= 65535 && !!native.name.trim();
+  const connectNative = async (reconnect: boolean) => {
+    if (configurationOnly || blocked || differentOwner || !nativeReady) return;
+    const departing = latest.current;
+    if (reconnect ? departing?.owner !== "native_dcu1" : !!departing?.owner) return;
+    await run(async () => {
+      await ensureSaved();
+      if (reconnect) {
+        const retired = await request("rotor_disconnect", rotorCommandParams(departing));
+        if (!validRotorSnapshot(retired) || retired.owner !== null || retired.state !== "disconnected")
+          throw new Error("Rotor disconnect could not be confirmed. Check its status before reconnecting.");
+      }
+      return request("rotor_connect", { owner: "native_dcu1", host: native.host.trim(), port: native.port, name: native.name.trim() });
+    }, reconnect ? "Rotor reconnection" : "Rotor connection");
+  };
 
   return <section className="live-station rotor-panel" aria-label={configurationOnly ? "Rotor configuration" : "Independent rotor"}>
     <header className="live-station-head"><div><h2><Antenna size={17} /> {configurationOnly ? "Rotor configuration" : "Independent rotor"}</h2>
@@ -127,16 +142,16 @@ export default function RotorPanel({ snapshot, request, onManual = () => {}, con
       {!configurationOnly && <span className={current.connected ? "teal" : "amber"}>{current.connected ? "Connected" : current.status}</span>}</header>
     <div className="live-actions" role="group" aria-label="Rotor connection type">{([ ["native_dcu1", "DCU-1 · TCP"], ["hamlib", "Local rotor · Hamlib"] ] as const).map(([id, label]) =>
       <button key={id} disabled={blocked} aria-pressed={owner === id} onClick={() => { edit({ ...configuration, owner: id }); if (id === "hamlib") setHamlibOpened(true); }}>{label}</button>)}
-      {!configurationOnly && !ownerApplied && <button type="button" disabled={blocked} onClick={() => void applySelection()}>Apply rotor selection</button>}
-      {(configurationOnly || ownerApplied) && <button type="button" disabled={blocked || !dirty} onClick={() => void saveConfiguration().catch(cause => setError(cause.message))}>{configurationState.saving ? "Saving…" : "Save rotor configuration"}</button>}
-      {!configurationOnly && <span>Active rotor: {snapshot?.owner === "hamlib" ? "Hamlib" : snapshot?.owner === "native_dcu1" ? "DCU-1" : "Disconnected"}. {!ownerApplied ? "Viewing only. Apply to retire a different active rotor and save this selection." : "Connecting and motion require an explicit action."}</span>}
+      <button type="button" className="primary" disabled={blocked || !dirty} onClick={() => void saveConfiguration().catch(cause => setError(cause.message))}>{configurationState.saving ? "Saving…" : "Save rotor configuration"}</button>
+      {!configurationOnly && differentOwner && <button type="button" disabled={blocked} onClick={() => void applySelection()}>Disconnect previous rotor and apply selection</button>}
+      {!configurationOnly && <span>Active rotor: {snapshot?.owner === "hamlib" ? "Hamlib" : snapshot?.owner === "native_dcu1" ? "DCU-1" : "Disconnected"}. {dirty ? "Unsaved changes." : "Settings saved."}{differentOwner && " Disconnect the previous rotor before connecting this one."}</span>}
     </div>
     <section className="live-station-card rotor-auto-settings" aria-labelledby="rotor-auto-settings-title">
       <h3 id="rotor-auto-settings-title">Automatic rotor</h3>
       <label className="rotor-auto-start"><input type="checkbox" aria-describedby="rotor-auto-live-help"
         checked={automaticRotorEnabled} disabled={automaticBusy || !onAutomaticRotorChange || !automaticRotorEnabled && !automaticRotorAvailable}
         onChange={event => { void changeAutomaticRotor(event.target.checked); }} /> Auto rotor</label>
-      {automaticRotorEnabled && !automaticRotorArmed && <><p className="live-station-helper amber" role="status">Auto rotor is paused after a stop or operating context change. Review the rotor connection, then resume explicitly.</p>
+      {automaticRotorEnabled && !automaticRotorArmed && <><ErrorNotice><p className="live-station-helper amber" role="status">Auto rotor is paused after a stop or operating context change. Review the rotor connection, then resume explicitly.</p></ErrorNotice>
         <button type="button" disabled={automaticBusy || !onAutomaticRotorChange || !automaticRotorAvailable}
           onClick={() => { void changeAutomaticRotor(true); }}>Resume Auto rotor</button></>}
       <p id="rotor-auto-live-help" className="live-station-helper">{onAutomaticRotorChange
@@ -160,21 +175,22 @@ export default function RotorPanel({ snapshot, request, onManual = () => {}, con
       </label>)}</div></fieldset>
       {automaticRotorArmed && dirty && <p className="live-station-helper amber">Saved band changes apply after Auto rotor is turned off and armed again.</p>}
       {configuration.auto_rotor_bands.length === 0 && <p className="live-station-helper amber">No bands selected. Automatic rotor movement is blocked on every band.</p>}
-      {(automaticError || automaticRotorError) && <p className="live-station-error" role="alert">{automaticError || automaticRotorError}</p>}
+      {(automaticError || automaticRotorError) && <ErrorNotice><p className="live-station-error" role="alert">{automaticError || automaticRotorError}</p></ErrorNotice>}
     </section>
     <div className="rotor-panel-layout"><div><div hidden={owner !== "hamlib"}>{hamlibOpened && <HamlibDevice device="rotor" request={hamlibRequest}
       state={!configurationOnly && snapshot?.owner === "hamlib" ? snapshot.backend : undefined} configurationOnly
       connectionControls={!configurationOnly} connectionOwned={!configurationOnly && !!snapshot?.owner}
-      connectionSelectionAllowed={!configurationOnly && ownerApplied && !blocked}
+      connectionSelectionAllowed={!configurationOnly && !differentOwner && !blocked}
       configuration={configuration.hamlib} onConfigurationChange={updateHamlib} configurationBusy={blocked}
       onBeforeConnection={async () => { await ensureSaved(); }} />}</div>
       <section hidden={owner !== "native_dcu1"} className="live-station-card"><h3>DCU-1 connection</h3>
-        <form className="live-station-connect" onSubmit={event => { event.preventDefault(); if (configurationOnly || !ownerApplied || latest.current?.owner) return;
-          void ensureSaved().then(() => run(() => request("rotor_connect", { owner: "native_dcu1", host: native.host.trim(), port: native.port, name: native.name.trim() }), "Rotor connection")).catch(cause => setError(cause.message));
+        <form className="live-station-connect" onSubmit={event => { event.preventDefault();
+          void connectNative(false).catch(cause => setError(serviceErrorMessage(cause) || "Rotor connection failed."));
         }}><label>Rotor TCP host<input aria-label="Rotor TCP host" value={native.host} onChange={event => updateNative("host", event.target.value)} /></label>
           <label>Rotor TCP port<input aria-label="Rotor TCP port" type="number" min="1" max="65535" value={native.port || ""} onChange={event => updateNative("port", Number(event.target.value))} /></label>
           <label>Name<input aria-label="Rotor name" value={native.name} onChange={event => updateNative("name", event.target.value)} /></label>
-          {!configurationOnly && <div className="live-actions"><button disabled={blocked || !!snapshot?.owner || !ownerApplied || !native.host.trim() || !Number.isInteger(native.port) || native.port < 1 || native.port > 65535 || !native.name.trim()}>Connect rotor</button>
+          {!configurationOnly && <div className="live-actions"><button disabled={blocked || !!snapshot?.owner || !nativeReady}>{dirty ? "Save & Connect rotor" : "Connect rotor"}</button>
+            <button type="button" disabled={blocked || snapshot?.owner !== "native_dcu1" || !nativeReady} onClick={() => void connectNative(true).catch(cause => setError(serviceErrorMessage(cause) || "Rotor reconnection failed."))}>{dirty ? "Save & Reconnect rotor" : "Reconnect rotor"}</button>
             <button type="button" disabled={busy || snapshot?.owner !== "native_dcu1"} onClick={() => void run(() => request("rotor_disconnect", rotorCommandParams(latest.current)), "Rotor disconnect").catch(() => {})}>Disconnect rotor</button></div>}
         </form></section></div>
       {!configurationOnly && <section className="live-station-card"><h3>Observed antenna</h3><strong className="rotor-panel-bearing cyan">{typeof current.azimuth === "number" ? `${Math.round(current.azimuth).toString().padStart(3, "0")}°` : "—"}</strong><p>{current.name} · {current.status}</p>{current.target_label && <p>Target {current.target_label} · {current.target_bearing ?? "—"}°</p>}
@@ -184,12 +200,12 @@ export default function RotorPanel({ snapshot, request, onManual = () => {}, con
         }} />
         <p className="live-station-helper">Motion needs an explicit action. Stop requests motion release; disconnect closes the transport. No previous turn is replayed after reconnect.</p>
       </section>}</div>
-    {configurationState.error && <p className="live-station-error" role="alert">{configurationState.error}</p>}
+    {configurationState.error && <ErrorNotice><p className="live-station-error" role="alert">{configurationState.error}</p></ErrorNotice>}
     {(configurationState.pending || configurationState.conflict || configurationState.workspaceChanged) && <div className="live-actions">
       {configurationState.pending && <button type="button" disabled={configurationState.saving} onClick={() => { manualFeedback.current = null; void configurationSession.reconcile().catch(cause => setError(cause.message)); }}>Check save</button>}
       {configurationState.pending && !configurationState.workspaceChanged && <button type="button" disabled={configurationState.saving} onClick={() => { manualFeedback.current = null; void configurationSession.retry().catch(cause => setError(cause.message)); }}>Retry same save</button>}
       {configurationState.snapshot && <button type="button" disabled={configurationState.saving} onClick={() => { manualFeedback.current = null; try { configurationSession.useSaved(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Saved rotor configuration is unavailable."); } }}>Use saved values</button>}
     </div>}
-    {error && <p className="live-station-error" role="alert">{error}</p>}{message && <p role="status">{message}</p>}{saveToast.toast}
+    {error && <ErrorNotice><p className="live-station-error" role="alert">{error}</p></ErrorNotice>}{message && <ErrorNotice><p role="status">{message}</p></ErrorNotice>}{saveToast.toast}
   </section>;
 }

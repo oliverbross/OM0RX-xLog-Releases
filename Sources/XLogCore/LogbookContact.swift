@@ -1,5 +1,49 @@
 import Foundation
 
+/// Immutable, bounded companion input. Equality is the durable replay fence;
+/// generated QSO metadata is deliberately absent from the client request.
+public struct CompanionQSO: Codable, Equatable, Sendable {
+    public let contact_id: UUID
+    public let callsign: String
+    public let band: String
+    public let mode: String
+    public let started_at_unix_ms: Int64
+    public let frequency_hz: Int64?
+    public let rst_sent: String
+    public let rst_received: String
+    public let grid: String
+    public let comment: String
+    public func validate() throws {
+        guard callsign.range(of: #"^[A-Z0-9/\-]{3,32}$"#, options: .regularExpression) != nil,
+              band.range(of: #"^[a-zA-Z0-9.]{1,16}$"#, options: .regularExpression) != nil,
+              mode.range(of: #"^[A-Z0-9\-]{1,16}$"#, options: .regularExpression) != nil,
+              (0...4_102_444_800_000).contains(started_at_unix_ms),
+              frequency_hz.map({ (1...1_000_000_000_000).contains($0) }) ?? true,
+              rst_sent.utf8.count <= 16, rst_received.utf8.count <= 16,
+              !rst_sent.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !rst_received.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              grid.isEmpty || grid.range(of: #"^[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2}([0-9]{2})?)?$"#, options: .regularExpression) != nil,
+              comment.utf8.count <= 4096,
+              comment.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) || [9,10,13].contains($0.value) }) else { throw LogbookContactError.invalid }
+    }
+    public func applying(to retained: QSO?) -> QSO {
+        var qso = retained ?? QSO(id: contact_id, call: callsign, band: band, mode: mode)
+        qso.id = contact_id
+        qso.call = callsign; qso.band = band.lowercased()
+        qso.mode = mode
+        qso.start = Date(timeIntervalSince1970: Double(started_at_unix_ms) / 1000)
+        qso.frequencyHz = frequency_hz; qso.rstSent = rst_sent; qso.rstReceived = rst_received
+        qso.gridSquare = grid.uppercased(); qso.comment = comment
+        return qso
+    }
+}
+public struct CompanionContactReceipt: Codable, Equatable, Sendable {
+    public let operationID: UUID
+    public let draft: CompanionQSO
+    public let expectedRevision: Int64?
+    public let contact: LogbookContactSnapshot
+}
+
 /// Existing logbook contacts have their own revisions, separate from the active
 /// new-contact draft and from the aggregate-cache revision. SQLite triggers cover
 /// every writer, including import, synchronization and older native code paths.

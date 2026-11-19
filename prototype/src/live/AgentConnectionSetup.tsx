@@ -1,3 +1,6 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { FlexStationPicker } from "./FlexStationPicker";
+import { isMacOS } from "./platform";
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { RefreshCw } from "lucide-react";
@@ -11,7 +14,9 @@ import { useSettingsSaveToast } from "./SettingsSaveToast";
 
 const providerLabels: Record<StationProvider, string> = { direct_agent: "Remote Station Agent", direct_flex_lan: "Direct FLEX LAN", direct_tci: "Direct TCI", hamlib: "Local Hamlib" };
 const receiveModes = ["USB", "LSB", "CW", "CWR", "AM", "FM", "RTTY", "RTTYR", "DIGU", "DIGL"];
-const notice = (receipt: StationReceipt) => receipt.request.action === "select"
+const notice = (receipt: StationReceipt) => receipt.status === "reviewed" ? "Previous operation reviewed."
+  : receipt.status === "confirmed" ? "Operation confirmed." : receipt.status === "rejected" ? "Connection request was rejected."
+  : receipt.request.action === "select"
   ? receipt.status === "acknowledged" ? "Radio selection acknowledged. Connect the selected radio explicitly."
     : "Radio selection outcome is unknown. Review the selected radio and check this receipt before another request."
   : receipt.request.action.startsWith("receive_") ? receipt.status === "acknowledged" ? "Receive control request acknowledged. Check fresh observations before another action." : "Receive control outcome is unknown. Check observed state and this receipt before another action."
@@ -20,6 +25,9 @@ const notice = (receipt: StationReceipt) => receipt.request.action === "select"
   : "Connection outcome is unknown. Check observed station state before issuing another connection request.";
 
 /** Desk and child share one native radio setup, lifecycle and receipt owner. */
+/** How long station setup reads may keep failing before the panel reports it. */
+export const stationSetupErrorAfterMs = 15_000;
+
 export function AgentConnectionSetup({ radioId, connections = false, legacyEndpoint = "", providers = false, onlySelection = false, selectionTarget, activeProvider, hamlib: hamlibSetup = false, flex: flexSetup = false, followSelection = false, compact = false, radioForm = false, receiveContext, onSession, onDraftState }: {
   radioId: RadioID; connections?: boolean; legacyEndpoint?: string; providers?: boolean; onlySelection?: boolean; selectionTarget?: StationProvider; activeProvider?: StationProvider; hamlib?: boolean; flex?: boolean; followSelection?: boolean; compact?: boolean; radioForm?: boolean; receiveContext?: MonitorContext | null; onSession?: (value: StationSession) => void; onDraftState?: (blocked: boolean) => void;
 }) {
@@ -30,10 +38,10 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
   const hamlib = radioForm ? profile.provider === "hamlib" : hamlibSetup || followSelection && state?.selection.provider === "hamlib";
   const flex = radioForm ? profile.provider === "direct_flex_lan" : flexSetup || followSelection && state?.selection.provider === "direct_flex_lan";
   const tci = radioForm ? profile.provider === "direct_tci" : followSelection && state?.selection.provider === "direct_tci";
-  const [config, setConfig] = useState<HamlibConfiguration>({ mode: "managed", model: undefined, path: "", baud: radioForm ? undefined : 9600 });
-  const [flexConfig, setFlexConfig] = useState<FlexConfiguration>({ host: "", port: 4992, station_name: "OM0RX-xLog" });
+  const [config, setConfig] = useState<HamlibConfiguration>({ mode: "managed", model: undefined, path: "", baud: undefined });
+  const [flexConfig, setFlexConfig] = useState<FlexConfiguration>({ host: "", port: 4992, station_name: "" });
   const [tciConfig, setTCIConfig] = useState<TCIConfiguration>({ endpoint: "", trx: 0, channel: 0 });
-  const [token, setToken] = useState(""), [transmit, setTransmit] = useState(!radioForm);
+  const [token, setToken] = useState(""), [transmit, setTransmit] = useState(radioForm || !(flex && /^Win/i.test(globalThis.navigator?.platform ?? "")));
   const [agentTransmit, setAgentTransmit] = useState(true);
   const [receiveMHz, setReceiveMHz] = useState(""), [receiveMode, setReceiveMode] = useState("USB"), [consumedObservation, setConsumedObservation] = useState("");
   const [busy, setBusy] = useState(false), [message, setMessage] = useState(""), [error, setError] = useState("");
@@ -46,19 +54,31 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
   const [providerTarget, setProviderTarget] = useState<StationProvider | null>(null);
   const active = useRef(false), dirty = useRef(false), inFlight = useRef(false), readSequence = useRef(0);
   const current = useRef<StationSession | null>(null);
+  // Operations whose receipt is checked automatically at most once: recovered
+  // ones, not those whose receipt this view has just received itself.
+  const autoChecked = useRef(new Set<string>());
+  // A read can fail for a moment while the station service restarts or is busy.
+  // Keep showing the last good setup and retry quietly; report the failure only
+  // when there is nothing to show or reads keep failing.
+  const failingSince = useRef(0), retryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined), lastRead = useRef(0);
   const refresh = async (adopt = false) => {
     const sequence = ++readSequence.current;
+    lastRead.current = Date.now();
     try {
       const next = await loadStationSession(radioId);
       if (!active.current || sequence !== readSequence.current) return;
+      failingSince.current = 0; clearTimeout(retryTimer.current);
       if (next.generation !== current.current?.generation || next.revision !== current.current?.revision
-        || next.selection.selection_id !== current.current?.selection.selection_id) { if (!radioForm) setTransmit(true); }
+        || next.selection.selection_id !== current.current?.selection.selection_id) { if (!radioForm) {
+          const nextIsFlex = flexSetup || (followSelection && next.selection.provider === "direct_flex_lan");
+          setTransmit(!(nextIsFlex && /^Win/i.test(globalThis.navigator?.platform ?? "")));
+        } }
       onSession?.(next);
       if (adopt || !dirty.current) {
         const hint = !adopt && !current.current && !next.base_url && next.revision === 0 && !next.last_receipt ? legacyEndpoint : "";
         current.current = next; setState(next); setURL(hint || next.base_url); dirty.current = !!hint; setConflict(false);
-        setConfig(next.hamlib ?? { mode: "managed", path: "", baud: radioForm ? undefined : 9600 });
-        setFlexConfig(next.flex ?? { host: "", port: 4992, station_name: "OM0RX-xLog" });
+        setConfig(next.hamlib ?? { mode: "managed", path: "", baud: undefined });
+        setFlexConfig(next.flex ?? { host: "", port: 4992, station_name: "" });
         setTCIConfig(next.tci ?? { endpoint: "", trx: 0, channel: 0 });
         if (radioForm) {
           const provider = next.profile?.provider ?? next.selection.provider as StationProvider | null ?? "direct_agent";
@@ -74,26 +94,47 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
         sessionStorage.setItem(journalKey, unresolved.operation_id); setPending(unresolved.operation_id);
         setMessage(radioForm ? "The last operation outcome is uncertain. Check it before trying again." : notice(unresolved));
       }
-      if (next.last_receipt && ["saved", "acknowledged"].includes(next.last_receipt.status)
+      if (next.last_receipt && !["pending", "unknown"].includes(next.last_receipt.status)
         && sessionStorage.getItem(journalKey) === next.last_receipt.operation_id) {
-        sessionStorage.removeItem(journalKey); setPending(null); setMessage(radioForm ? next.last_receipt.status === "saved" ? "Radio setup saved." : "Connection request completed. Check current radio status." : notice(next.last_receipt));
+        sessionStorage.removeItem(journalKey); setPending(null); setMessage(radioForm && next.last_receipt.status === "saved" ? "Radio setup saved." : notice(next.last_receipt));
       }
       setError("");
       return next;
-    } catch { if (active.current && sequence === readSequence.current) setError("Shared station setup is unavailable. Refresh before making changes."); }
+    } catch {
+      if (!active.current || sequence !== readSequence.current) return;
+      const now = Date.now();
+      if (!failingSince.current) failingSince.current = now;
+      if (!current.current || now - failingSince.current >= stationSetupErrorAfterMs) {
+        setError("Shared station setup is unavailable. Refresh before making changes.");
+      }
+      clearTimeout(retryTimer.current);
+      retryTimer.current = setTimeout(() => { if (active.current && !inFlight.current && !coordinating.current) void refresh(); }, 2_000);
+    }
   };
   useEffect(() => {
     active.current = true; const stops: (() => void)[] = [];
-    const focused = () => { void refresh(); };
+    // The operation's own post-write refresh adopts the saved revision. Telemetry
+    // arriving during that read must not supersede it and abort Save & Connect.
+    const focused = () => { if (!inFlight.current && !coordinating.current) void refresh(); };
+    // Telemetry arrives about four times a second; it only needs to keep the
+    // setup roughly current, so it re-reads at most once a second. An event
+    // inside that second schedules one trailing read, so the last change is
+    // never dropped when telemetry then goes quiet.
+    let trailing: ReturnType<typeof setTimeout> | undefined;
+    const telemetry = () => {
+      const wait = 1_000 - (Date.now() - lastRead.current);
+      if (wait <= 0) { clearTimeout(trailing); trailing = undefined; focused(); return; }
+      if (trailing === undefined) trailing = setTimeout(() => { trailing = undefined; if (active.current) focused(); }, wait);
+    };
     window.addEventListener("focus", focused);
     const events = ["xlog:station-session", "xlog:station-selection", ...(radioForm ? ["xlog:station-telemetry"] : [])];
-    void Promise.allSettled(events.map(name => listen(name, () => { void refresh(); }))).then(results => {
+    void Promise.allSettled(events.map(name => listen(name, name === "xlog:station-telemetry" ? telemetry : focused))).then(results => {
       for (const result of results) {
         if (result.status === "fulfilled") { if (active.current) stops.push(result.value); else result.value(); }
       }
-      if (active.current) void refresh();
+      if (active.current) focused();
     });
-    return () => { active.current = false; readSequence.current++; stops.forEach(stop => stop()); window.removeEventListener("focus", focused); };
+    return () => { active.current = false; readSequence.current++; clearTimeout(retryTimer.current); clearTimeout(trailing); stops.forEach(stop => stop()); window.removeEventListener("focus", focused); };
   }, []);
   // Durable uncertain operations survive navigation; only local text and an
   // operation still executing in this view need the presentation/close fence.
@@ -107,7 +148,9 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
     && state?.selection.generation === receiveContext?.selection?.generation;
   const execute = async (action: "save" | "connect" | "reconnect" | "disconnect" | "forget" | "select" | "receive_frequency" | "receive_mode") => {
     const base = current.current;
-    if (!base || inFlight.current || pending) return;
+    const saveDuringReview = radioForm && action === "save" && !!pending &&
+      (base?.pending_setup_receipt ?? base?.last_receipt)?.status === "unknown";
+    if (!base || inFlight.current || pending && !saveDuringReview) return;
     // Disconnect always addresses the live route, even while another setup is drafted.
     const route = radioForm ? action === "disconnect" ? base.selection.provider : profile.provider : null;
     const tci = radioForm ? route === "direct_tci" : followSelection && base.selection.provider === "direct_tci";
@@ -121,7 +164,7 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
     const id = crypto.randomUUID();
     try {
       // Journal identity only: tokens and access-bearing connection details never enter browser storage.
-      sessionStorage.setItem(journalKey, id); setPending(id);
+      if (!saveDuringReview) { sessionStorage.setItem(journalKey, id); setPending(id); }
       if (receive) setConsumedObservation(observation);
       const receipt = await stationSessionRequest<StationReceipt>(radioId, receive ? { action, operation_id: id, generation: base.generation, revision: base.revision,
         provider: receiveContext!.selection!.provider, selection_generation: receiveContext!.selection!.generation, selection_id: receiveContext!.selection!.selection_id,
@@ -130,12 +173,14 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
         : { action: action !== "select" && (tci || hamlib || flex) ? `${action}_${tci ? "tci" : flex ? "flex" : "hamlib"}` : action, operation_id: id, generation: base.generation, revision: base.revision,
         ...(action === "save" ? { ...(tci ? { configuration: { ...tciConfig, endpoint: tciConfig.endpoint.trim() } } : flex ? { configuration: { ...flexConfig, host: flexConfig.host.trim(), station_name: flexConfig.station_name.trim() } } : hamlib ? { configuration: config } : { base_url: url.trim() }), ...(radioForm ? { profile } : {}) } : { selection_generation: base.selection.generation, selection_id: base.selection.selection_id,
           ...(action === "select" ? { provider: target } : tci ? {} : { allow_transmit: ["connect", "reconnect"].includes(action) && (radioForm || hamlib || flex ? transmit : agentTransmit) }), ...(!tci && !hamlib && !flex && action === "connect" && token ? { token } : {}) }) });
+      // This view already holds the outcome; an automatic re-read is for recovery only.
+      autoChecked.current.add(id);
       if (!active.current) return;
       if (action === "connect") setToken("");
       if (!radioForm && receipt.status === "saved") saveToast.show(notice(receipt));
       else setMessage(radioForm ? receipt.status === "saved" ? "Radio setup saved." : receipt.status === "acknowledged" ? "Connection request completed. Waiting for current radio status." : "The operation outcome is uncertain. Check it before trying again." : notice(receipt));
       if (receipt.status === "saved" || receipt.status === "acknowledged") {
-        sessionStorage.removeItem(journalKey); setPending(null);
+        if (!saveDuringReview) { sessionStorage.removeItem(journalKey); setPending(null); }
         const next = await refresh(action === "save");
         return !!next && !(radioForm && next.pending_setup_receipt && ["pending", "unknown"].includes(next.pending_setup_receipt.status));
       }
@@ -151,13 +196,22 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
       setError("");
       if (receipt?.status === "saved") saveToast.show(notice(receipt));
       else setMessage(receipt ? notice(receipt) : "No operation was admitted under this identity. Refresh setup before trying again.");
-      if (!receipt || receipt.status === "saved" || receipt.status === "acknowledged") {
+      if (!receipt || !["pending", "unknown"].includes(receipt.status)) {
         if (!receipt) setConsumedObservation("");
-        sessionStorage.removeItem(journalKey); setPending(null); await refresh();
+        sessionStorage.removeItem(journalKey); setPending(null);
       }
+      await refresh();
     } catch { if (active.current) setError("The receipt is unavailable. Keep this operation pending and check again."); }
     finally { inFlight.current = false; if (active.current) setBusy(false); }
   };
+  // After a service restart an operation's outcome can be unknown. Check its
+  // receipt once by itself as soon as setup reads work again (a read only,
+  // never a replay); the operator is asked only if it is still unresolved.
+  useEffect(() => {
+    if (!pending || !state || autoChecked.current.has(pending) || inFlight.current || coordinating.current) return;
+    autoChecked.current.add(pending);
+    void check();
+  }, [pending, state]);
   const selected = state?.selection.provider === (tci ? "direct_tci" : flex ? "direct_flex_lan" : hamlib ? "hamlib" : "direct_agent") && !!state.selection.selection_id;
   const displayedProvider = activeProvider ?? state?.selection.provider as StationProvider | null | undefined;
   const updateConfig = (next: HamlibConfiguration) => { dirty.current = true; setConfig(next); };
@@ -175,7 +229,7 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
     finally { inFlight.current = false; if (active.current) setBusy(false); }
   };
   const setupAction = async (action: RadioSetupAction) => {
-    if (coordinating.current || inFlight.current || pending || conflict || !current.current) return;
+    if (coordinating.current || inFlight.current || pending && action !== "save" || conflict || !current.current) return;
     const base = current.current;
     const replace = action !== "save" && (base.radio?.snapshot?.radio?.connected === true || base.tx_owner === radioId) && action !== "disconnect";
     if ((replace || action === "save_disconnect") && !window.confirm(`${radioLabel(radioId)} will release its current controls and disconnect before applying this setup. Continue?`)) return;
@@ -222,12 +276,12 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
       <div className="live-station-actionrow"><button type="button" disabled={!state || busy || !!pending || conflict || !validTCIConfiguration(tciConfig)} onClick={() => void execute("save")}>Save TCI configuration</button>
         <button type="button" disabled={busy} onClick={() => void refresh(true)}>Reload saved TCI configuration</button></div>
       {dirty.current && <p>Save configuration changes before connecting.</p>}
-      {conflict && <p role="alert">Station setup changed in another window. Your text is retained; reload saved TCI configuration to review it.</p>}
+      {conflict && <ErrorNotice><p role="alert">Station setup changed in another window. Your text is retained; reload saved TCI configuration to review it.</p></ErrorNotice>}
       <div className="live-station-actionrow"><button type="button" disabled={!selected || !state?.tci || dirty.current || conflict || busy || !!pending} onClick={() => void execute("connect")}>Connect saved TCI radio</button>
         <button type="button" disabled={!selected || busy || !!pending} onClick={() => void execute("disconnect")}>Disconnect TCI radio</button></div>
     </>}
     {providers && (onlySelection ? <div className="live-station-selection">
-      {displayedProvider && <span className="live-station-status is-online" role="status"><i aria-hidden="true" />Active · {providerLabels[displayedProvider]}</span>}
+      {displayedProvider && <ErrorNotice><span className="live-station-status is-online" role="status"><i aria-hidden="true" />Active · {providerLabels[displayedProvider]}</span></ErrorNotice>}
       {displayedProvider !== target && state?.selection.selection_id && <button type="button" aria-label="Apply shared radio selection"
         disabled={busy || !!pending || !!error} onClick={() => void execute("select")}>Use {providerLabels[target]}</button>}
       {error && !state && <button type="button" className="live-station-selection-retry" aria-label="Refresh radio selection" title="Refresh radio selection"
@@ -244,12 +298,12 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
       <fieldset disabled={!state || busy}>
         <label>Private radio IP address<input aria-label="Shared FLEX private IP" value={flexConfig.host} autoComplete="off" placeholder="192.168.1.50" onChange={event => { dirty.current = true; setFlexConfig({ ...flexConfig, host: event.target.value }); }} /></label>
         <label>TCP port<input aria-label="Shared FLEX TCP port" type="number" min="1" max="65535" value={flexConfig.port} onChange={event => { dirty.current = true; setFlexConfig({ ...flexConfig, port: Number(event.target.value) }); }} /></label>
-        <label>Station name<input aria-label="Shared FLEX station name" maxLength={64} value={flexConfig.station_name} onChange={event => { dirty.current = true; setFlexConfig({ ...flexConfig, station_name: event.target.value }); }} /></label>
+        <FlexStationPicker value={flexConfig.station_name} snapshot={state?.radio?.snapshot} onChange={station_name => { dirty.current = true; setFlexConfig({ ...flexConfig, station_name }); }} />
       </fieldset>
       <button type="button" disabled={!state || busy || !!pending || conflict} onClick={() => void execute("save")}>Save FLEX configuration</button>
       <button type="button" disabled={busy} onClick={() => void refresh(true)}>Reload saved FLEX configuration</button>
       {dirty.current && <p>Save configuration changes before connecting.</p>}
-      {conflict && <p role="alert">Station setup changed in another window. Your text is retained; reload saved FLEX configuration to review it.</p>}
+      {conflict && <ErrorNotice><p role="alert">Station setup changed in another window. Your text is retained; reload saved FLEX configuration to review it.</p></ErrorNotice>}
       <label><input type="checkbox" checked={transmit} onChange={event => setTransmit(event.target.checked)} />Enable FLEX transmit commands for this connection</label>
       <div className="live-station-actionrow"><button type="button" disabled={!selected || !state?.flex || dirty.current || conflict || busy || !!pending} onClick={() => void execute("connect")}>Connect saved FLEX radio</button>
         <button type="button" disabled={!selected || !state?.flex || dirty.current || conflict || busy || !!pending} onClick={() => void execute("reconnect")}>Reconnect saved FLEX radio</button>
@@ -258,11 +312,11 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
       {!selected && <p>Select Direct FLEX LAN before connecting.</p>}
     </>}
     {hamlib && !flex && <><h3>{compact ? "Hamlib radio connection" : "Shared Hamlib radio connection"}</h3>{!compact && <p>Save configuration for Desk and Station Control, then connect explicitly. Saving does not contact a device. Request transmit permission separately for each connection.</p>}
-      <fieldset disabled={!state || busy}><label>Hamlib connection<select aria-label="Shared Hamlib connection" value={config.mode} onChange={event => updateConfig(event.target.value === "external" ? { mode: "external", host: "127.0.0.1", port: 4532 } : { mode: "managed", path: "", baud: 9600 })}><option value="managed">Built-in Hamlib</option><option value="external">Existing local Hamlib daemon</option></select></label>
+      <fieldset disabled={!state || busy}><label>Hamlib connection<select aria-label="Shared Hamlib connection" value={config.mode} onChange={event => updateConfig(event.target.value === "external" ? { mode: "external", host: "127.0.0.1", port: 4532 } : { mode: "managed", path: "", baud: undefined })}><option value="managed">Built-in Hamlib</option><option value="external">Existing local Hamlib daemon</option></select></label>
       {config.mode === "managed" ? <><SharedHamlibModelBrowser radioId={radioId} selected={config.model} onSelect={id => updateConfig({ ...config, model: id })} />
         <label>Hamlib model ID (manual entry)<input aria-label="Shared Hamlib model ID" type="number" min="1" value={config.model ?? ""} onChange={event => updateConfig({ ...config, model: Number(event.target.value) })} /></label>
         <label>Serial device or device TCP address<input aria-label="Shared Hamlib device path" value={config.path ?? ""} onChange={event => updateConfig({ ...config, path: event.target.value })} /></label>
-        <label>Serial baud<input aria-label="Shared Hamlib baud" type="number" min="300" max="921600" value={config.baud ?? 9600} onChange={event => updateConfig({ ...config, baud: Number(event.target.value) })} /></label>
+        <label>Serial baud<input aria-label="Shared Hamlib baud" type="number" min="300" max="921600" placeholder="Model default" value={config.baud ?? ""} onChange={event => updateConfig({ ...config, baud: event.target.value ? Number(event.target.value) : undefined })} /></label>
         <details><summary>Serial framing and control lines</summary>{[
           ["data_bits", "Data bits", [7, 8]], ["stop_bits", "Stop bits", [1, 2]], ["parity", "Parity", ["None", "Even", "Odd", "Mark", "Space"]],
           ["handshake", "Handshake", ["None", "XONXOFF", "Hardware"]], ["dtr_state", "DTR", ["Unset", "OFF", "ON"]], ["rts_state", "RTS", ["Unset", "OFF", "ON"]],
@@ -272,7 +326,7 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
       <button type="button" disabled={!state || busy || !!pending || conflict} onClick={() => void execute("save")}>Save Hamlib configuration</button>
       <button type="button" disabled={busy} onClick={() => void refresh(true)}>Reload saved Hamlib configuration</button>
       {dirty.current && <p>Save configuration changes before connecting.</p>}
-      {conflict && <p role="alert">Station setup changed in another window. Your text is retained; reload saved Hamlib configuration to review it.</p>}
+      {conflict && <ErrorNotice><p role="alert">Station setup changed in another window. Your text is retained; reload saved Hamlib configuration to review it.</p></ErrorNotice>}
       <label><input type="checkbox" checked={transmit} onChange={event => setTransmit(event.target.checked)} />Enable Hamlib transmit commands for this connection</label>
       <div className="live-station-actionrow"><button type="button" disabled={!selected || !state?.hamlib || dirty.current || conflict || busy || !!pending} onClick={() => void execute("connect")}>Connect saved Hamlib radio</button>
         <button type="button" disabled={!selected || !state?.hamlib || dirty.current || conflict || busy || !!pending} onClick={() => void execute("reconnect")}>Reconnect saved Hamlib radio</button>
@@ -282,11 +336,12 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
     {!onlySelection && !tci && !hamlib && !flex && <>{!compact && <p>Saved Agent endpoint is shared across windows. Saving it does not connect a radio.</p>}
     <label>Agent HTTPS URL<input aria-label="Shared Agent HTTPS URL" type="url" value={url} disabled={!state || busy}
       placeholder="https://station.example:8443" onChange={event => { dirty.current = true; setLegacyHint(false); setURL(event.target.value); }} /></label>
+    {!isMacOS() && <button type="button" disabled={!state || busy} onClick={() => { dirty.current = true; setLegacyHint(false); setURL("http://127.0.0.1:8840"); }}>Use Agent on this PC</button>}
     <div className="live-station-actionrow"><button type="button" disabled={!state || busy || !!pending || conflict} onClick={() => void execute("save")}>{legacyHint ? "Import previous Agent endpoint" : "Save Agent endpoint"}</button>
       <button type="button" disabled={busy} onClick={() => void refresh(true)}>Reload saved endpoint</button></div>
     {legacyHint && <p>Your previous Desk endpoint is shown for review. Import it once to share it across windows.</p>}
     {state && dirty.current && <p>Save endpoint changes before connecting. This text has not changed shared setup.</p>}
-    {conflict && <p role="alert">Agent setup changed in another window. Your text is retained; reload saved endpoint to review the current setup.</p>}
+    {conflict && <ErrorNotice><p role="alert">Agent setup changed in another window. Your text is retained; reload saved endpoint to review the current setup.</p></ErrorNotice>}
     </>}
     {connections && !tci && !hamlib && !flex && <>
       {!compact && <p>Saved Agent setup and connection tests do not confirm the running station session. Check the live station status for current radio observations; an interrupted session retries automatically.</p>}
@@ -307,7 +362,7 @@ export function AgentConnectionSetup({ radioId, connections = false, legacyEndpo
       </section>}
     {pending && <button type="button" disabled={busy} onClick={() => void check()}>{onlySelection ? "Check radio selection receipt" : "Check connection setup receipt"}</button>}
     {pending && message.includes("unknown") && <button type="button" disabled={busy} onClick={() => { sessionStorage.setItem(reviewedKey, pending); sessionStorage.removeItem(journalKey); setPending(null); setMessage("Previous outcome remains unknown. Review observed state before a new explicit request."); void refresh(); }}>I have reviewed observed state</button>}
-    {message && (!onlySelection || !!pending) && <p role="status">{message}</p>}{saveToast.toast}{error && (!onlySelection || !!state) && <p role="alert">{error}</p>}
+    {message && (!onlySelection || !!pending) && <ErrorNotice><p role="status">{message}</p></ErrorNotice>}{saveToast.toast}{error && (!onlySelection || !!state) && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     {state?.last_receipt && !onlySelection && <p>Last shared operation: {state.last_receipt.request.action} · {state.last_receipt.status}. Acknowledgement does not confirm radio state.</p>}
   </div>;
 }

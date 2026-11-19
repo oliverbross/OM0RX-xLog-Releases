@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { migrateReferenceSchedule, referenceAutoCheckChanged, type ReferenceRequest } from "./referenceSchedule";
 import { useSettingsSaveToast } from "./SettingsSaveToast";
@@ -54,6 +55,6 @@ export default function ReferenceScheduleControl({ request, visible }: { request
   };
   return <section hidden={!visible}><label><input type="checkbox" checked={enabled === true} disabled={enabled === null || busy} onChange={event => void save(event.target.checked)} />Automatically check reference databases</label>
     <p>Checks run after startup, on return to the app and hourly when due. Validated cached data remains available on failure. This preference saves immediately; it never synchronizes QSOs.</p>
-    {message && <p role="alert">{message}</p>}{saveToast.toast}
+    {message && <ErrorNotice when={true} title="Message"><p role="alert">{message}</p></ErrorNotice>}{saveToast.toast}
   </section>;
 }

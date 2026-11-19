@@ -41,7 +41,7 @@ for (const name of ["WorldMap", "DXpeditionMap", "BandMaps", "Monitor"]) {
   assert(bytes <= (name === "BandMaps" ? 400_000 : 1_600_000), `${name} startup JavaScript budget exceeded: ${bytes}`);
   console.log(JSON.stringify({ window: name, bytes, gzip: data.reduce((sum, item) => sum + gzipSync(item).length, 0), files }));
 }
-for (const name of ["Awards", "Logbook", "Cluster", "QSO", "SpotHistory", "CallsignIntelligence", "PreviousQSOs", "OperatingGoals", "Settings", "Opportunities", "HFPropagationLive", "StationControl", "CW", "Rotor", "StationStatus", "Propagation", "StationIdentity", "Alerts", "Antenna"]) {
+for (const name of ["Awards", "Logbook", "Cluster", "Special", "QSO", "SpotHistory", "CallsignIntelligence", "PreviousQSOs", "OperatingGoals", "Settings", "Opportunities", "HFPropagationLive", "StationControl", "CW", "Rotor", "StationStatus", "Propagation", "StationIdentity", "Alerts", "Antenna"]) {
   const entry = `src/live/Detached${name}Surface.tsx`;
   const graph = closure(entry, closure("index.html"));
   assert(!graph.has(main), `${name} imports the main station workspace`);
@@ -81,7 +81,15 @@ for (const name of ["Awards", "Logbook", "Cluster", "QSO", "SpotHistory", "Calls
   // Mode handoff shares the 1,341-byte editor-preparation helper with Logbook.
   // Measured startup: 404,998 bytes (130,274 gzip); allow 202 bytes of headroom
   // only here. Main and map UI exclusion checks above remain unchanged.
-  const budget = name === "Settings" ? 408_000 : name === "QSO" ? 407_000 : name === "Logbook" ? 405_200 : 401_000;
+  // Shared error notices and the lazy feedback-dialog route put Alerts just
+  // above its old ceiling. Keep a bounded 2 kB allowance on that window only;
+  // the dialog body itself remains outside ordinary window startup.
+  // Routine-contention classification adds a shared helper and feedback metadata.
+  // Measured Alerts startup is 403,281 bytes; allow 219 bytes of headroom here.
+  // Repeat counts and the brief grace for momentary service notices live in
+  // the shared feedback store, and Alerts now reports a failed window open.
+  // Measured Alerts startup is 404,836 bytes; allow 164 bytes of headroom here.
+  const budget = name === "Settings" ? 408_000 : name === "QSO" ? 407_000 : name === "Logbook" ? 405_200 : name === "Alerts" ? 405_000 : 401_000;
   console.log(JSON.stringify({ window: name, bytes, gzip, files }));
   assert(bytes <= budget, `${name} startup JavaScript exceeds the ${budget / 1_000} kB budget: ${bytes}`);
 }

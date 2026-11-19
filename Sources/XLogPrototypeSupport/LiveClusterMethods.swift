@@ -2,6 +2,8 @@ import Foundation
 #if os(macOS)
 import LocalAuthentication
 import Security
+#endif
+#if os(macOS) || os(Windows)
 import XCatIntegrationCore
 #endif
 import XClusterIntegrationCore
@@ -29,7 +31,7 @@ struct ClusterRadioSpotPayload: Equatable, Sendable {
     let priority: Int
     let colorHex: String
 
-    #if os(macOS)
+    #if os(macOS) || os(Windows)
     func flexSpot() throws -> FlexSpot {
         try FlexSpot(frequencyHz: frequencyHz, callsign: callsign, mode: mode, source: source,
                      spotter: spotter, comment: comment, timestamp: timestamp,
@@ -135,6 +137,7 @@ public actor LiveClusterMethods {
         let spot: ClassifiedClusterSpot
         let generation: UUID
         let provider: String
+        var manual = false
     }
     private var normalSpotQueue: [String: PendingNormalSpot] = [:]
     private var normalSpotDrain: Task<Void, Never>?
@@ -150,10 +153,12 @@ public actor LiveClusterMethods {
     private var contactReadCancellation: LogbookAggregateCancellation?
     private var contactReadTask: Task<ClusterContactProjection, Error>?
     private var contactRefreshFlight: (id: UUID, task: Task<Void, Error>)?
+    private var backgroundContactRefresh: (id: UUID, task: Task<Void, Never>)?
     private var contactProjectionOwner: LiveLogbookAggregateOwner?
     private var countrySnapshotIdentity: String?
     private static let bundledCountrySnapshot = try? CTYResolver.bundledCountryPack()
     private let beforeContactPublication: (@Sendable () async throws -> Void)?
+    private let beforeNeedsValidation: (@Sendable () async -> Void)?
     private let forwardClassifiedIngressSpots: Bool
     private let radioSideEffectsAllowed: Bool
     private let hasInjectedSpotForwarder: Bool
@@ -184,9 +189,16 @@ public actor LiveClusterMethods {
     private var resumeLoaded = false
     private var resumeIntent: ResumeIntent?
     private var resumeURL: URL { configurationURL.deletingLastPathComponent().appendingPathComponent("cluster-session.json") }
+    #if os(Windows)
+    private static let flexProvider = "direct_flex_lan"
+    private static let flexDestination = "direct FLEX radio"
+    #else
+    private static let flexProvider = "direct_agent"
+    private static let flexDestination = "Remote Station Agent"
+    #endif
     private var forwardingAvailable: Bool {
-        #if os(macOS)
-        true
+        #if os(macOS) || os(Windows)
+        radioSideEffectsAllowed
         #else
         hasInjectedSpotForwarder
         #endif
@@ -198,6 +210,7 @@ public actor LiveClusterMethods {
              makeClusterTCPTransport(server: server, password: password, reconnect: reconnect,
                                      requestSkimmer: skimmer, onState: state, onLine: line)
          }, beforeContactPublication: (@Sendable () async throws -> Void)? = nil,
+         beforeNeedsValidation: (@Sendable () async -> Void)? = nil,
          forwardClassifiedIngressSpots: Bool = true,
          radioSideEffectsAllowed: Bool = true,
          normalSpotRetryDelay: TimeInterval = 5,
@@ -212,6 +225,7 @@ public actor LiveClusterMethods {
         self.vault = CachedClusterCredentialStore(base: vault)
         self.transportFactory = transportFactory
         self.beforeContactPublication = beforeContactPublication
+        self.beforeNeedsValidation = beforeNeedsValidation
         self.radioSideEffectsAllowed = radioSideEffectsAllowed
         self.hasInjectedSpotForwarder = radioSideEffectsAllowed && spotForward != nil
         self.forwardClassifiedIngressSpots = radioSideEffectsAllowed && forwardClassifiedIngressSpots
@@ -226,7 +240,7 @@ public actor LiveClusterMethods {
             self.spotRemove = spotRemove ?? { _, _ in false }
         } else {
             self.spotForward = { payload, provider, replacing in
-                #if os(macOS)
+                #if os(macOS) || os(Windows)
                 return try await SpotForwardBroker.shared.forward(try payload.flexSpot(), provider: provider,
                                                                   replacingExisting: replacing)
                 #else
@@ -234,7 +248,7 @@ public actor LiveClusterMethods {
                 #endif
             }
             self.spotRemove = { payload, provider in
-                #if os(macOS)
+                #if os(macOS) || os(Windows)
                 return try await SpotForwardBroker.shared.remove(try payload.flexSpot(), provider: provider)
                 #else
                 return false
@@ -250,7 +264,7 @@ public actor LiveClusterMethods {
             self.beforeContestSpotPublication = { _ in try await beforeContestSpotPublication() }
         } else if logbook === LiveLogbookMethods.shared {
             self.beforeContestSpotPublication = { priorReceiptCutoff in
-                #if os(macOS)
+                #if os(macOS) || os(Windows)
                 var failure: Error?
                 do { _ = try await SpotForwardBroker.shared.withdrawNormalForwardedSpots(acceptedBefore: priorReceiptCutoff) }
                 catch { failure = error }
@@ -268,7 +282,7 @@ public actor LiveClusterMethods {
         } else if let retirePersistedContestSpots {
             self.retirePersistedContestSpots = retirePersistedContestSpots
         } else if logbook === LiveLogbookMethods.shared {
-            #if os(macOS)
+            #if os(macOS) || os(Windows)
             self.retirePersistedContestSpots = {
                 _ = try await SpotForwardBroker.shared.retireContestForwardedSpots()
             }
@@ -287,7 +301,7 @@ public actor LiveClusterMethods {
         } else if let deferPersistedContestSpots {
             self.deferPersistedContestSpots = deferPersistedContestSpots
         } else if logbook === LiveLogbookMethods.shared {
-            #if os(macOS)
+            #if os(macOS) || os(Windows)
             self.deferPersistedContestSpots = {
                 try await SpotForwardBroker.shared.deferContestForwardedSpotsForShutdown()
             }
@@ -309,6 +323,7 @@ public actor LiveClusterMethods {
         if !deferRadioSpotCleanup { await cleanup?.value }
         contactRefreshRevision &+= 1
         contactProjectionOwner = nil
+        backgroundContactRefresh?.task.cancel(); backgroundContactRefresh = nil
         contactRefreshFlight?.task.cancel()
         contactReadCancellation?.cancel(); contactReadTask?.cancel()
         _ = await contactReadTask?.result
@@ -366,8 +381,120 @@ public actor LiveClusterMethods {
         guard !terminated else { throw WorkerFailure("worker_stopping", "The cluster service has shut down.") }
     }
 
+    private static let needsPolicy = "xlog-call-dxcc-needs-v1"
+    private static let needsMaxRevision: UInt64 = 9_007_199_254_740_990
+
+    private func needsUnknown(_ queries: [ClusterNeedsQuery], state: String) -> [String: Any] {
+        ["generated_at_unix_ms": Int64(Date().timeIntervalSince1970 * 1000), "max_age_ms": 2000,
+         "readiness": state, "authority": NSNull(), "results": queries.map { query -> [String: Any] in
+            ["query_id": query.id, "normalized_callsign": query.call, "dial_frequency_hz": query.frequencyHz,
+             "decoder_mode": query.mode, "classification_mode": "DIGI", "band": NSNull(), "country": NSNull(),
+             "adif": NSNull(), "country_resolution": NSNull(), "call_status": "Unknown", "dxcc_status": "Unknown",
+             "need": ["status": "unknown", "score": NSNull(), "reason_code": state, "reasons": []] as [String: Any]]
+         }]
+    }
+
+    /// This helper never prepares a service, index, reference cache or database.
+    /// The scheduled owner poll owns that existing work independently.
+    private func retainedNeeds(_ queries: [ClusterNeedsQuery], workspace: String?, expires: Date) async -> [String: Any] {
+        let state = contactRefreshState == "refreshing" ? "refreshing" : contactRefreshState == "stale" ? "stale" : "unavailable"
+        guard !terminated, workspaceTransitionCount == 0, Date() < expires,
+              contactRefreshState == "current", let owner = contactProjectionOwner,
+              workspace == nil || workspace == owner.generation,
+              owner.authority.revision >= 0, UInt64(owner.authority.revision) <= Self.needsMaxRevision,
+              let reference = countrySnapshotIdentity, !reference.isEmpty, reference.utf8.count <= 512,
+              let service else {
+            return needsUnknown(queries, state: state)
+        }
+        let publication = contactRefreshRevision
+        guard await logbook.validateRetainedNeedsOwner(owner, reference: reference, expires: expires),
+              !terminated, workspaceTransitionCount == 0, Date() < expires,
+              contactRefreshState == "current", contactRefreshRevision == publication,
+              contactProjectionOwner?.generation == owner.generation,
+              countrySnapshotIdentity == reference else { return needsUnknown(queries, state: "stale") }
+        guard let facts = await service.queryNeeds(queries, expires: expires) else { return needsUnknown(queries, state: "stale") }
+        if !queries.isEmpty { await beforeNeedsValidation?() }
+        guard await logbook.validateRetainedNeedsOwner(owner, reference: reference, expires: expires),
+              !terminated, workspaceTransitionCount == 0, Date() < expires,
+              contactRefreshState == "current", contactRefreshRevision == publication,
+              contactProjectionOwner?.generation == owner.generation,
+              facts.revision <= Self.needsMaxRevision, facts.reference == reference,
+              countrySnapshotIdentity == reference else {
+            return needsUnknown(queries, state: "stale")
+        }
+        let rows = facts.results.map { row -> [String: Any] in
+            ["query_id": row.query.id, "normalized_callsign": row.query.call, "dial_frequency_hz": row.query.frequencyHz,
+             "decoder_mode": row.query.mode, "classification_mode": "DIGI", "band": row.band == "OTHER" ? NSNull() : row.band as Any,
+             "country": row.country as Any? ?? NSNull(), "adif": row.adif as Any? ?? NSNull(),
+             "country_resolution": row.resolution, "call_status": row.callStatus, "dxcc_status": row.dxccStatus,
+             "need": ["status": row.need, "score": row.score as Any? ?? NSNull(),
+                      "reason_code": row.reasonCode as Any? ?? NSNull(), "reasons": row.reasons] as [String: Any]]
+        }
+        return ["generated_at_unix_ms": Int64(Date().timeIntervalSince1970 * 1000), "max_age_ms": 2000,
+                "readiness": "ready", "authority": ["logbook_revision": owner.authority.revision,
+                    "classification_revision": facts.revision, "country_reference_revision": reference,
+                    "policy_revision": Self.needsPolicy] as [String: Any], "results": rows]
+    }
+
+    /// Needs evidence alone, for the owner's frequent needs poll. It never
+    /// prepares a service, index, reference cache or snapshot payload, so its
+    /// small reply is not delayed by encoding the full spot/console snapshot:
+    /// the evidence arrives with almost all of its two-second lifetime left.
+    private func needsOnlySnapshot(_ params: [String: Any]) async throws -> [String: Any] {
+        try require(params, allowed: ["needs_only", "needs_query"], required: ["needs_only"])
+        guard let flag = params["needs_only"] as? Bool, flag else { throw invalid() }
+        let needs = await retainedNeedsPoll(lookup: {
+            guard let query = params["needs_query"] as? [String: Any] else { return nil }
+            return try? await needsReply(query)
+        }, base: {
+            await retainedNeeds([], workspace: nil, expires: Date().addingTimeInterval(1))
+        })
+        var response: [String: Any] = ["needs": needs.metadata]
+        if let reply = needs.reply { response["needs_reply"] = reply }
+        return response
+    }
+
+    private func needsReply(_ params: [String: Any]) async throws -> [String: Any] {
+        try require(params, allowed: ["batch_id", "workspace_id", "expires_at_unix_ms", "queries"],
+                    required: ["batch_id", "workspace_id", "expires_at_unix_ms", "queries"])
+        guard let batch = params["batch_id"] as? String, UUID(uuidString: batch) != nil,
+              let workspace = params["workspace_id"] as? String, !workspace.isEmpty, workspace.utf8.count <= 128,
+              let milliseconds = params["expires_at_unix_ms"] as? Int64, milliseconds > 0,
+              let raw = params["queries"] as? [[String: Any]], (1...32).contains(raw.count),
+              ((try? JSONSerialization.data(withJSONObject: params).count) ?? Int.max) <= 18 * 1024 else { throw invalid() }
+        let expires = Date(timeIntervalSince1970: Double(milliseconds) / 1000)
+        guard expires.timeIntervalSinceNow <= 1.05 else { throw invalid() }
+        var ids = Set<String>()
+        let queries = try raw.map { row -> ClusterNeedsQuery in
+            try require(row, allowed: ["query_id", "callsign", "dial_frequency_hz", "mode"],
+                        required: ["query_id", "callsign", "dial_frequency_hz", "mode"])
+            guard let id = row["query_id"] as? String, !id.isEmpty, id.utf8.count <= 128,
+                  id.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 95 || $0 == 45 }), ids.insert(id).inserted,
+                  let call = row["callsign"] as? String, Self.validNeedsCall(call),
+                  let hz = row["dial_frequency_hz"] as? Int64, (1...1_000_000_000_000).contains(hz),
+                  let mode = row["mode"] as? String, ["FT8", "FT4"].contains(mode) else { throw invalid() }
+            return .init(id: id, call: call, frequencyHz: hz, mode: mode)
+        }
+        return ["batch_id": batch, "workspace_id": workspace,
+                "result": await retainedNeeds(queries, workspace: workspace, expires: expires)]
+    }
+
+    private static func validNeedsCall(_ call: String) -> Bool {
+        let bytes = Array(call.utf8)
+        guard (3...32).contains(bytes.count),
+              bytes.allSatisfy({ (65...90).contains($0) || (48...57).contains($0) || $0 == 47 }) else { return false }
+        let parts = bytes.split(separator: 47, omittingEmptySubsequences: false)
+        guard parts.allSatisfy({ !$0.isEmpty }), !["RR73", "RRR", "R73", "73"].contains(call),
+              !(bytes.count <= 3 && (48...57).contains(bytes[0]) && bytes.allSatisfy({ (48...57).contains($0) || $0 == 78 })) else { return false }
+        return bytes.contains(where: { (65...90).contains($0) }) && bytes.contains(where: { (48...57).contains($0) })
+    }
+
     public func handle(method: String, params: [String: Any]) async throws -> [String: Any] {
         try requireRunning()
+        if method == "cluster_needs_query" { return try await needsReply(params) }
+        if method == "cluster_snapshot", params["needs_only"] != nil {
+            return try await needsOnlySnapshot(params)
+        }
         if method == "cluster_resume_initialize" {
             try require(params, allowed: ["intent"])
             let intent: ResumeIntent?
@@ -392,11 +519,14 @@ public actor LiveClusterMethods {
         }
         // Connect owns its contact refresh. Do not build the entire index once
         // in readyService and then immediately rebuild it again in connect.
-        let service = try await readyService(refreshInitialContacts: method != "cluster_connect" && method != "cluster_resume")
+        let passiveSnapshot = method == "cluster_snapshot"
+        let backgroundIndex = passiveSnapshot || method == "cluster_resume"
+        let service = try await readyService(refreshInitialContacts: !passiveSnapshot && method != "cluster_connect" && method != "cluster_resume")
         let countryChanged = try await refreshCountrySnapshot(service)
-        if countryChanged, workspaceTransitionCount == 0,
+        if (countryChanged || backgroundIndex && contactRefreshState == "not_loaded"), workspaceTransitionCount == 0,
            (try logbook.handle(method: "workspace_status", params: [:]))["workspace_exists"] as? Bool == true {
-            try await refreshContacts()
+            if backgroundIndex { scheduleContactRefresh() }
+            else { try await refreshContacts() }
         }
         try requireRunning()
         let mutatesConfiguration = method == "cluster_configure" || method == "cluster_radio_spots_configure" || method == "cluster_filter"
@@ -413,27 +543,35 @@ public actor LiveClusterMethods {
                 resumeChecked = true
                 let config = try currentConfiguration()
                 if config.connectOnStartup && config.servers.contains(where: \.enabled) {
-                    do { try await connect(service) }
+                    do { try await connect(service, prepareContacts: false) }
                     catch { resumeError = "Cluster could not connect automatically. Check its settings and use Connect to retry." }
                 }
             }
         case "cluster_snapshot":
-            try require(params, allowed: [])
+            try require(params, allowed: ["needs_query"])
         case "cluster_configure":
             try require(params, allowed: ["configuration", "base_configuration"], required: ["configuration", "base_configuration"])
             guard let object = params["configuration"] as? [String: Any],
                   let baseObject = params["base_configuration"] as? [String: Any] else { throw invalid() }
             let draft: ClusterSessionConfiguration = try decode(object)
             let base: ClusterSessionConfiguration = try decode(baseObject)
-            let next = try mergeClusterConfiguration(draft: draft, base: base, current: currentConfiguration())
+            var next = try mergeClusterConfiguration(draft: draft, base: base, current: currentConfiguration())
+            for index in next.servers.indices {
+                let host = next.servers[index].host.trimmingCharacters(in: .whitespacesAndNewlines)
+                let name = next.servers[index].name.trimmingCharacters(in: .whitespacesAndNewlines)
+                next.servers[index].host = host
+                next.servers[index].name = name.isEmpty ? String(host.prefix(80)) : name
+                next.servers[index].callsign = next.servers[index].callsign.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
             try validate(next)
-            guard forwardingAvailable || (!next.forwardSpotsToFlex && !next.forwardSpotsToTCI) else {
+            guard (forwardingAvailable || !next.forwardSpotsToFlex) && (forwardingAvailable || !next.forwardSpotsToTCI) else {
                 throw WorkerFailure("platform_pending", "Radio spot forwarding is not yet available on this platform. Turn forwarding off before saving cluster settings.")
             }
-            try await service.configure(next, password: { [vault] id in try vault.load(id) ?? "" })
+            do { try await service.configure(next, password: { [vault] id in try vault.load(id) ?? "" }) }
+            catch let error as ClusterSessionError { throw WorkerFailure("cluster_configuration", error.localizedDescription) }
             try requireRunning()
             configuration = next
-            flexForwardStatus = next.forwardSpotsToFlex ? "Enabled; connect the Remote Station Agent." : "Off"
+            flexForwardStatus = next.forwardSpotsToFlex ? "Enabled; connect the \(Self.flexDestination)." : "Off"
             tciForwardStatus = next.forwardSpotsToTCI ? "Enabled; connect TCI." : "Off"
             try saveConfiguration(next)
         case "cluster_radio_spots_configure":
@@ -487,11 +625,12 @@ public actor LiveClusterMethods {
                     next.palette.status[name] = color
                 }
             }
-            try await service.configure(next, password: { [vault] id in try vault.load(id) ?? "" })
+            do { try await service.configure(next, password: { [vault] id in try vault.load(id) ?? "" }) }
+            catch let error as ClusterSessionError { throw WorkerFailure("cluster_configuration", error.localizedDescription) }
             try requireRunning()
             try saveConfiguration(next)
             configuration = next
-            flexForwardStatus = next.forwardSpotsToFlex ? "Enabled; waiting for a connected cluster and Remote Station Agent with add_spot." : "Off"
+            flexForwardStatus = next.forwardSpotsToFlex ? "Enabled; waiting for a connected cluster and \(Self.flexDestination)." : "Off"
             tciForwardStatus = next.forwardSpotsToTCI ? "Enabled; waiting for a connected cluster and TCI." : "Off"
             flexForwardRetryAfter = .distantPast
             tciForwardRetryAfter = .distantPast
@@ -540,6 +679,38 @@ public actor LiveClusterMethods {
                   let password = params["password"] as? String,
                   password.utf8.count <= 256, !password.contains("\r"), !password.contains("\n") else { throw invalid() }
             try vault.save(password, serverID: serverID)
+        case "cluster_push_spots":
+            try require(params, allowed: [])
+            guard forwardingAvailable, forwardClassifiedIngressSpots else {
+                throw WorkerFailure("station_unavailable", "Radio spot publishing is unavailable in this workspace.")
+            }
+            let replay = await service.forwardingSnapshot()
+            let now = Date()
+            let eligible = replay.spots.filter { Self.isManualPushEligible($0, now: now) }
+            guard !eligible.isEmpty else { throw WorkerFailure("no_spots", "No filtered spots from the past 30 minutes are eligible for the radio display.") }
+            let config = try currentConfiguration()
+            // Manual replay follows configured outputs; preserve the one-shot
+            // FLEX action when automatic forwarding has not been enabled.
+            var providers: [String] = []
+            if config.forwardSpotsToFlex { providers.append(Self.flexProvider) }
+            if config.forwardSpotsToTCI { providers.append("direct_tci") }
+            if providers.isEmpty { providers = [Self.flexProvider] }
+            flexForwardRetryAfter = .distantPast
+            tciForwardRetryAfter = .distantPast
+            // A new explicit replay supersedes pending manual work. The
+            // snapshot caps this at 500 spots for each of the two outputs.
+            normalSpotQueue = normalSpotQueue.filter { !$0.value.manual }
+            for provider in providers {
+                for spot in eligible {
+                    normalSpotQueue["\(provider)|\(spot.id)"] = PendingNormalSpot(spot: spot, generation: replay.generation, provider: provider, manual: true)
+                }
+                let status = "Queued \(eligible.count) filtered spots from the past 30 minutes."
+                if provider == Self.flexProvider { flexForwardStatus = status } else { tciForwardStatus = status }
+            }
+            trimNormalSpotQueue()
+            if normalSpotDrain == nil, !normalSpotQueue.isEmpty {
+                normalSpotDrain = Task { [weak self] in await self?.drainNormalSpots() }
+            }
         case "cluster_console_clear":
             try require(params, allowed: [])
             await service.clearConsole()
@@ -551,17 +722,18 @@ public actor LiveClusterMethods {
             let replay = await service.forwardingSnapshot()
             for spot in replay.spots { await forwardSpotIfEnabled(spot, generation: replay.generation) }
         }
-        let (snapshot, truncated) = try await boundedSnapshot(service)
+        let (encodedSnapshot, truncated) = try await boundedSnapshotData(service)
         let contestSpots = await service.contestSpots()
-        return ["configuration": try json(currentConfiguration()),
-                "snapshot": try json(snapshot), "snapshot_truncated": truncated,
+        var response: [String: Any] = ["configuration": try json(currentConfiguration()),
+                "snapshot": try JSONSerialization.jsonObject(with: encodedSnapshot), "snapshot_truncated": truncated,
                 "contest_spots": try json(contestSpots),
                 "password_storage_available": vault.available,
                 "resume_error": resumeError as Any? ?? NSNull(),
                 "resume_initialized": (try? readResumeIntent()) != nil,
-                "flex_forwarding_available": forwardingAvailable,
+                "flex_forwarding_available": forwardingAvailable, "flex_provider": Self.flexProvider,
                 "tci_forwarding_available": forwardingAvailable,
                 "contact_refresh_state": contactRefreshState,
+                "contact_logbook_revision": contactProjectionOwner?.authority.revision as Any? ?? NSNull(),
                 "contact_refresh_error": contactRefreshError as Any? ?? NSNull(),
                 "password_servers": try currentConfiguration().servers.filter { try vault.load($0.id) != nil }.map { $0.id.uuidString },
                 "forwarding": ["accepted_count": forwardAcceptedCount,
@@ -569,6 +741,15 @@ public actor LiveClusterMethods {
                                "flex_status": flexForwardStatus + (configuration?.forwardSpotsToFlex == true ? priorRadioSpotCleanupNotice : ""),
                                "tci_status": tciForwardStatus + (configuration?.forwardSpotsToTCI == true ? priorRadioSpotCleanupNotice : ""),
                                "prior_spot_cleanup_pending": priorRadioSpotCleanupPending]]
+        let needs = await retainedNeedsPoll(lookup: {
+            guard method == "cluster_snapshot", let query = params["needs_query"] as? [String: Any] else { return nil }
+            return try? await needsReply(query)
+        }, base: {
+            await retainedNeeds([], workspace: nil, expires: Date().addingTimeInterval(1))
+        })
+        response["needs"] = needs.metadata
+        if let reply = needs.reply { response["needs_reply"] = reply }
+        return response
     }
 
     private func resolvedPasswords() throws -> [UUID: String] {
@@ -579,9 +760,13 @@ public actor LiveClusterMethods {
         return passwords
     }
 
-    private func connect(_ service: ClusterSessionService, passwords preloadedPasswords: [UUID: String]? = nil) async throws {
+    private func connect(_ service: ClusterSessionService, passwords preloadedPasswords: [UUID: String]? = nil,
+                         prepareContacts: Bool = true) async throws {
         let workspaceStatus = try logbook.handle(method: "workspace_status", params: [:])
-        if workspaceStatus["workspace_exists"] as? Bool == true { try await refreshContacts() }
+        if workspaceStatus["workspace_exists"] as? Bool == true {
+            if prepareContacts { try await refreshContacts() }
+            else { scheduleContactRefresh() }
+        }
         else {
             contactRefreshRevision &+= 1
             let revision = contactRefreshRevision
@@ -590,7 +775,8 @@ public actor LiveClusterMethods {
         }
         try requireRunning()
         let passwords = try preloadedPasswords ?? resolvedPasswords()
-        try await service.connect(passwords: passwords)
+        do { try await service.connect(passwords: passwords) }
+        catch let error as ClusterSessionError { throw WorkerFailure("cluster_connection", error.localizedDescription) }
     }
 
     private func validateResumePath() throws {
@@ -621,7 +807,11 @@ public actor LiveClusterMethods {
     }
 
     /// Read an already running cluster without starting services or scanning contacts.
-    func currentSpotRowsIfStarted() async -> [[String: Any]] {
+    func currentSpotRowsIfStarted(unfiltered: Bool = false) async -> [[String: Any]] {
+        if unfiltered {
+            guard let service else { return [] }
+            return (try? json(await service.contestSpots())) as? [[String: Any]] ?? []
+        }
         guard let service, let (snapshot, _) = try? await boundedSnapshot(service),
               let object = try? json(snapshot) as? [String: Any] else { return [] }
         return object["spots"] as? [[String: Any]] ?? []
@@ -634,6 +824,24 @@ public actor LiveClusterMethods {
     }
 
     /// Called after local QSO mutations, import, restore or remote reconciliation.
+    private func scheduleContactRefresh() {
+        guard backgroundContactRefresh == nil, !terminated, workspaceTransitionCount == 0 else { return }
+        let id = UUID()
+        contactRefreshState = "refreshing"; contactRefreshError = nil
+        let task = Task { [weak self] in
+            guard let self else { return }
+            // The refresh owner publishes current/stale evidence. A renderer
+            // status read must not wait for a complete logbook classification.
+            do { try await self.refreshContacts() } catch { }
+            await self.finishBackgroundContactRefresh(id)
+        }
+        backgroundContactRefresh = (id, task)
+    }
+
+    private func finishBackgroundContactRefresh(_ id: UUID) {
+        if backgroundContactRefresh?.id == id { backgroundContactRefresh = nil }
+    }
+
     public func refreshContacts() async throws {
         try requireRunning()
         // Connect, startup and committed contacts join one rebuild. A new save
@@ -755,6 +963,7 @@ public actor LiveClusterMethods {
         workspaceTransitionCount += 1
         contactRefreshRevision &+= 1
         contactProjectionOwner = nil
+        backgroundContactRefresh?.task.cancel(); backgroundContactRefresh = nil
         contactRefreshFlight?.task.cancel()
         contactRefreshFlight = nil
         contactReadCancellation?.cancel(); contactReadTask?.cancel()
@@ -771,17 +980,31 @@ public actor LiveClusterMethods {
     /// Keep the full in-memory history while fitting a bounded worker response.
     /// Trim oldest console lines first, then least-recent visible spots if needed.
     private func boundedSnapshot(_ service: ClusterSessionService) async throws -> (ClusterSessionSnapshot, Bool) {
+        let (snapshot, _, truncated) = try await boundedSnapshotParts(service)
+        return (snapshot, truncated)
+    }
+
+    /// The bounded snapshot already encoded. The size check's encoding is the
+    /// reply, so the once-a-second native poll encodes the spot list once, not twice.
+    private func boundedSnapshotData(_ service: ClusterSessionService) async throws -> (Data, Bool) {
+        let (_, data, truncated) = try await boundedSnapshotParts(service)
+        return (data, truncated)
+    }
+
+    private func boundedSnapshotParts(_ service: ClusterSessionService) async throws -> (ClusterSessionSnapshot, Data, Bool) {
         var snapshot = await service.snapshot()
         var truncated = false
-        while try JSONEncoder().encode(snapshot).count > 800_000 {
+        var data = try JSONEncoder().encode(snapshot)
+        while data.count > 800_000 {
             truncated = true
             if snapshot.console.count > 40 {
                 snapshot.console.removeFirst(max(1, snapshot.console.count / 4))
             } else if snapshot.spots.count > 1 {
                 snapshot.spots.removeLast(max(1, snapshot.spots.count / 4))
             } else { break }
+            data = try JSONEncoder().encode(snapshot)
         }
-        return (snapshot, truncated)
+        return (snapshot, data, truncated)
     }
 
     private func readyService(refreshInitialContacts: Bool = true) async throws -> ClusterSessionService {
@@ -802,7 +1025,7 @@ public actor LiveClusterMethods {
             Task { await self?.forwardSpotIfEnabled(spot, generation: generation) }
         }, onObservation: { archive.observe($0) }, onHistoryConnection: { archive.connection($0) }, transportFactory: transportFactory)
         configuration = config
-        flexForwardStatus = config.forwardSpotsToFlex ? (forwardingAvailable ? "Enabled; connect a cluster and Remote Station Agent." : "Unavailable on this platform") : "Off"
+        flexForwardStatus = config.forwardSpotsToFlex ? (forwardingAvailable ? "Enabled; connect the cluster and FLEX spot destination." : "Unavailable on this platform") : "Off"
         tciForwardStatus = config.forwardSpotsToTCI ? (forwardingAvailable ? "Enabled; connect a cluster and TCI." : "Unavailable on this platform") : "Off"
         service = created
         try await refreshCountrySnapshot(created)
@@ -867,8 +1090,9 @@ public actor LiveClusterMethods {
 
     private func forwardSpotIfEnabled(_ spot: ClassifiedClusterSpot, generation: UUID) async {
         guard !terminated, forwardingAvailable, forwardClassifiedIngressSpots, let config = configuration else { return }
-        for (enabled, provider) in [(config.forwardSpotsToFlex, "direct_agent"), (config.forwardSpotsToTCI, "direct_tci")] where enabled {
+        for (enabled, provider) in [(config.forwardSpotsToFlex, Self.flexProvider), (config.forwardSpotsToTCI, "direct_tci")] where enabled {
             let key = "\(provider)|\(spot.id)"
+            if normalSpotQueue[key]?.manual == true { continue }
             normalSpotQueue[key] = PendingNormalSpot(spot: spot, generation: generation, provider: provider)
         }
         trimNormalSpotQueue()
@@ -876,10 +1100,16 @@ public actor LiveClusterMethods {
         normalSpotDrain = Task { [weak self] in await self?.drainNormalSpots() }
     }
 
+    static func isManualPushEligible(_ spot: ClassifiedClusterSpot, now: Date) -> Bool {
+        (100...60000).contains(spot.frequencyKHz) && !spot.mode.isEmpty
+            && (0...1800).contains(now.timeIntervalSince(spot.receivedAt))
+    }
+
     private func trimNormalSpotQueue() {
-        // Bound retained ingress during an outage. Newer spots take precedence.
+        // Bound automatic ingress during an outage without truncating an
+        // explicit replay (at most 500 spots per configured output).
         if normalSpotQueue.count > 256 {
-            for entry in normalSpotQueue.sorted(by: { $0.value.spot.receivedAt < $1.value.spot.receivedAt })
+            for entry in normalSpotQueue.filter({ !$0.value.manual }).sorted(by: { $0.value.spot.receivedAt < $1.value.spot.receivedAt })
                 .prefix(normalSpotQueue.count - 256) {
                 normalSpotQueue.removeValue(forKey: entry.key)
             }
@@ -889,13 +1119,19 @@ public actor LiveClusterMethods {
     private func drainNormalSpots() async {
         defer { normalSpotDrain = nil }
         while !terminated, !Task.isCancelled, !normalSpotQueue.isEmpty {
+            // TCP startup does not wait for the contact index. Keep its bounded
+            // spot queue pending until classifications are authoritative.
+            if contactRefreshState == "refreshing" || contactRefreshState == "stale" {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                continue
+            }
             let now = Date()
             let eligible = normalSpotQueue.filter {
-                now >= ($0.value.provider == "direct_agent" ? flexForwardRetryAfter : tciForwardRetryAfter)
+                now >= ($0.value.provider == Self.flexProvider ? flexForwardRetryAfter : tciForwardRetryAfter)
             }
             guard let entry = eligible.max(by: { $0.value.spot.receivedAt < $1.value.spot.receivedAt }) else {
                 let next = normalSpotQueue.values.map {
-                    $0.provider == "direct_agent" ? flexForwardRetryAfter : tciForwardRetryAfter
+                    $0.provider == Self.flexProvider ? flexForwardRetryAfter : tciForwardRetryAfter
                 }.min() ?? now
                 // A newly enabled/queued second provider should not inherit
                 // the first provider's full outage backoff.
@@ -904,28 +1140,36 @@ public actor LiveClusterMethods {
                 continue
             }
             normalSpotQueue.removeValue(forKey: entry.key)
-            let item = entry.value, spot = item.spot, provider = item.provider
+            let item = entry.value, provider = item.provider
+            guard let service else { continue }
+            let current = await service.forwardingSnapshot()
+            guard current.generation == item.generation,
+                  let spot = current.spots.first(where: { $0.id == item.spot.id }) else { continue }
+            if contactRefreshState == "refreshing" || contactRefreshState == "stale" {
+                normalSpotQueue[entry.key] = item
+                continue
+            }
             guard let config = configuration,
-                  provider == "direct_agent" ? config.forwardSpotsToFlex : config.forwardSpotsToTCI,
-                  let service, await service.isVisibleSpot(spot.id, in: item.generation),
+                  item.manual || (provider == Self.flexProvider ? config.forwardSpotsToFlex : config.forwardSpotsToTCI),
+                  await service.isVisibleSpot(spot.id, in: item.generation),
                   !terminated, !Task.isCancelled else { continue }
             // Recheck configuration after the actor suspension as well. A queued
             // retry must never escape an operator's forwarding-off decision.
             guard let latest = configuration,
-                  provider == "direct_agent" ? latest.forwardSpotsToFlex : latest.forwardSpotsToTCI else { continue }
+                  item.manual || (provider == Self.flexProvider ? latest.forwardSpotsToFlex : latest.forwardSpotsToTCI) else { continue }
             let frequencyHz = Int64((spot.frequencyKHz * 1_000).rounded())
             guard (100_000...60_000_000).contains(frequencyHz),
-                  abs(Date().timeIntervalSince(spot.receivedAt)) < 600 else { continue }
+                  item.manual ? Self.isManualPushEligible(spot, now: Date()) : abs(Date().timeIntervalSince(spot.receivedAt)) < 600 else { continue }
             let payload = ClusterRadioSpotPayload(frequencyHz: frequencyHz, callsign: spot.callsign,
                 mode: spot.mode, source: "xLog xCluster", spotter: spot.spotter, comment: spot.comment,
-                timestamp: Int64(spot.receivedAt.timeIntervalSince1970), lifetimeSeconds: 600,
+                timestamp: Int64((item.manual ? Date() : spot.receivedAt).timeIntervalSince1970), lifetimeSeconds: 600,
                 priority: 3, colorHex: radioSpotColor(for: spot))
             guard !payload.mode.isEmpty else { continue }
             do {
-                if try await spotForward(payload, provider, false) {
+                if try await spotForward(payload, provider, item.manual) {
                     forwardAcceptedCount += 1
-                    if provider == "direct_agent" {
-                        flexForwardStatus = "Accepted by Remote Station Agent; FLEX/Maestro display is not verified."
+                    if provider == Self.flexProvider {
+                        flexForwardStatus = "Accepted by \(Self.flexDestination); FLEX/Maestro display is not verified."
                     } else {
                         tciForwardStatus = "Sent through TCI; SunSDR display is not verified."
                     }
@@ -934,9 +1178,15 @@ public actor LiveClusterMethods {
                 guard !terminated, !Task.isCancelled else { return }
                 // Retain the failed spot and those arriving during backoff. A
                 // timer retries them even if the cluster sends no further lines.
+                if item.manual {
+                    let status = "Push to \(provider == Self.flexProvider ? "FLEX" : "TCI") failed: \(error.localizedDescription)"
+                    if provider == Self.flexProvider { flexForwardStatus = status } else { tciForwardStatus = status }
+                    normalSpotQueue = normalSpotQueue.filter { !$0.value.manual || $0.value.provider != provider }
+                    continue
+                }
                 normalSpotQueue[entry.key] = item
                 trimNormalSpotQueue()
-                if provider == "direct_agent" {
+                if provider == Self.flexProvider {
                     flexForwardStatus = "FLEX forwarding failed: \(error.localizedDescription). Retrying current visible spots."
                     flexForwardRetryAfter = Date().addingTimeInterval(normalSpotRetryDelay)
                 } else {
@@ -1094,7 +1344,7 @@ public actor LiveClusterMethods {
                                             publication: ContestRadioPublicationAccumulator,
                                             forceReplaceAll: Bool) async throws -> [String: Any] {
         let config = try currentConfiguration()
-        let enabledProviders = Set([(config.forwardSpotsToFlex, "direct_agent"),
+        let enabledProviders = Set([(config.forwardSpotsToFlex, Self.flexProvider),
                                     (config.forwardSpotsToTCI, "direct_tci")].filter(\.0).map(\.1))
         let now = contestRadioClock(), bandSet = Set(publication.configuredBands), modeSet = Set(publication.allowedModeGroups)
         var desired: [String: ContestForwardedRadioSpot] = [:]
@@ -1171,7 +1421,7 @@ public actor LiveClusterMethods {
                 } else { rejected += 1 }
             } catch {
                 rejected += 1
-                if provider == "direct_agent" {
+                if provider == Self.flexProvider {
                     flexForwardStatus = "FLEX contest spot removal failed; check the Radio spots diagnostics."
                 } else {
                     tciForwardStatus = "TCI contest spot removal failed; check the Radio spots diagnostics."
@@ -1205,7 +1455,7 @@ public actor LiveClusterMethods {
                 } else { rejected += 1 }
             } catch {
                 rejected += 1
-                if provider == "direct_agent" {
+                if provider == Self.flexProvider {
                     flexForwardStatus = "FLEX contest spot forwarding failed; check the Radio spots diagnostics."
                 } else {
                     tciForwardStatus = "TCI contest spot forwarding failed; check the Radio spots diagnostics."
@@ -1213,8 +1463,8 @@ public actor LiveClusterMethods {
             }
         }
         if accepted > 0 {
-            if enabledProviders.contains("direct_agent") {
-                flexForwardStatus = "Contest spots accepted by Remote Station Agent; FLEX/Maestro display is not verified."
+            if enabledProviders.contains(Self.flexProvider) {
+                flexForwardStatus = "Contest spots accepted by \(Self.flexDestination); FLEX/Maestro display is not verified."
             }
             if enabledProviders.contains("direct_tci") {
                 tciForwardStatus = "Contest spots sent through TCI; SunSDR display is not verified."

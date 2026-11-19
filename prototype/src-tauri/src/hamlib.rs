@@ -1771,6 +1771,16 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The client has closed the connection: a clean end of stream, or (on
+    /// Windows) a reset because it closed with response bytes still unread.
+    fn assert_client_closed<R: std::io::BufRead>(reader: &mut R, line: &mut String) {
+        line.clear();
+        match reader.read_line(line) {
+            Ok(0) => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
+            other => panic!("expected the client to close, got {other:?} after {line:?}"),
+        }
+    }
     use std::io::Cursor;
 
     #[test]
@@ -2055,7 +2065,7 @@ mod tests {
                     socket.write_all(response.as_bytes()).unwrap();
                 }
                 let mut line = String::new();
-                assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                assert_client_closed(&mut reader, &mut line);
             });
             let (reader, writer) = connect_stream(address).unwrap();
             let mut session = Session::new(
@@ -2148,7 +2158,7 @@ mod tests {
                     }
                 }
                 line.clear();
-                assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                assert_client_closed(&mut reader, &mut line);
             });
             let (reader, writer) = connect_stream(address).unwrap();
             let mut session = Session::new(reader, writer, None, "external", address.port(), None, false, 1);
@@ -2176,7 +2186,7 @@ mod tests {
                 socket.write_all(response.as_bytes()).unwrap();
             }
             let mut line = String::new();
-            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+            assert_client_closed(&mut reader, &mut line);
         });
         let (reader, writer) = connect_stream(address).unwrap();
         let mut session = Session::new(reader, writer, None, "external", address.port(), None, false, 1);
@@ -2214,7 +2224,7 @@ mod tests {
                     exchange("+s\n", "get_split_vfo:\nSplit: 1\nTX VFO: VFOB\nRPRT 0\n");
                 }
                 let mut line = String::new();
-                assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                assert_client_closed(&mut reader, &mut line);
             });
             let (reader, writer) = connect_stream(address).unwrap();
             let mut session = Session::new(reader, writer, None, "external", address.port(), None, false, 1);
@@ -2300,7 +2310,7 @@ mod tests {
                 socket.write_all(response.as_bytes()).unwrap();
             }
             let mut line = String::new();
-            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+            assert_client_closed(&mut reader, &mut line);
         });
         let (reader, writer) = connect_stream(address).unwrap();
         let mut session = Session::new(reader, writer, None, "external", address.port(), None, true, 1);

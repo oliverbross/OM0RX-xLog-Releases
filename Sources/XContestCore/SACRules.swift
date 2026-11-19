@@ -119,7 +119,9 @@ private func evaluateSAC(_ qso: ContestQSO, in session: ContestSessionSnapshot,
     }
 
     let multipliers: Set<ContestMultiplierKey>
-    if ownIsScandinavian {
+    if ownIsScandinavian && !workedIsScandinavian {
+        // Scandinavian stations count only contacts outside Scandinavia, so a
+        // Scandinavian-to-Scandinavian QSO earns neither points nor a multiplier.
         multipliers = [.init(kind: "country-prefix", value: worked.countryPrefix, scope: qso.band)]
     } else if workedIsScandinavian, let callArea {
         multipliers = [.init(kind: "scandinavian-call-area",

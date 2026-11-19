@@ -521,7 +521,7 @@ fn snapshot() -> Result<Value, String> {
         .lock()
         .map_err(|_| "Native voice state unavailable")?;
     Ok(
-        json!({"nativeAvailable":cfg!(target_os="macos"),"job":s.job.as_ref().map(|j|json!({"actionID":j.id,"kind":j.kind,"phase":j.phase,"consumedFrames":j.consumed,"totalFrames":j.total})),"last":s.last}),
+        json!({"nativeAvailable":cfg!(any(target_os="macos",windows)),"job":s.job.as_ref().map(|j|json!({"actionID":j.id,"kind":j.kind,"phase":j.phase,"consumedFrames":j.consumed,"totalFrames":j.total})),"last":s.last}),
     )
 }
 fn wait_on(app: &tauri::AppHandle, id: &str, cancel: &AtomicBool) -> Result<(), String> {
@@ -674,7 +674,7 @@ pub fn native_request(
     }
     match request {
         NativeRequest::Capabilities => Ok(
-            json!({"nativeAvailable":cfg!(target_os="macos"),"backend":if cfg!(target_os="macos"){"CPAL/CoreAudio"}else{"legacy contest WebView; native routes unavailable"}}),
+            json!({"nativeAvailable":cfg!(any(target_os="macos",windows)),"backend":if cfg!(target_os="macos"){"CPAL/CoreAudio"}else if cfg!(windows){"CPAL/WASAPI"}else{"legacy contest WebView; native routes unavailable"}}),
         ),
         NativeRequest::Snapshot => {
             let (_, saved, profile) = settings()?;

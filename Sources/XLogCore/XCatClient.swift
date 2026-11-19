@@ -1,4 +1,8 @@
+#if os(Windows)
+import CClusterSocket
+#else
 import Darwin
+#endif
 import Foundation
 
 public struct RadioSnapshot: Equatable, Sendable {
@@ -207,6 +211,39 @@ public actor XCatClient {
     }
 
     private func command(_ command: String, timeoutSeconds: Int = 2) throws -> String {
+        #if os(Windows)
+        guard host == "127.0.0.1" else { throw XCatClientError.invalidHost }
+        let timeout = Int32(timeoutSeconds * 1000)
+        guard let socket = xlog_socket_connect(host, port, timeout, nil) else {
+            throw XCatClientError.connect("Loopback listener unavailable")
+        }
+        defer { xlog_socket_close(socket) }
+        let deadline = ContinuousClock.now + .seconds(timeoutSeconds)
+        let payload = Data((command + "\n").utf8)
+        var offset = 0
+        while offset < payload.count {
+            guard ContinuousClock.now < deadline else { throw XCatClientError.timeout }
+            let count = payload.withUnsafeBytes {
+                xlog_socket_write(socket, $0.baseAddress!.advanced(by: offset), Int32(payload.count - offset))
+            }
+            if count == -2 { Thread.sleep(forTimeInterval: 0.005); continue }
+            guard count > 0 else { throw XCatClientError.write }
+            offset += Int(count)
+        }
+        var reply = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while ContinuousClock.now < deadline {
+            let count = buffer.withUnsafeMutableBytes { xlog_socket_read(socket, $0.baseAddress, Int32($0.count), 100) }
+            if count == -2 { continue }
+            guard count > 0 else { throw XCatClientError.read }
+            reply.append(contentsOf: buffer.prefix(Int(count)))
+            guard reply.count <= 65_536 else { throw XCatClientError.invalidResponse }
+            if let newline = reply.firstIndex(of: 10) {
+                return String(decoding: reply[..<newline], as: UTF8.self)
+            }
+        }
+        throw XCatClientError.timeout
+        #else
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw XCatClientError.connect(String(cString: strerror(errno))) }
         defer { close(descriptor) }
@@ -232,6 +269,7 @@ public actor XCatClient {
         if count < 0, errno == EAGAIN || errno == EWOULDBLOCK { throw XCatClientError.timeout }
         guard count > 0 else { throw XCatClientError.read }
         return String(decoding: bytes.prefix(count), as: UTF8.self)
+        #endif
     }
 
     private func normalizedMode(_ response: String) -> String {

@@ -285,6 +285,64 @@ public final class LogbookDatabase: @unchecked Sendable {
         }
     }
 
+    public func companionReceipt(operationID: UUID) throws -> CompanionContactReceipt? {
+        try withDatabaseLock {
+            try withStatement("SELECT payload FROM xlog_companion_receipts WHERE operation_id=?;") { statement in
+                bind(operationID.uuidString.lowercased(), to: 1, in: statement)
+                let step = sqlite3_step(statement)
+                if step == SQLITE_DONE { return nil }
+                guard step == SQLITE_ROW, let bytes = sqlite3_column_blob(statement, 0) else { throw error() }
+                return try decoder.decode(CompanionContactReceipt.self,
+                    from: Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+            }
+        }
+    }
+
+    /// Create/update and its receipt commit atomically. Reopening after a lost
+    /// response returns the original receipt without writing or enrolling again.
+    public func applyCompanionContact(operationID: UUID, draft: CompanionQSO,
+                                      expectedRevision: Int64? = nil,
+                                      initial: QSO? = nil,
+                                      beforeCommit: (() throws -> Void)? = nil) throws -> CompanionContactReceipt {
+        try draft.validate()
+        return try withDatabaseLock {
+            try execute("BEGIN IMMEDIATE;")
+            do {
+                if let receipt = try companionReceipt(operationID: operationID) {
+                    guard receipt.draft == draft, receipt.expectedRevision == expectedRevision else { throw LogbookContactError.operationReused }
+                    try execute("COMMIT;"); return receipt
+                }
+                let current = try contactSnapshot(localID: draft.contact_id)
+                if let expectedRevision {
+                    guard expectedRevision > 0, let current, current.revision == expectedRevision,
+                          current.qso.deletedAt == nil else { throw LogbookContactError.conflict(current) }
+                    // The companion's minimal draft cannot review retained
+                    // entity, award or confirmation evidence when identity
+                    // changes. Those material edits belong in xLog's editor.
+                    guard current.qso.call.uppercased() == draft.callsign,
+                          current.qso.band.lowercased() == draft.band.lowercased(),
+                          current.qso.mode.uppercased() == draft.mode else { throw LogbookContactError.invalid }
+                } else if current != nil { throw LogbookContactError.conflict(current) }
+                let qso = draft.applying(to: current?.qso ?? initial)
+                if current == nil { try qso.validateOperatorDraft(forSave: true) }
+                if let current, LogbookContactUpdateReview.admissionFailure(current: current, proposed: qso) != nil { throw LogbookContactError.invalid }
+                try save(qso, markDirty: true, onlineLogCandidate: current == nil)
+                guard let contact = try contactSnapshot(localID: draft.contact_id),
+                      contact.revision == (current?.revision ?? 0) + 1 else { throw LogbookDatabaseError.corruptRecord }
+                let receipt = CompanionContactReceipt(operationID: operationID, draft: draft,
+                    expectedRevision: expectedRevision, contact: contact)
+                let payload = try encoder.encode(receipt)
+                try withStatement("INSERT INTO xlog_companion_receipts(operation_id,payload) VALUES(?,?);") { statement in
+                    bind(operationID.uuidString.lowercased(), to: 1, in: statement)
+                    _ = payload.withUnsafeBytes { sqlite3_bind_blob(statement, 2, $0.baseAddress, Int32($0.count), Self.transient) }
+                    try stepDone(statement)
+                }
+                try beforeCommit?()
+                try execute("COMMIT;"); return receipt
+            } catch { try? execute("ROLLBACK;"); throw error }
+        }
+    }
+
     /// Stores the exact source snapshot before any normal-log insertion. Preparing
     /// the same source revision and digest is idempotent even across app restarts.
     public func prepareContestLogTransfer(_ proposed: ContestLogTransferManifest) throws
@@ -818,6 +876,105 @@ public final class LogbookDatabase: @unchecked Sendable {
                 return LogbookContactSnapshot(revision: sqlite3_column_int64(statement, 1), qso: qso)
             }
         }
+    }
+
+    /// Selected normal-log UUID only, bounded before JSON decoding, on the already
+    /// opened owner. No migrations, provider access, receipt enrollment or writes.
+    public func companionContactDetail(localID: UUID) throws -> CompanionContactDetailRead {
+        try withDatabaseLock {
+            guard let handle else { throw LogbookDatabaseError.closed }
+            guard sqlite3_get_autocommit(handle) != 0 else { throw LogbookDatabaseError.syncBusy }
+            let identity = try currentAggregateFileIdentity()
+            return try withDatabaseReadSnapshot {
+                let revision = try qsoRevision()
+                let result = try withStatement("""
+                    SELECT q.record_json, COALESCE(r.revision,0), q.deleted_at
+                    FROM qsos q LEFT JOIN xlog_contact_revisions r ON r.local_id=q.local_id
+                    WHERE q.local_id=?;
+                    """) { statement -> CompanionContactDetailRead in
+                    bind(localID.uuidString, to: 1, in: statement)
+                    let step = sqlite3_step(statement)
+                    if step == SQLITE_DONE {
+                        return .init(contactID: localID, logRevision: revision, contactRevision: nil,
+                                     status: .not_found, reason: nil, snapshot: nil)
+                    }
+                    guard step == SQLITE_ROW else { throw error() }
+                    let contactRevision = sqlite3_column_int64(statement, 1)
+                    if sqlite3_column_type(statement, 2) != SQLITE_NULL {
+                        return .init(contactID: localID, logRevision: revision, contactRevision: contactRevision,
+                                     status: .deleted, reason: nil, snapshot: nil)
+                    }
+                    let size = Int(sqlite3_column_bytes(statement, 0))
+                    guard size <= 1024 * 1024 else {
+                        return .init(contactID: localID, logRevision: revision, contactRevision: contactRevision,
+                                     status: .unavailable, reason: "record_too_large", snapshot: nil)
+                    }
+                    guard size > 0, let bytes = sqlite3_column_blob(statement, 0) else { throw LogbookDatabaseError.corruptRecord }
+                    let data = Data(bytes: bytes, count: size)
+                    guard let qso = try? decoder.decode(QSO.self, from: data), qso.id == localID, qso.deletedAt == nil else {
+                        return .init(contactID: localID, logRevision: revision, contactRevision: contactRevision,
+                                     status: .unavailable, reason: "invalid_record", snapshot: nil)
+                    }
+                    // Retain actual stored values. Do not synthesize fresh callbook
+                    // facts or overwrite missing fields with current station defaults.
+                    return .init(contactID: localID, logRevision: revision, contactRevision: contactRevision,
+                        status: .found, reason: nil, snapshot: .init(revision: contactRevision, qso: qso.backfillingADIFFields()))
+                }
+                guard try currentAggregateFileIdentity() == identity else { throw LogbookDatabaseError.syncBusy }
+                return result
+            }
+        }
+    }
+
+    /// Latest row for the exact operating callsign only. A missing grid on that
+    /// row never causes a scan through older operating locations. No base-call
+    /// matching, database open, provider lookup or write is performed here.
+    public func companionBearingGrid(call: String) throws -> CompanionBearingGridRead {
+        guard let normalized = CompanionBearing.normalizedCall(call) else { throw CompanionBearingError.invalidCall }
+        guard lock.try() else { throw LogbookDatabaseError.syncBusy }
+        defer { lock.unlock() }
+        guard let handle else { throw LogbookDatabaseError.closed }
+        guard sqlite3_get_autocommit(handle) != 0 else { throw LogbookDatabaseError.syncBusy }
+        let identity = try currentAggregateFileIdentity()
+        return try withDatabaseReadSnapshot {
+            let revision = try qsoRevision()
+            let result = try withStatement("""
+                SELECT q.local_id, q.record_json, COALESCE(r.revision,0)
+                FROM qsos q LEFT JOIN xlog_contact_revisions r ON r.local_id=q.local_id
+                WHERE q.deleted_at IS NULL AND q.call = ? COLLATE NOCASE
+                ORDER BY q.qso_start DESC, q.local_id ASC LIMIT 1;
+                """) { statement -> CompanionBearingGridRead in
+                bind(normalized, to: 1, in: statement)
+                let step = sqlite3_step(statement)
+                if step == SQLITE_DONE { return .init(logRevision: revision, contact: nil) }
+                guard step == SQLITE_ROW else { throw error() }
+                let bytes = Int(sqlite3_column_bytes(statement, 1))
+                guard bytes <= 1024 * 1024 else {
+                    return .init(logRevision: revision, contact: nil, unavailableReason: "record_too_large")
+                }
+                guard bytes > 0, let data = sqlite3_column_blob(statement, 1),
+                      let idText = sqlite3_column_text(statement, 0),
+                      let id = UUID(uuidString: String(cString: idText)),
+                      let qso = try? decoder.decode(QSO.self, from: Data(bytes: data, count: bytes)),
+                      qso.id == id, qso.deletedAt == nil,
+                      CompanionBearing.normalizedCall(qso.call) == normalized else {
+                    return .init(logRevision: revision, contact: nil, unavailableReason: "invalid_record")
+                }
+                return .init(logRevision: revision, contact: .init(id: id,
+                    revision: sqlite3_column_int64(statement, 2), call: qso.call,
+                    grid: qso.gridSquare, startedAt: qso.start))
+            }
+            guard try currentAggregateFileIdentity() == identity else { throw LogbookDatabaseError.syncBusy }
+            return result
+        }
+    }
+
+    /// The bearing publisher must not wait behind a background database writer
+    /// while checking the file/revision captured around its passive read.
+    public func companionBearingAuthority() throws -> LogbookAggregateAuthority {
+        guard lock.try() else { throw LogbookDatabaseError.syncBusy }
+        defer { lock.unlock() }
+        return try aggregateReadAuthority()
     }
 
     /// One bounded local read. Historical delivery remains visible after an edit,
@@ -2462,6 +2619,76 @@ public final class LogbookDatabase: @unchecked Sendable {
         }
     }
 
+    /// Groups of live contacts with the same call, start second, band and mode:
+    /// exact duplicates, newest first. Read-only; at most `limit` groups.
+    public struct DuplicateGroup: Sendable, Equatable {
+        public let call: String
+        public let start: Double
+        public let band: String
+        public let mode: String
+        public let contactIDs: [UUID]
+    }
+    public func exactDuplicateGroups(limit: Int = 200) throws -> [DuplicateGroup] {
+        try withDatabaseLock {
+            let sql = """
+                SELECT upper(call), CAST(qso_start AS INTEGER), upper(band), upper(mode), group_concat(local_id, ',')
+                FROM qsos WHERE deleted_at IS NULL
+                GROUP BY upper(call), CAST(qso_start AS INTEGER), upper(band), upper(mode)
+                HAVING count(*) > 1 ORDER BY CAST(qso_start AS INTEGER) DESC LIMIT ?;
+                """
+            return try withStatement(sql) { statement in
+                sqlite3_bind_int(statement, 1, Int32(clamping: max(1, min(limit, 1_000))))
+                var groups: [DuplicateGroup] = []
+                var step = sqlite3_step(statement)
+                while step == SQLITE_ROW {
+                    func text(_ column: Int32) -> String {
+                        sqlite3_column_text(statement, column).map { String(cString: $0) } ?? ""
+                    }
+                    let ids = text(4).split(separator: ",").compactMap { UUID(uuidString: String($0)) }
+                    groups.append(DuplicateGroup(call: text(0), start: sqlite3_column_double(statement, 1),
+                                                 band: text(2), mode: text(3), contactIDs: ids))
+                    step = sqlite3_step(statement)
+                }
+                guard step == SQLITE_DONE else { throw error() }
+                return groups
+            }
+        }
+    }
+
+    /// The stored record of every contact a query selects, in export order
+    /// (newest first, then identity), copied without decoding. A paged export
+    /// freezes these bytes once, in one statement, and decodes one page at a
+    /// time, so a large logbook is never decoded in a single pass while its
+    /// content still cannot change under the export.
+    public func exportContactRecords(search: String = "", query: LogbookQuery, at now: Date = Date()) throws -> [Data] {
+        try withDatabaseLock {
+            let predicate = try query.compile(search: search, at: now)
+            let sql = "SELECT record_json FROM qsos WHERE \(predicate.sql) ORDER BY qso_start DESC, local_id ASC;"
+            return try withStatement(sql) { statement in
+                bindQuery(predicate, in: statement)
+                var records: [Data] = []
+                var step = sqlite3_step(statement)
+                while step == SQLITE_ROW {
+                    guard let bytes = sqlite3_column_blob(statement, 0) else { throw LogbookDatabaseError.corruptRecord }
+                    records.append(Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+                    step = sqlite3_step(statement)
+                }
+                guard step == SQLITE_DONE else { throw error() }
+                return records
+            }
+        }
+    }
+
+    /// Freezes already-decoded contacts in the stored record form.
+    public func encodeExportRecords(_ contacts: [QSO]) throws -> [Data] {
+        try contacts.map { try encoder.encode($0) }
+    }
+
+    /// Decodes records frozen by `exportContactRecords`.
+    public func decodeExportRecords<Records: Sequence>(_ records: Records) throws -> [QSO] where Records.Element == Data {
+        try records.map { try decoder.decode(QSO.self, from: $0) }
+    }
+
     /// One SQLite read statement gives consumers a consistent contact view even
     /// while another connection appends to the logbook.
     public func fetchAll() throws -> [QSO] {
@@ -3001,6 +3228,36 @@ public final class LogbookDatabase: @unchecked Sendable {
         }
     }
 
+    /// Passive companion projection pinned to one committed WAL read snapshot.
+    /// No cache persistence, outbox preparation, station polling or contact writes.
+    public func companionLogbookRead(call: String? = nil) throws -> CompanionLogbookRead {
+        try withDatabaseLock {
+            guard let handle else { throw LogbookDatabaseError.closed }
+            guard sqlite3_get_autocommit(handle) != 0 else { throw LogbookDatabaseError.syncBusy }
+            _ = try currentAggregateFileIdentity()
+            return try withDatabaseReadSnapshot {
+                let revision = try qsoRevision()
+                let rows = try call.map { try historyRows(call: $0, adif: nil) } ?? []
+                let ordered = rows.sorted {
+                    $0.start == $1.start ? $0.id.uuidString < $1.id.uuidString : $0.start > $1.start
+                }
+                func snapshots(_ ids: [UUID]) throws -> [LogbookContactSnapshot] {
+                    try ids.map { id in
+                        guard let current = try contactSnapshot(localID: id), current.qso.deletedAt == nil else {
+                            throw LogbookDatabaseError.corruptRecord
+                        }
+                        return current
+                    }
+                }
+                let result = CompanionLogbookRead(revision: revision, historyRows: ordered,
+                    historyContacts: try snapshots(ordered.prefix(25).map(\.id)),
+                    recentContacts: try snapshots(fetch(limit: 5).map(\.id)), logbookCount: try count())
+                _ = try currentAggregateFileIdentity()
+                return result
+            }
+        }
+    }
+
     public func previous(call: String, limit: Int = 20) throws -> [QSO] {
         let base = NormalLogCallsignIdentity.base(call), prefix = normalLogCallPrefix(NormalLogCallsignIdentity.base(call))
         return try withDatabaseLock {
@@ -3454,19 +3711,50 @@ public final class LogbookDatabase: @unchecked Sendable {
             "myCall","myGrid","stationLocation","iota","potaReference","sotaReference","wwffReference","qslReceived","lotwReceived","extraFields","sig","sigInfo","operatorCall","propagationMode"]
         let columns = "json_extract(record_json," + fields.map { "'$.\($0)'" }.joined(separator: ",") + ")"
         let predicate = try query.compile(search: search, at: date)
-        return try withStatement("SELECT \(columns), CASE WHEN instr(record_json,'\\u0000')>0 THEN record_json END FROM qsos WHERE \(predicate.sql) ORDER BY qso_start DESC,local_id ASC;") { statement in
+        return try withStatement("SELECT \(columns), json_valid(record_json), json_extract(record_json,'$.start'), CASE WHEN instr(record_json,'\\u0000')>0 THEN record_json END FROM qsos WHERE \(predicate.sql) ORDER BY qso_start DESC,local_id ASC;") { statement in
             bindQuery(predicate, in: statement)
-            var values: [AwardEvidenceContact] = []
+            var values: [AwardEvidenceContact] = [], batch = Data("[".utf8), starts: [Double] = []
+            var batches: [Data] = [], batchCount = 0
+            // Amortize Foundation's JSON parser setup across a bounded batch.
+            // Do not retain the complete log as a second JSON buffer.
+            func flush() throws {
+                guard !starts.isEmpty else { return }
+                try aggregateReadCancellation?.check()
+                if batchCount > 0 { batch.append(93);batches.append(batch) }
+                let rows=try AwardEvidenceBatchDecoder.decode(batches)
+                guard rows.count == starts.count else { throw LogbookDatabaseError.corruptRecord }
+                for (index,row) in rows.enumerated() {
+                    var contact=row.contact
+                    // SQLite's JSON-array text may round fractional seconds.
+                    contact.start=Date(timeIntervalSinceReferenceDate:starts[index])
+                    values.append(contact)
+                }
+                batch=Data("[".utf8);starts.removeAll(keepingCapacity:true)
+                batches.removeAll(keepingCapacity:true);batchCount=0
+            }
             var step = sqlite3_step(statement)
             while step == SQLITE_ROW {
                 try aggregateReadCancellation?.check()
-                let fallback = sqlite3_column_type(statement,1) != SQLITE_NULL
-                let column: Int32 = fallback ? 1 : 0
-                guard let bytes=sqlite3_column_blob(statement,column) else { throw LogbookDatabaseError.corruptRecord }
-                let data=Data(bytes:bytes,count:Int(sqlite3_column_bytes(statement,column)))
-                values.append(fallback ? try decoder.decode(AwardEvidenceContact.self,from:data) : try decoder.decode(AwardEvidenceSQLRow.self,from:data).contact)
+                guard sqlite3_column_int(statement,1) == 1 else { throw LogbookDatabaseError.corruptRecord }
+                if sqlite3_column_type(statement,3) != SQLITE_NULL {
+                    try flush()
+                    guard let bytes=sqlite3_column_blob(statement,3) else { throw LogbookDatabaseError.corruptRecord }
+                    values.append(try decoder.decode(AwardEvidenceContact.self,from:Data(bytes:bytes,count:Int(sqlite3_column_bytes(statement,3)))))
+                } else {
+                    guard sqlite3_column_type(statement,0) == SQLITE_TEXT, let bytes=sqlite3_column_blob(statement,0),
+                          [SQLITE_INTEGER,SQLITE_FLOAT].contains(sqlite3_column_type(statement,2)) else { throw LogbookDatabaseError.corruptRecord }
+                    let start=sqlite3_column_double(statement,2)
+                    guard start.isFinite else { throw LogbookDatabaseError.corruptRecord }
+                    if batchCount > 0 { batch.append(44) }
+                    batch.append(bytes.assumingMemoryBound(to:UInt8.self),count:Int(sqlite3_column_bytes(statement,0)))
+                    starts.append(start)
+                    batchCount += 1
+                    if batchCount == 128 { batch.append(93);batches.append(batch);batch=Data("[".utf8);batchCount=0 }
+                    if batches.count == 4 { try flush() }
+                }
                 step=sqlite3_step(statement)
             }
+            try flush()
             guard step == SQLITE_DONE else { throw error() }
             return values
         }
@@ -3815,7 +4103,7 @@ public final class LogbookDatabase: @unchecked Sendable {
 
     /// A remote acknowledgement covers only the submitted snapshot. Logging
     /// remains available during a request; newer edits/deletes stay queued.
-    public func acknowledgeSynced(_ submitted: QSO, wavelogID: Int? = nil) throws {
+    public func acknowledgeSynced(_ submitted: QSO, wavelogID: Int? = nil, createdResponse: WavelogQSO? = nil) throws {
         try withDatabaseLock {
             try execute("BEGIN IMMEDIATE;")
             do {
@@ -3823,6 +4111,20 @@ public final class LogbookDatabase: @unchecked Sendable {
                     let changed = current != submitted
                     var baseline = submitted
                     if let wavelogID { baseline.wavelogID = wavelogID; current.wavelogID = wavelogID }
+                    // Wavelog can infer zones during creation. Those returned
+                    // defaults are the acknowledged remote state, not a later
+                    // competing edit. Preserve any operator edit made in flight.
+                    if let createdResponse, createdResponse.id == wavelogID {
+                        for (field, returned) in [(\QSO.cqZone, createdResponse.cqZone),
+                                                  (\QSO.ituZone, createdResponse.ituZone)] {
+                            if submitted[keyPath: field].isEmpty, let returned, !returned.isEmpty {
+                                baseline[keyPath: field] = returned
+                                if current[keyPath: field] == submitted[keyPath: field] {
+                                    current[keyPath: field] = returned
+                                }
+                            }
+                        }
+                    }
                     // An undo that raced a successful remote delete must create
                     // a new remote record, rather than update the deleted ID.
                     if changed, submitted.deletedAt != nil { current.wavelogID = nil }
@@ -4514,6 +4816,10 @@ public final class LogbookDatabase: @unchecked Sendable {
           INSERT INTO xlog_contact_revisions(local_id,revision) VALUES(OLD.local_id,1)
           ON CONFLICT(local_id) DO UPDATE SET revision=revision+1;
         END;
+        CREATE TABLE IF NOT EXISTS xlog_companion_receipts(
+          operation_id TEXT PRIMARY KEY,
+          payload BLOB NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS xlog_contact_receipts(
           operation_id TEXT PRIMARY KEY,
           payload BLOB NOT NULL
@@ -4890,7 +5196,7 @@ public final class LogbookDatabase: @unchecked Sendable {
 private struct SyncedQSOState: Codable, Equatable {
     let wavelogID: Int?
     let call: String
-    let start: Date
+    var start: Date
     let band: String
     let mode: String
     let submode: String
@@ -4912,7 +5218,7 @@ private struct SyncedQSOState: Codable, Equatable {
     let wwffReference: String
     let comment: String
     let notes: String
-    let stationProfileID: Int?
+    var stationProfileID: Int?
     let txPower: String
     let propagationMode: String
     let satelliteName: String?
@@ -4958,9 +5264,17 @@ private struct SyncedQSOState: Codable, Equatable {
     }
 
     func matches(_ other: Self) -> Bool {
-        guard gridSquare.uppercased() == other.gridSquare.uppercased() else { return false }
+        // ADIF/Wavelog carries whole seconds, while a newly logged contact can
+        // retain subseconds. Compare the wire value, including older baselines.
+        guard floor(start.timeIntervalSince1970) == floor(other.start.timeIntervalSince1970),
+              gridSquare.uppercased() == other.gridSquare.uppercased() else { return false }
         var normalized = self
+        normalized.start = other.start
         normalized.gridSquare = other.gridSquare
+        // A locally created baseline may predate Wavelog's profile assignment.
+        // Unknown is not a competing edit; known profile changes still differ.
+        // SyncEngine separately verifies the configured station before writes.
+        if stationProfileID == nil { normalized.stationProfileID = other.stationProfileID }
         return normalized == other
     }
 }

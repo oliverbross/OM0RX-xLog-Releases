@@ -130,8 +130,9 @@ async fn choose_legacy_file(window: tauri::WebviewWindow, archive: bool) -> Resu
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn choose_legacy_file(_window: tauri::WebviewWindow, archive: bool) -> Result<Option<PathBuf>, String> {
+async fn choose_legacy_file(window: tauri::WebviewWindow, archive: bool) -> Result<Option<PathBuf>, String> {
     tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new()
+        .set_parent(&window)
         .set_title(if archive {"Inspect immutable submission ZIP"}else{"Choose a legacy Not1MM SQLite database"})
         .add_filter("Contest source", if archive {&["zip"]}else{&["sqlite", "sqlite3", "db"]})
         .set_can_create_directories(false).pick_file()).await

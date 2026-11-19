@@ -28,25 +28,31 @@ fn validate_export(label: &str, filename: &str, content: &str) -> Result<&'stati
     Ok(extension)
 }
 
-fn validate_logbook_export(label: &str, filename: &str, content: &str) -> Result<&'static str, String> {
+/// The owner window and suggested filename of a Logbook ADIF export, shared by
+/// the single-call save and the chunked export stream.
+pub(crate) fn validate_logbook_target(label: &str, filename: &str) -> Result<&'static str, String> {
     if !matches!(label, "main" | "logbook") { return Err("Only the integrated Logbook can export ADIF files.".into()); }
     if filename.is_empty() || filename.len() > 128
         || !filename.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')) {
         return Err("Use a simple ADI or ADX filename.".into());
     }
-    let extension = match Path::new(filename).extension().and_then(|value| value.to_str()) {
-        Some("adi") => "adi", Some("adx") => "adx",
-        _ => return Err("Logbook exports must be ADI or ADX files.".into()),
-    };
+    match Path::new(filename).extension().and_then(|value| value.to_str()) {
+        Some("adi") => Ok("adi"), Some("adx") => Ok("adx"),
+        _ => Err("Logbook exports must be ADI or ADX files.".into()),
+    }
+}
+
+fn validate_logbook_export(label: &str, filename: &str, content: &str) -> Result<&'static str, String> {
+    let extension = validate_logbook_target(label, filename)?;
     if content.is_empty() || content.len() > MAX_LOGBOOK_EXPORT_BYTES || content.contains('\0') {
         return Err("The Logbook export must contain between 1 byte and 32 MiB of text.".into());
     }
     Ok(extension)
 }
 
-struct ExportLease;
+pub(crate) struct ExportLease;
 impl ExportLease {
-    fn acquire() -> Result<Self, String> {
+    pub(crate) fn acquire() -> Result<Self, String> {
         EXPORT_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self).map_err(|_| "An export is already open.".to_string())
     }
@@ -55,17 +61,23 @@ impl Drop for ExportLease {
     fn drop(&mut self) { EXPORT_PENDING.store(false, Ordering::Release); }
 }
 
-fn save_export(path: Option<PathBuf>, extension: &str, content: &str) -> Result<Value, String> {
-    use std::io::Write;
-    let Some(path) = path else { return Ok(json!({"saved":false,"cancelled":true})); };
+/// A chosen destination must carry the export's extension and be a regular
+/// file or not exist yet; folders and links are never written through.
+pub(crate) fn check_destination(path: &Path, extension: &str) -> Result<(), String> {
     if !path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case(extension)) {
         return Err(format!("Choose a .{extension} file for this export."));
     }
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if !metadata.file_type().is_file() => return Err("Choose a regular export file, not a folder or link.".into()),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err("The selected export destination is unavailable.".into()),
-        _ => {}
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err("Choose a regular export file, not a folder or link.".into()),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err("The selected export destination is unavailable.".into()),
+        _ => Ok(()),
     }
+}
+
+fn save_export(path: Option<PathBuf>, extension: &str, content: &str) -> Result<Value, String> {
+    use std::io::Write;
+    let Some(path) = path else { return Ok(json!({"saved":false,"cancelled":true})); };
+    check_destination(&path, extension)?;
     let write = || -> Result<(), Box<dyn std::error::Error>> {
         let mut temporary = tempfile::NamedTempFile::new_in(path.parent().ok_or("Missing export directory")?)?;
         temporary.write_all(content.as_bytes())?;
@@ -78,7 +90,7 @@ fn save_export(path: Option<PathBuf>, extension: &str, content: &str) -> Result<
 }
 
 #[cfg(target_os = "macos")]
-async fn choose_export(window: tauri::WebviewWindow, filename: String, _extension: &str, purpose: &'static str) -> Result<Option<PathBuf>, String> {
+pub(crate) async fn choose_export(window: tauri::WebviewWindow, filename: String, _extension: &str, purpose: &'static str) -> Result<Option<PathBuf>, String> {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSModalResponseOK, NSSavePanel};
     use objc2_foundation::NSString;
@@ -101,9 +113,12 @@ async fn choose_export(window: tauri::WebviewWindow, filename: String, _extensio
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn choose_export(_window: tauri::WebviewWindow, filename: String, extension: &str, purpose: &'static str) -> Result<Option<PathBuf>, String> {
+pub(crate) async fn choose_export(window: tauri::WebviewWindow, filename: String, extension: &str, purpose: &'static str) -> Result<Option<PathBuf>, String> {
     let extension = extension.to_owned();
+    // Owned by the requesting window, the chooser opens in front of it and stays
+    // there; an unowned chooser could open behind xLog and Nexus.
     tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new()
+        .set_parent(&window)
         .set_title(purpose).set_file_name(filename)
         .add_filter("Export file", &[extension]).save_file())
         .await.map_err(|_| "Export chooser is unavailable.".to_string())

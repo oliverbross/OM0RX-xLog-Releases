@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { ContestRequest } from "./types";
 import type { StrategyMutation, StrategyScope } from "./ContestReminders";
@@ -205,7 +206,7 @@ export function ContestQTC({ scope, request, disabled, opportunityIntent, onMuta
     </aside>}
     <button type="button" onClick={() => { void run(async () => { await persist(); onEntry(); }); }}>Return to Entry</button>
     {onStop && <button type="button" onClick={() => void stop()}>Stop QTC output</button>}
-    {error && <p role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{notice && <ErrorNotice><p role="status">{notice}</p></ErrorNotice>}
     {data && !data.available ? <p>{data.reason}</p> : <>
       <p>{data?.ruleEdition} · {data?.score.qtcPoints ?? 0} confirmed QTC points · shared score {data?.score.total ?? 0}</p>
       <p>{data?.output ?? (onOutput ? "Review the current lane and native provider before output." : "Manual operation: no native output callback is available.")}</p>
@@ -233,7 +234,7 @@ export function ContestQTC({ scope, request, disabled, opportunityIntent, onMuta
           {data?.eligibleSources.map(item => <label key={item.sourceQSOID}><input type="checkbox" checked={selected.includes(item.sourceQSOID!)} onChange={event => setSelected(ids => event.target.checked ? [...ids, item.sourceQSOID!] : ids.filter(id => id !== item.sourceQSOID))}/>{item.time} {item.callsign} {item.serial}</label>)}
         </fieldset>}
         <button type="button" disabled={locked || saved} onClick={() => void run(persist, "Unfinished QTC editor saved without confirming items.")}>Save unfinished QTC editor</button>
-        <span role="status">{saved ? "Editor saved" : "Editor has unsaved changes"}</span>
+        <ErrorNotice><span role="status">{saved ? "Editor saved" : "Editor has unsaved changes"}</span></ErrorNotice>
         <button disabled={locked || !!data?.eligibility || !data?.available} type="submit">Create pending QTC series</button>
       </form>
       <label>Local counterpart opportunity<select aria-label="Local QTC opportunity" disabled={locked || !workspace.counterpart} value={observation?.status ?? "unknown"} onChange={event => void mutate("qtc_observe", {

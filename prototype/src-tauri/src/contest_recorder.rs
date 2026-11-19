@@ -39,7 +39,7 @@ struct Active {
     stop: Arc<AtomicBool>,
     frames: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     peak: Arc<std::sync::atomic::AtomicU32>,
 }
 struct State {
@@ -63,7 +63,7 @@ pub struct Recorder {
     reconciliation_cursor: AtomicU64,
     export_cancel: AtomicBool,
     export_running: AtomicBool,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     playback: Mutex<Option<crate::contest_recorder_audio::Output>>,
     exiting: AtomicBool,
 }
@@ -147,7 +147,7 @@ pub fn stop_replay() {
     // Even a Stop before owner initialization invalidates queued admissions.
     playback_epoch().fetch_add(1, Ordering::AcqRel);
     if let Some(owner) = existing() {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Ok(mut player) = owner.playback.try_lock() {
             *player = None;
         }
@@ -234,7 +234,7 @@ fn owner(app: &tauri::AppHandle) -> Result<Arc<Recorder>> {
         reconciliation_cursor: AtomicU64::new(0),
         export_cancel: AtomicBool::new(false),
         export_running: AtomicBool::new(false),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         playback: Mutex::new(None),
         exiting: AtomicBool::new(false),
     });
@@ -358,7 +358,7 @@ impl Recorder {
         if observed_transmit() {
             stop_replay();
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Ok(mut player) = self.playback.try_lock() {
             if player
                 .as_ref()
@@ -530,7 +530,7 @@ impl Recorder {
         }
         Ok(())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn start(&self, log: &str, generation: &str, test: bool) -> Result<()> {
         let _life = self
             .lifecycle
@@ -740,21 +740,21 @@ impl Recorder {
         } else {
             Value::Null
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let permission = crate::contest_recorder_audio::permission();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let permission = "Native capture is available on macOS only";
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let level = self.state.lock().ok().and_then(|s| {
             s.active
                 .as_ref()
                 .map(|a| a.peak.load(Ordering::Relaxed) as f64 / 32768.0)
         });
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let level: Option<f64> = None;
         let active=active.map(|(a,done)|->Result<Value>{let a=a.try_lock().map_err(|_|"Recorder writer busy; recording health unavailable")?;Ok(json!({"logId":a.manifest.log_id,"captureId":a.manifest.capture_id,"status":a.manifest.status,"inputState":if done{"Stopped"}else if a.manifest.frames==0{"Starting — waiting for samples"}else if level.unwrap_or(0.0)<0.001{"Input silent — valid callbacks"}else{"Input present"},"inputLevel":level,"frames":a.manifest.frames,"savedFrames":a.manifest.saved_frames,"startUtcMs":a.manifest.start_utc_ms,"rate":a.manifest.config.rate,"roles":a.manifest.config.roles,"finished":done}))}).transpose()?;
-        #[cfg(target_os="macos")]let playback=self.playback.lock().ok().and_then(|p|p.as_ref().map(|p|json!({"position":p.cursor.load(Ordering::Acquire),"frames":p.frames,"rate":p.rate,"paused":p.paused.load(Ordering::Acquire),"underruns":p.underruns.load(Ordering::Relaxed)})));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(target_os="macos",windows))]let playback=self.playback.lock().ok().and_then(|p|p.as_ref().map(|p|json!({"position":p.cursor.load(Ordering::Acquire),"frames":p.frames,"rate":p.rate,"paused":p.paused.load(Ordering::Acquire),"underruns":p.underruns.load(Ordering::Relaxed)})));
+        #[cfg(not(any(target_os = "macos", windows)))]
         let playback: Option<Value> = None;
         let context = crate::contest_window_context::active()
             .ok()
@@ -948,11 +948,11 @@ impl Recorder {
         match action {
             "status" => self.status(),
             "devices" => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 {
                     crate::contest_recorder_audio::devices()
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", windows)))]
                 {
                     Ok(json!([]))
                 }
@@ -965,7 +965,7 @@ impl Recorder {
                 if r["routeVerified"] != true {
                     return Err("Verify the physical headset/listening route before saving".into());
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 crate::contest_recorder_audio::validate_listening(output)?;
                 stop_replay();
                 let mut s = self.state.lock().map_err(|_| "Recorder unavailable")?;
@@ -983,7 +983,7 @@ impl Recorder {
                 let config: Config =
                     serde_json::from_value(r["config"].clone()).map_err(|e| e.to_string())?;
                 config.validate()?;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 crate::contest_recorder_audio::validate(&config)?;
                 let _life = self
                     .lifecycle
@@ -1001,7 +1001,7 @@ impl Recorder {
                 Ok(json!({"saved":true}))
             }
             "start" | "record_test" => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 self.start(
                     r["logId"].as_str().ok_or("Select an active contest")?,
                     r["workspaceGeneration"]
@@ -1009,7 +1009,7 @@ impl Recorder {
                         .ok_or("Missing workspace fence")?,
                     action == "record_test",
                 )?;
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", windows)))]
                 return Err("Native capture is available on macOS only".into());
                 #[allow(unreachable_code)]
                 Ok(json!({"started":true}))
@@ -1226,7 +1226,7 @@ impl Recorder {
             }
             "replay" | "replay_recent" => self.replay(&r),
             "pause_replay" | "seek" | "volume" => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 {
                     let mut p = self
                         .playback
@@ -1412,7 +1412,7 @@ impl Recorder {
                 "Transmit/output activity observed; replay rejected, capture continues".into(),
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             crate::contest_recorder_audio::validate_listening(&config.output_id)?;
             let mut player = self
@@ -1451,7 +1451,7 @@ impl Recorder {
                 generation,
             )?);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = (samples, config, generation);
             return Err("Native listening playback is available on macOS only".into());
@@ -1502,8 +1502,8 @@ async fn choose_directory(window: tauri::WebviewWindow, export: bool) -> Result<
     .map_err(|_| "Folder chooser failed".to_string())?
 }
 #[cfg(not(target_os = "macos"))]
-async fn choose_directory(_window: tauri::WebviewWindow, _export: bool) -> Result<Option<PathBuf>> {
-    tauri::async_runtime::spawn_blocking(|| rfd::FileDialog::new().pick_folder())
+async fn choose_directory(window: tauri::WebviewWindow, _export: bool) -> Result<Option<PathBuf>> {
+    tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).pick_folder())
         .await
         .map_err(|e| e.to_string())
 }
@@ -1527,7 +1527,7 @@ mod tests {
                 started_utc_ms: store::utc_ms(), controlled_test: false },
             archive: shared.clone(), stop: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(AtomicU64::new(100)), done: Arc::new(AtomicBool::new(false)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
         for (index, method) in ["contest_qso_commit", "contest_esm", "contest_function_key"].iter().enumerate() {
@@ -1605,7 +1605,7 @@ mod tests {
             reconciliation_cursor: AtomicU64::new(0),
             export_cancel: AtomicBool::new(false),
             export_running: AtomicBool::new(false),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             playback: Mutex::new(None),
             exiting: AtomicBool::new(false),
         };
@@ -1695,7 +1695,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 frames: Arc::new(AtomicU64::new(20)),
                 done: Arc::new(AtomicBool::new(false)),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             });
         }
@@ -1732,7 +1732,7 @@ mod tests {
         let shared=archive.into_shared(); let done=Arc::new(AtomicBool::new(false));
         {let mut state=recorder.state.lock().unwrap();state.saved.captures.push(key.clone());state.cache.insert(capture.clone(),shared.clone());
             state.active=Some(Active {key,archive:shared.clone(),stop:Arc::new(AtomicBool::new(false)),frames:Arc::new(AtomicU64::new(100)),done:done.clone(),
-                #[cfg(target_os="macos")]peak:Arc::new(std::sync::atomic::AtomicU32::new(0))});}
+                #[cfg(any(target_os="macos",windows))]peak:Arc::new(std::sync::atomic::AtomicU32::new(0))});}
         let request=json!({"captureId":capture,"logId":log,"qtc":{"schema":1,"sessionID":log,"seriesID":series,"itemIndex":0,
             "operationID":uuid::Uuid::new_v4().to_string(),"event":"item"},"note":"QTC row"});
         let mark=recorder.dispatch("qtc_bookmark",request.clone()).unwrap(); assert_eq!(mark["frame"],100);

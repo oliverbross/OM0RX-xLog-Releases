@@ -159,7 +159,8 @@ fn endpoint(value: &str) -> Result<String, String> {
         return Err("Agent endpoint is too long.".into());
     }
     let url = tauri::Url::parse(value).map_err(|_| "Enter a valid Agent HTTPS URL.")?;
-    if url.scheme() != "https"
+    let local_agent = matches!(value.trim_end_matches('/'), "http://127.0.0.1:8840") && url.path() == "/";
+    if (url.scheme() != "https" && !local_agent)
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -231,8 +232,8 @@ fn flex_configuration(value: &Value) -> Result<Value, String> {
     };
     let name = value["station_name"].as_str().ok_or("Enter a FLEX station name.")?;
     if !private || value["port"].as_u64().is_none_or(|port| !(1..=65535).contains(&port))
-        || name.trim().is_empty() || name.len() > 64 || !name.bytes().all(|byte| (32..=126).contains(&byte) && byte != b'|') {
-        return Err("Use a private numeric FLEX IP, port 1..65535 and an ASCII station name up to 64 characters without |.".into());
+        || name.len() > 64 || !name.bytes().all(|byte| (32..=126).contains(&byte) && byte != b'|') {
+        return Err("Use a private numeric FLEX IP and port 1..65535. An optional station name must be ASCII, up to 64 characters without |.".into());
     }
     Ok(value.clone())
 }
@@ -595,7 +596,7 @@ impl Session {
         self.persist(&next)?; *state = next;
         Ok(json!(&state.receipts[index]))
     }
-    /// Only native application startup may restore the saved Agent connection.
+    /// Only native application startup may restore the selected saved connection.
     /// Journal a fresh connection while preserving the last admitted transmit
     /// authority. Reconcile a prior uncertain connect with a new identity, but
     /// never override an explicit disconnect or credential removal.
@@ -614,31 +615,38 @@ impl Session {
         selection: &Value,
         dispatch: impl FnOnce(Value, u64, &str) -> Result<Value, String>,
     ) -> Result<Option<Value>, String> {
-        if selection["provider"] != "direct_agent"
-            || selection["generation"].as_u64().is_none_or(|value| value > MAX_REVISION)
+        if selection["generation"].as_u64().is_none_or(|value| value > MAX_REVISION)
             || selection["control_revision"].as_u64().is_none_or(|value| value > MAX_REVISION)
             || selection["selection_id"].as_str().is_none_or(|value| uuid::Uuid::parse_str(value).is_err()) {
             return Ok(None);
         }
         let state = self.state.lock().map_err(|_| "Station Control state is unavailable.")?;
-        let last_lifecycle = state.receipts.iter().rev().find(|receipt| matches!(
-            receipt.request["action"].as_str(),
-            Some("connect" | "disconnect" | "forget")
-        ));
-        if state.base_url.is_empty()
+        let (action, configured, lifecycle): (&str, bool, &[&str]) = match selection["provider"].as_str() {
+            Some("direct_agent") => ("connect", !state.base_url.is_empty(), &["connect", "disconnect", "forget"]),
+            Some("direct_flex_lan") => ("connect_flex", state.flex.is_some(), &["connect_flex", "reconnect_flex", "disconnect_flex"]),
+            Some("direct_tci") => ("connect_tci", state.tci.is_some(), &["connect_tci", "disconnect_tci"]),
+            Some("hamlib") => ("connect_hamlib", state.hamlib.is_some(), &["connect_hamlib", "reconnect_hamlib", "disconnect_hamlib"]),
+            _ => return Ok(None),
+        };
+        let last_lifecycle = state.receipts.iter().rev().find(|receipt|
+            receipt.request["action"].as_str().is_some_and(|value| lifecycle.contains(&value)));
+        if !configured
             || state.profile.as_ref().is_some_and(|profile| profile["enabled"] == false)
             || last_lifecycle.is_some_and(|receipt| {
-                receipt.request["action"] != "connect" || receipt.status == "rejected"
+                receipt.request["action"].as_str().is_some_and(|value| value.starts_with("disconnect") || value == "forget")
+                    || action == "connect" && receipt.status == "rejected"
             }) {
             return Ok(None);
         }
         let allow_transmit = last_lifecycle
             .and_then(|receipt| receipt.request["allow_transmit"].as_bool())
             .unwrap_or(false);
-        let params = json!({"action":"connect","operation_id":uuid::Uuid::new_v4().to_string(),
+        let mut params = json!({"action":action,"operation_id":uuid::Uuid::new_v4().to_string(),
             "generation":state.generation,"revision":state.revision,
             "selection_generation":selection["generation"],"selection_id":selection["selection_id"],
-            "allow_transmit":allow_transmit,"allow_keychain_interaction":false,"radio_id":self.radio_id});
+            "radio_id":self.radio_id});
+        if action != "connect_tci" { params["allow_transmit"] = json!(allow_transmit); }
+        if action == "connect" { params["allow_keychain_interaction"] = json!(false); }
         drop(state);
         // The existing admission path persists pending before transport, fences
         // concurrent setup edits, and lets Swift load only this endpoint's token.
@@ -752,6 +760,12 @@ impl Session {
             } else if action == "manual_tune" {
                 crate::manual_tune::params(params)?;
                 for key in ["provider", "control_revision", "connection_generation", "worker_generation", "frequency_hz", "mode"] { descriptor[key] = params[key].clone(); }
+                if let Some(slice) = params.get("companion_slice") {
+                    if params["provider"] != "direct_flex_lan" || !matches!(slice.as_str(), Some("A" | "B")) {
+                        return Err("Invalid companion tune slice".into());
+                    }
+                    descriptor["companion_slice"] = slice.clone();
+                }
                 for key in ["expected_source_frequency_hz", "expected_source_mode"] {
                     if params.get(key).is_some() { descriptor[key] = params[key].clone(); }
                 }
@@ -807,10 +821,15 @@ impl Session {
             next.revision = next.revision.checked_add(1).filter(|value| *value <= MAX_REVISION).ok_or("Station Control revision exhausted.")?;
         }
         if next.receipts.len() == MAX_RECEIPTS {
-            let lifecycle = next.receipts.iter().rposition(|receipt| matches!(receipt.request["action"].as_str(),
-                Some("connect" | "disconnect" | "forget" | "connect_tci" | "disconnect_tci")));
+            let lifecycles: Vec<_> = [
+                &["connect", "disconnect", "forget"][..],
+                &["connect_tci", "disconnect_tci"][..],
+                &["connect_flex", "reconnect_flex", "disconnect_flex"][..],
+                &["connect_hamlib", "reconnect_hamlib", "disconnect_hamlib"][..],
+            ].iter().filter_map(|actions| next.receipts.iter().rposition(|receipt|
+                actions.contains(&receipt.request["action"].as_str().unwrap_or("")))).collect();
             if let Some(index) = next.receipts.iter().enumerate().find_map(|(index, receipt)|
-                (Some(index) != lifecycle && matches!(receipt.status.as_str(), "saved" | "acknowledged" | "confirmed" | "reviewed" | "rejected")).then_some(index)) {
+                (!lifecycles.contains(&index) && matches!(receipt.status.as_str(), "saved" | "acknowledged" | "confirmed" | "reviewed" | "rejected")).then_some(index)) {
                 next.receipts.remove(index);
             } else {
                 return Err("Station Control operation journal has no safely removable receipt; no action was sent.".into());
@@ -951,7 +970,12 @@ impl Session {
             .is_ok_and(|response| response["id"] == id && response["ok"] == true)
         {
             if action == "tci_receive_filter" { if crate::tci_filter::confirmed(&receipt.request, result.as_ref().unwrap()) { "confirmed" } else { "unknown" } }
-            else if action == "manual_tune" { if crate::manual_tune::confirmed(&receipt.request, result.as_ref().unwrap()) { "confirmed" } else { "unknown" } }
+            else if action == "manual_tune" {
+                let confirmed = if receipt.request.get("companion_slice").is_some() {
+                    crate::companion_audio_config::tune_confirmed(&receipt.request, result.as_ref().unwrap())
+                } else { crate::manual_tune::confirmed(&receipt.request, result.as_ref().unwrap()) };
+                if confirmed { "confirmed" } else { "unknown" }
+            }
             else if action == "manual_rotor_goto" { if crate::manual_rotor::acknowledged(&receipt.request, result.as_ref().unwrap()) { "acknowledged" } else { "unknown" } }
             else { "acknowledged" }
         } else if result
@@ -1451,6 +1475,42 @@ mod tests {
     fn startup_selection() -> Value {
         json!({"provider":"direct_agent","generation":0,"control_revision":0,
             "selection_id":uuid::Uuid::new_v4().to_string()})
+    }
+    #[test]
+    fn startup_restores_saved_direct_radios_once_and_respects_disconnect() {
+        for (provider, save_action, connect_action, disconnect_action, configuration) in [
+            ("direct_flex_lan", "save_flex", "connect_flex", "disconnect_flex", json!({"host":"127.0.0.1","port":4992,"station_name":""})),
+            ("hamlib", "save_hamlib", "connect_hamlib", "disconnect_hamlib", json!({"mode":"external","host":"127.0.0.1","port":4532})),
+            ("direct_tci", "save_tci", "connect_tci", "disconnect_tci", json!({"endpoint":"ws://127.0.0.1:40001","trx":0,"channel":0,"allow_transmit":false})),
+        ] {
+            let (directory, session, mut save) = setup();
+            save.as_object_mut().unwrap().remove("base_url");
+            save["action"] = json!(save_action); save["configuration"] = configuration;
+            session.apply(&save, passive).unwrap();
+            let mut selection = startup_selection(); selection["provider"] = json!(provider);
+            let receipt = session.resume_saved_agent(&selection, |request, _, _| {
+                assert!(matches!(request["method"].as_str(), Some("station_connect" | "hamlib_connect")));
+                assert_ne!(request["params"]["allow_transmit"], true);
+                assert_ne!(request["params"]["tx_enabled"], true);
+                Ok(json!({"id":request["id"],"ok":true}))
+            }).unwrap().unwrap();
+            assert_eq!(receipt["request"]["action"], connect_action);
+            assert!(session.resume_saved_agent(&selection, passive).unwrap().is_none());
+            let state = session.snapshot().unwrap();
+            session.apply(&json!({"action":disconnect_action,"operation_id":uuid::Uuid::new_v4().to_string(),
+                "generation":state["generation"],"revision":state["revision"],
+                "selection_generation":selection["generation"],"selection_id":selection["selection_id"]}),
+                |request,_,_| Ok(json!({"id":request["id"],"ok":true}))).unwrap();
+            // Journal rollover must not erase the user's last connection intent.
+            for _ in 0..MAX_RECEIPTS + 4 {
+                let current = session.snapshot().unwrap();
+                save["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+                save["revision"] = current["revision"].clone();
+                session.apply(&save, passive).unwrap();
+            }
+            let restored = Session::new(directory.path().join("session.json")).unwrap();
+            assert!(restored.resume_saved_agent(&selection, passive).unwrap().is_none());
+        }
     }
     #[test]
     fn startup_without_a_prior_connect_receipt_resumes_receive_only_once() {

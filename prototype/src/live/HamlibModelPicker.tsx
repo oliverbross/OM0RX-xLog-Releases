@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { hamlibManufacturers, loadHamlibCatalogue, type HamlibModel } from "./hamlibCatalogue";
 import { stationSessionRequest, type RadioID } from "./stationSession";
@@ -20,7 +21,7 @@ export function HamlibModelPicker({ device, models, loading, selected, onSelect,
     {manufacturerFilter === undefined && <label>Manufacturer<select aria-label={`${label} manufacturer`} value={manufacturer} onChange={event => setManufacturer(event.target.value)}><option value="">All manufacturers</option>{manufacturers.map(group => <option key={group.key} value={group.key}>{group.name} · {group.count}</option>)}</select></label>}
     <label>Find model<input aria-label={labelPrefix ? `${labelPrefix} search` : `Find ${device} model`} value={search} onChange={event => setSearch(event.target.value)} placeholder={plainLabels ? "Search model name" : "Model name, ID or maturity"} /></label>
     <label>Model<select aria-label={`${label} model`} required value={selected || ""} onChange={event => onSelect(Number(event.target.value))}><option value="">Choose model…</option>{outside && <option value={selected}>{selectedModel ? plainLabels ? `${selectedModel.model} (saved selection)` : `${selectedModel.manufacturer} ${selectedModel.model} · ${selectedModel.id} · ${selectedModel.maturity} (selected; outside filter)` : plainLabels ? "Saved model (catalogue unavailable)" : `Saved model ${selected} · not in this catalogue`}</option>}{filtered.map(model => <option key={model.id} value={model.id}>{plainLabels ? model.model : `${model.manufacturer} ${model.model} · ${model.id} · ${model.maturity}`}</option>)}</select></label>
-    <p className="live-station-helper" role="status">{loading ? "Loading bundled device catalogue…" : plainLabels ? `${filtered.length} matching models` : `${filtered.length} matching ${device} models · ${models.length} listed. Catalogue support is not physical-device verification.`}</p>
+    <ErrorNotice><p className="live-station-helper" role="status">{loading ? "Loading bundled device catalogue…" : plainLabels ? `${filtered.length} matching models` : `${filtered.length} matching ${device} models · ${models.length} listed. Catalogue support is not physical-device verification.`}</p></ErrorNotice>
   </>;
 }
 
@@ -43,7 +44,7 @@ export function SharedHamlibModelBrowser({ radioId, selected, onSelect }: { radi
   return <div aria-label="Shared Hamlib radio model browser">
     <button type="button" disabled={loading} onClick={() => void load()}>{loading ? "Loading radio models…" : attempted ? "Reload radio model catalogue" : "Load radio model catalogue"}</button>
     {!!models.length && <HamlibModelPicker device="radio" models={models} loading={loading} selected={selected} onSelect={onSelect} labelPrefix="Shared Hamlib catalogue" />}
-    {failed && <p role="status">Bundled radio model catalogue is unavailable. Retry loading or enter a known model ID manually; manual entry does not verify backend support.</p>}
+    {failed && <ErrorNotice><p role="status">Bundled radio model catalogue is unavailable. Retry loading or enter a known model ID manually; manual entry does not verify backend support.</p></ErrorNotice>}
     <p>Choosing a model changes this draft only. Save setup before connecting.</p>
   </div>;
 }

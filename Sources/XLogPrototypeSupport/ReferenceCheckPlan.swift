@@ -21,6 +21,7 @@ struct ReferenceCheckPlan: Equatable {
                      unavailableSources: Set<String> = [],
                      allowedSources: Set<String>? = nil) -> Self {
         let sources: [(String, Bool)] = [
+            ("cty.dat", true),
             ("cty.xml", clubLogConfigured),
             ("lotw-user-activity.csv", true),
             (ActivationReferenceKind.pota.fileName, true),

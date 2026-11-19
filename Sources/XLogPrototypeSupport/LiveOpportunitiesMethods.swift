@@ -21,8 +21,17 @@ actor LiveOpportunitiesMethods {
         var parserVersion: Int?
     }
     private let logbook: LiveLogbookMethods
-    private let session: URLSession
+    private let suppliedSession: URLSession?
+    private var downloadConfiguration: URLSessionConfiguration {
+        if let suppliedSession { return suppliedSession.configuration }
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
+        return config
+    }
     private let clusterSpots: () async -> [[String: Any]]
+    private let specialSpots: () async -> [[String: Any]]
     private let dxpeditionHistory: ([String]) async throws -> [[String: Any]]
     private var historyCache: (key: String, at: Date, rows: [[String: Any]])?
     private var historyState = "unavailable"
@@ -30,7 +39,7 @@ actor LiveOpportunitiesMethods {
     private var feeds: [String: Feed] = [:]
     private var refreshing: [String: Task<Void, Never>] = [:]
     private var terminated = false
-    private var cachedDirectory: (path: String, identity: String, value: ActivationReferenceDirectory)?
+    private var cachedDirectory: (path: String, identity: String, references: [ActivationReferenceKind: Set<String>], value: ActivationReferenceDirectory)?
     private let names = ["adxo", "425dxn", "pota", "sota", "wwff", "wwbota"]
     private let dxSources = ["adxo", "425dxn", "clublog"]
     private let timestampFormatter: ISO8601DateFormatter = {
@@ -48,19 +57,19 @@ actor LiveOpportunitiesMethods {
         self.clusterSpots = clusterSpots ?? {
             await LiveClusterMethods.shared.currentSpotRowsIfStarted()
         }
-        self.dxpeditionHistory = dxpeditionHistory
-        if let session { self.session = session }
-        else {
-            let config = URLSessionConfiguration.ephemeral
-            config.httpCookieAcceptPolicy = .never
-            config.httpShouldSetCookies = false
-            config.urlCredentialStorage = nil
-            self.session = URLSession(configuration: config)
+        self.specialSpots = clusterSpots ?? {
+            await LiveClusterMethods.shared.currentSpotRowsIfStarted(unfiltered: true)
         }
+        self.dxpeditionHistory = dxpeditionHistory
+        self.suppliedSession = session
     }
 
     func handle(method: String, params: [String: Any]) async throws -> [String: Any] {
         guard !terminated else { throw WorkerFailure("worker_stopping", "The opportunity service has shut down.") }
+        if method == "opportunities_special_snapshot" {
+            guard params.isEmpty else { throw invalid() }
+            return try await specialSnapshot()
+        }
         _ = try logbook.openedDatabase()
         try loadCache()
         switch method {
@@ -127,7 +136,7 @@ actor LiveOpportunitiesMethods {
             // Club Log's JSON API deliberately returns text/html.
             let html = source == "adxo" || source == "clublog"
             request.setValue(html ? "text/html" : "application/json", forHTTPHeaderField: "Accept")
-            let data = try await OpportunityDownload.fetch(request, configuration: session.configuration, format: html ? .html : .json)
+            let data = try await OpportunityDownload.fetch(request, configuration: downloadConfiguration, format: html ? .html : .json)
             let items = try OpportunityFeedParser.parse(data, source: source, observedAt: Date())
             guard !terminated, !Task.isCancelled else { return }
             let recent = prior.items.filter { old in
@@ -145,6 +154,38 @@ actor LiveOpportunitiesMethods {
             feeds[source] = prior
             try? saveCache()
         }
+    }
+
+    private func specialSnapshot() async throws -> [String: Any] {
+        // Retained cluster and local reference history only; no public-feed refresh.
+        let spots = await specialSpots()
+        guard !terminated else { throw WorkerFailure("worker_stopping", "The opportunity service has shut down.") }
+        let database = try logbook.openedDatabase()
+        let history = try? database.opportunityReferenceHistory()
+        func key(_ kind: String, _ reference: String) -> String {
+            let ref = reference.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            return kind.lowercased() + ":" + (kind == "castle" ? ref.replacingOccurrences(of: #"^(?:WCA|COTA|CASTLE)[-:\s]+"#, with: "", options: .regularExpression) : ref)
+        }
+        let worked = Set((history ?? []).filter { $0.workedCount > 0 }.map { key($0.kind, $0.reference) })
+        let rows: [[String: Any]] = spots.prefix(500).compactMap { spot in
+            guard let id = spot["id"] as? String, let comment = spot["comment"] as? String else { return nil }
+            let tags = spot["specialTags"] as? [String] ?? []
+            let references = AwardReferenceParser.specialReferences(comment: comment, specialTags: tags)
+            var programmes = Set(references.map(\.kind))
+            for tag in tags.map({ $0.uppercased() }) where tag != "RBN" {
+                // A broad legacy POTA tag must not relabel a parsed SOTA/WWFF/castle ID.
+                if tag == "POTA", !references.isEmpty, !references.contains(where: { $0.kind == "pota" }) { continue }
+                programmes.insert(["POTA", "SOTA", "IOTA", "WWFF"].contains(tag) ? tag.lowercased() : ["WCA", "COTA", "CASTLE"].contains(tag) ? "castle" : "other")
+            }
+            guard !programmes.isEmpty else { return nil }
+            return ["id": id, "callsign": spot["callsign"] ?? "", "frequencyKHz": spot["frequencyKHz"] ?? NSNull(),
+                    "band": spot["band"] ?? "", "mode": spot["mode"] ?? "", "comment": comment,
+                    "programmes": programmes.sorted(), "references": references.map { reference in
+                        ["kind": reference.kind, "reference": reference.reference,
+                         "status": history == nil ? "unknown" : worked.contains(key(reference.kind, reference.reference)) ? "worked" : "new"]
+                    }]
+        }
+        return ["spots": rows, "history_available": history != nil]
     }
 
     private func snapshot(dxpeditionOnly: Bool = false) async throws -> [String: Any] {
@@ -201,10 +242,11 @@ actor LiveOpportunitiesMethods {
                         source: "Configured DX cluster", sourceURL: "", comment: comment))
                 }
         }
+        let selected = Array(all.sorted { $0.observedAt > $1.observedAt }.prefix(dxpeditionOnly ? 500 : 300))
         let database = try logbook.openedDatabase()
-        let history = try database.opportunityReferenceHistory()
+        let history = selected.isEmpty ? [] : try database.opportunityReferenceHistory()
         let byReference = Dictionary(uniqueKeysWithValues: history.map { ("\($0.kind.lowercased()):\($0.reference.uppercased())", $0) })
-        let classification = try? logbook.clusterClassificationSnapshot()
+        let classification = selected.isEmpty ? nil : try? logbook.clusterClassificationSnapshot()
         // Only DXpedition Map uses a feed's declared entity. Normalize each
         // endpoint once, preserving the resolver's first match for aliases.
         // Re-folding every endpoint for every Chaser row exceeded its read budget
@@ -212,8 +254,15 @@ actor LiveOpportunitiesMethods {
         let countries = dxpeditionOnly ? classification?.resolver.reachableCountryEndpoints(at: now) ?? [] : []
         let countriesByName = Dictionary(countries.map { (normalizedEntity($0.name), $0) },
                                         uniquingKeysWith: { first, _ in first })
-        let directory = try activationDirectory()
-        let selected = Array(all.sorted { $0.observedAt > $1.observedAt }.prefix(dxpeditionOnly ? 500 : 300))
+        let references = selected.reduce(into: [ActivationReferenceKind: Set<String>]()) { result, item in
+            if item.kind == "dxpedition" || item.kind == "special_event" {
+                if let reference = OpportunityFeedParser.iotaReference(in: item.reference + " " + item.name) { result[.iota, default: []].insert(reference.uppercased()) }
+            } else if let kind = ActivationReferenceKind(rawValue: item.kind) {
+                result[kind, default: []].insert(item.reference.trimmingCharacters(in: .whitespacesAndNewlines).uppercased())
+            }
+        }
+        let directory = try activationDirectory(references: references)
+        let clubLogByCall = Dictionary(grouping: (feeds["clublog"]?.items ?? []).filter { $0.expiresAt > now }, by: { $0.callsign.uppercased() })
         let items: [[String: Any]] = selected.map { item in
             let calendar = item.kind == "dxpedition" || item.kind == "special_event"
             let reference = calendar ? OpportunityFeedParser.iotaReference(in: item.reference + " " + item.name) ?? item.reference : item.reference
@@ -237,9 +286,15 @@ actor LiveOpportunitiesMethods {
             let namedCountry = dxpeditionOnly ? countriesByName[normalizedEntity(declaredName)] : nil
             let country = dxpeditionOnly ? namedCountry ?? resolvedCountry : resolvedCountry
             let entityLocation = dxpeditionOnly && country?.latitude != nil && country?.longitude != nil
-            let enrichment = (feeds["clublog"]?.items ?? []).filter { aliases.contains($0.callsign) &&
-                $0.expiresAt > now && ($0.lastQSO ?? .distantPast) >= (item.startsAt ?? .distantPast) &&
-                ($0.lastQSO ?? .distantFuture) <= (item.endsAt ?? item.expiresAt) }.max { ($0.lastQSO ?? .distantPast) < ($1.lastQSO ?? .distantPast) }
+            var enrichment: PublicOpportunity?
+            for alias in aliases {
+                for candidate in clubLogByCall[alias] ?? [] {
+                    guard let lastQSO = candidate.lastQSO,
+                          lastQSO >= (item.startsAt ?? Date.distantPast),
+                          lastQSO <= (item.endsAt ?? item.expiresAt) else { continue }
+                    if enrichment == nil || lastQSO > (enrichment?.lastQSO ?? Date.distantPast) { enrichment = candidate }
+                }
+            }
             let modeHistory = country.flatMap { entity in
                 classification.map { $0.index.dxccModeHistory(adif: entity.adif) }
             }
@@ -328,24 +383,28 @@ actor LiveOpportunitiesMethods {
         }
         return file
     }
-    private func activationDirectory() throws -> ActivationReferenceDirectory {
+    private func activationDirectory(references: [ActivationReferenceKind: Set<String>]) throws -> ActivationReferenceDirectory {
+        guard !references.isEmpty else { return ActivationReferenceDirectory() }
         let directory = try logbook.referenceDirectoryURL()
-        var parts: [String] = []
-        for kind in ActivationReferenceKind.allCases {
+        let identity = try ActivationReferenceDirectory.fingerprint(directory: directory)
+        var wanted = references
+        if let cachedDirectory, cachedDirectory.path == directory.path, cachedDirectory.identity == identity {
+            if references.allSatisfy({ cachedDirectory.references[$0.key]?.isSuperset(of: $0.value) == true }) { return cachedDirectory.value }
+            if cachedDirectory.references.values.reduce(0, { $0 + $1.count }) < 4_096 {
+                for (kind, values) in cachedDirectory.references { wanted[kind, default: []].formUnion(values) }
+            }
+        }
+        for kind in wanted.keys {
             let file = directory.appendingPathComponent(kind.fileName)
             guard FileManager.default.fileExists(atPath: file.path) else { continue }
             let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
             guard attributes[.type] as? FileAttributeType == .typeRegular else { throw invalid() }
-            parts.append([kind.rawValue,
-                          String((attributes[.size] as? NSNumber)?.int64Value ?? -1),
-                          String((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1),
-                          String((attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)].joined(separator: ":"))
         }
-        let identity = parts.joined(separator: "|")
-        if let cachedDirectory, cachedDirectory.path == directory.path,
-           cachedDirectory.identity == identity { return cachedDirectory.value }
-        let loaded = try ActivationReferenceDirectory(directory: directory)
-        cachedDirectory = (directory.path, identity, loaded)
+        // Chaser needs exact references for a few hundred rows, not hundreds of
+        // thousands of unrelated park/summit objects. CSV scanning still honours
+        // quoted multiline fields and validates the source header/encoding.
+        let loaded = try ActivationReferenceDirectory(directory: directory, kinds: Set(wanted.keys), references: wanted)
+        cachedDirectory = (directory.path, identity, wanted, loaded)
         return loaded
     }
     private func loadCache(createDirectory: Bool = true) throws {

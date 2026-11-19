@@ -209,7 +209,7 @@ private struct ARRLDXRule: ContestRule {
                 issues.append(arrlDXIssue("invalidReceivedLocation", "exchange.received.location",
                                           "A W/VE station must send its valid state or province."))
             }
-            if let value = location?.normalized {
+            if let value = arrlCanonicalLocation(location?.normalized, entity: worked) {
                 multiplier = .init(kind: worked.adif == 291 ? "arrl-us-state" : "arrl-ca-province",
                                    value: value, scope: qso.band)
             }

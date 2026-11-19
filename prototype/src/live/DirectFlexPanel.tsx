@@ -1,3 +1,7 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { EmbeddedCATSettings } from "./EmbeddedCATSettings";
+import { FlexStationPicker } from "./FlexStationPicker";
+import { decimalMHz, formatRadioFrequency } from "./radioFrequency";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Activity, Radio, RefreshCw } from "lucide-react";
 import { AgentConnectionSetup } from "./AgentConnectionSetup";
@@ -19,15 +23,15 @@ type Request = (method: string, params?: Data) => Promise<Data>;
 type Props = { radioId: RadioID; request: Request; snapshot: Data | null };
 const provider = "direct_flex_lan";
 const modes = ["USB", "LSB", "CW", "CWR", "AM", "FM", "RTTY", "RTTYR", "DIGU", "DIGL", "FT8", "FT4"];
-const formatMHz = (hz: unknown) => typeof hz === "number" && Number.isFinite(hz) ? (hz / 1_000_000).toFixed(6) : "—";
+const formatMHz = (hz: unknown) => typeof hz === "number" && Number.isFinite(hz) ? formatRadioFrequency(hz) : "—";
 const strictHz = (mhz: string): number | null => {
-  const numeric = Number(mhz);
+  const numeric = Number(decimalMHz(mhz));
   const hz = Math.round(numeric * 1_000_000);
   return mhz.trim() && Number.isFinite(numeric) && Number.isSafeInteger(hz) && hz >= 100_000 && hz <= 1_000_000_000 ? hz : null;
 };
 export function validFlexEndpoint(host: string, port: string, stationName: string): boolean {
   const name = stationName.trim();
-  if (!name || name.length > 64 || !/^[\x20-\x7E]+$/.test(name) || name.includes("|")) return false;
+  if (name.length > 64 || !/^[\x20-\x7E]*$/.test(name) || name.includes("|")) return false;
   const numericPort = Number(port);
   if (!/^\d+$/.test(port) || !Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65_535) return false;
   const octets = host.split(".");
@@ -45,8 +49,8 @@ export default function DirectFlexPanel({ radioId, request, snapshot }: Props) {
   const shared = nativeStationSelection();
   const [host, setHost] = useState(() => shared ? "" : localStorage.getItem("xlog.flex.host") || "");
   const [port, setPort] = useState(() => shared ? "4992" : localStorage.getItem("xlog.flex.port") || "4992");
-  const [stationName, setStationName] = useState(() => shared ? "OM0RX-xLog" : localStorage.getItem("xlog.flex.name") || "OM0RX-xLog");
-  const [allowTransmit, setAllowTransmit] = useState(true);
+  const [stationName, setStationName] = useState(() => shared ? "" : (localStorage.getItem("xlog.flex.name") ?? "").replace(/^OM0RX-xLog$/, ""));
+  const [allowTransmit, setAllowTransmit] = useState(!/^Win/i.test(globalThis.navigator?.platform ?? ""));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -134,7 +138,7 @@ export default function DirectFlexPanel({ radioId, request, snapshot }: Props) {
 
   const control = (name: string, params: Data = {}) => name==="ptt"&&shared ? pttSession().set(params.enabled===true,provider).catch(()=>null) : act("station_radio_control", { control: name, ...params }, name.replaceAll("_", " "));
   const hz = strictHz(frequency);
-  const validCW = cwText.length > 0 && cwText.length <= 128 && /^[\x20-\x7E]+$/.test(cwText) && !cwText.includes("|");
+  const validCW = cwText.length > 0 && cwText.length <= 128 && /^[\x20-\x7E]*$/.test(cwText) && !cwText.includes("|");
   const speed = Number(cwSpeed);
   const validRFPower = /^(?:0|[1-9]\d?|100)$/.test(rfPower);
   const rfPowerSupported = supports("set_rf_power");
@@ -146,16 +150,17 @@ export default function DirectFlexPanel({ radioId, request, snapshot }: Props) {
         {shared ? <><AgentConnectionSetup radioId={radioId} flex /><button type="button" disabled={busy} onClick={() => void act("station_snapshot", {}, "Read state")}><RefreshCw size={14} /> Read state</button></> : <form className="live-station-connect" onSubmit={event => void connect(event)}>
           <div className="flex-connect-fields"><label>Private radio IP address<input aria-label="Private radio IP address" required inputMode="url" value={host} onChange={event => setHost(event.target.value)} placeholder="192.168.1.50" autoComplete="off" /></label>
             <label>TCP port<input aria-label="TCP port" required type="number" min="1" max="65535" value={port} onChange={event => setPort(event.target.value)} /></label>
-            <label>Station name<input aria-label="Station name" required maxLength={64} value={stationName} onChange={event => setStationName(event.target.value)} /></label></div>
+            <FlexStationPicker value={stationName} snapshot={snapshot ?? undefined} onChange={setStationName} /></div>
           <label className="live-station-checkbox"><input type="checkbox" checked={allowTransmit} disabled={busy || attached} onChange={event => setAllowTransmit(event.target.checked)} />Enable transmit commands for this connection only</label>
           {attached && <p className="live-station-helper">Transmit permission is fixed for this connection. Disconnect before changing it.</p>}
-          <p className="live-station-helper">Full controls are enabled by default and can be explicitly changed to receive-only before connecting. A radio command is complete only when a fresh readback confirms it.</p>
+          <p className="live-station-helper">Choose whether this connection can send CW and control transmit. Frequency and mode changes are confirmed by radio readback.</p>
           <div className="live-station-actionrow"><button className="primary" disabled={busy || attached || !validFlexEndpoint(host.trim(), port, stationName)}>Connect FLEX</button>
             <button type="button" disabled={busy || connected || !attached} onClick={() => void act("station_reconnect", {}, "Reconnect")}>Reconnect</button>
             <button type="button" disabled={busy || !attached} onClick={() => void act("station_disconnect", {}, "Disconnect")}>Disconnect</button>
             <button type="button" disabled={busy} onClick={() => void act("station_snapshot", {}, "Read state")}><RefreshCw size={14} /> Read state</button></div>
         </form>}
       </section>
+      <EmbeddedCATSettings radioId={radioId} snapshot={snapshot} request={request} />
       <section className="live-station-card"><h3><Activity size={15} /> Observed FLEX radio</h3>
         <div className="flex-readback"><strong>{formatMHz(radio?.frequency_hz)} <small>MHz</small></strong><span>{radio?.mode || "Mode unavailable"}</span><span className={radio?.transmitting === true ? "amber" : "secondary"}>{!connected ? "No live radio observation" : radio?.transmitting === true ? "TRANSMITTING" : radio?.transmitting === false ? "Receiving" : "PTT state unknown"}</span></div>
         <div className="live-station-vfos">{["A", "B"].map(letter => {
@@ -199,8 +204,8 @@ export default function DirectFlexPanel({ radioId, request, snapshot }: Props) {
         <div className="live-station-actionrow"><button disabled={busy || !txAllowed || !supports("send_cw") || !validCW} onClick={() => void control("send_cw", { text: cwText })}>Send CW</button><button disabled={busy || !supports("clear_cw")} onClick={() => void control("clear_cw")}>Clear CW</button></div>
         <div className="live-station-inline"><label>CW speed WPM<input aria-label="FLEX CW speed" type="number" min="5" max="100" value={cwSpeed} onChange={event => setCWSpeed(event.target.value)} /></label><button disabled={busy || !supports("set_cw_speed") || !Number.isInteger(speed) || speed < 5 || speed > 100} onClick={() => void control("set_cw_speed", { words_per_minute: speed })}>Set speed</button></div>
       </section>
-      <section className="live-station-card"><h3>Provider scope</h3><p>Direct FLEX reports radio state only. Amplifier, tuner, rotor, Remote Agent configuration, RIT/XIT, CAT server and SmartLink controls are unavailable here. {!rfPowerSupported && "RF power setting is unavailable until FLEX reports its current level."}</p></section>
+      <section className="live-station-card"><h3>Provider scope</h3><p>Direct FLEX reports radio state only. Amplifier, tuner, rotor, Remote Agent configuration, RIT/XIT and SmartLink controls are unavailable here. {!rfPowerSupported && "RF power setting is unavailable until FLEX reports its current level."}</p></section>
     </div></div>
-    {error && <p className="live-station-error" role="alert">{error}</p>}{notice && <p className="live-station-notice" role="status">{notice}</p>}
+    {error && <ErrorNotice><p className="live-station-error" role="alert">{error}</p></ErrorNotice>}{notice && <ErrorNotice><p className="live-station-notice" role="status">{notice}</p></ErrorNotice>}
   </section>;
 }

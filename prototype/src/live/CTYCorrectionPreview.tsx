@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import "./ctyCorrectionPreview.css";
 import { CountryCorrectionReview } from "./CountryCorrectionReview";
@@ -44,10 +45,10 @@ export function CTYCorrectionPreview({ onRequest, refreshKey, queryContext, onCh
     <header><h3>PJ country inference preview</h3><button type="button" disabled={loading}
       onClick={() => { setOffset(0); setReload(value => value + 1); }}>Refresh preview</button></header>
     <p>Read-only comparison of the former PJ shortcut with current CTY rules at each QSO date. Stored DXCC values, including manual overrides, are excluded. No contacts are changed.</p>
-    {loading && <p role="status">Reading local classifications…</p>}
-    {error && <p role="alert">Could not read the preview: {error} Use Refresh preview to retry.</p>}
+    {loading && <ErrorNotice><p role="status">Reading local classifications…</p></ErrorNotice>}
+    {error && <ErrorNotice><p role="alert">Could not read the preview: {error} Use Refresh preview to retry.</p></ErrorNotice>}
     {preview && <>
-      <p role="status">{preview.affectedCount.toLocaleString()} inferred classifications differ · {preview.protectedOverrideCount.toLocaleString()} PJ contacts protected by stored DXCC · {snapshot.source} CTY source</p>
+      <ErrorNotice><p role="status">{preview.affectedCount.toLocaleString()} inferred classifications differ · {preview.protectedOverrideCount.toLocaleString()} PJ contacts protected by stored DXCC · {snapshot.source} CTY source</p></ErrorNotice>
       {preview.affectedCount === 0 ? <p>No inferred PJ classifications differ in this local logbook.</p> : <>
         <div className="cty-correction-table" tabIndex={0} role="region" aria-label="Inferred country changes"><table>
           <caption>Inferred entities only; before and after values are not stored-field provenance.</caption>

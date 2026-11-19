@@ -2,10 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export type DxAlertGeography = { dxEntity?: number | null; dxContinent?: string | null; dxCqZone?: number | null; dxItuZone?: number | null; spotterEntity?: number | null; spotterContinent?: string | null };
-export type DxAlertRule = { id: string; name: string; enabled: boolean; sources?: ("cluster" | "wsjtx")[]; callsignGlob: string; commentContains: string; bands: string[]; modes: string[]; callStatuses: string[]; dxccStatuses: string[]; specials: string[]; dxEntities?: number[]; dxContinents?: string[]; dxCqZones?: number[]; dxItuZones?: number[]; spotterEntities?: number[]; spotterContinents?: string[] };
+export type DxAlertRule = { id: string; name: string; enabled: boolean; sources?: ("cluster" | "wsjtx")[]; callsignGlob: string; chaseModes?: string[]; commentContains: string; bands: string[]; modes: string[]; callStatuses: string[]; dxccStatuses: string[]; specials: string[]; dxEntities?: number[]; dxContinents?: string[]; dxCqZones?: number[]; dxItuZones?: number[]; spotterEntities?: number[]; spotterContinents?: string[] };
 export type DxAlertConfiguration = { generation: string; revision: number; enabled: boolean; dedupSeconds: number; retentionMinutes: number; nativePopup: boolean; notificationSound: boolean; rules: DxAlertRule[] };
-export type DxAlertEntry = { id: string; test: boolean; source?: "cluster" | "wsjtx" | "test"; callsign: string; frequencyKHz: number; band: string; mode: string; comment: string; callStatus: string; dxccStatus: string; specialTags: string[]; ruleNames: string[]; count: number; firstSeenMs: number; lastSeenMs: number; geography?: DxAlertGeography; observation?: {id:string; activation:{sourceEpoch:string;spotVersion:string}} | null };
-export type DxAlertsSnapshot = { epoch: string; revision: number; configuration: DxAlertConfiguration; storageError: string | null; source: { available: boolean; baselined: boolean; revision: number; receivedAtMs: number }; activitySource?: { available: boolean; baselined: boolean; revision: number; classificationRevision?: number; receivedAtMs: number }; entries: DxAlertEntry[]; delivery: { error: string | null; suppressed: number; maximumPerWindow: number; windowSeconds: number }; limits: { maximumRules: number; maximumEntries: number } };
+export type DxAlertEntry = { id: string; test: boolean; source?: "cluster" | "wsjtx" | "test"; callsign: string; frequencyKHz: number; band: string; mode: string; comment: string; country?: string; spotter?: string; score?: number | null; workedBefore?: number | null; callStatus: string; dxccStatus: string; specialTags: string[]; ruleNames: string[]; count: number; firstSeenMs: number; lastSeenMs: number; geography?: DxAlertGeography; observation?: {id:string; activation:{sourceEpoch:string;spotVersion:string}} | null };
+export type DxAlertsSnapshot = { epoch: string; revision: number; completed?: string[]; progressReady?: boolean; configuration: DxAlertConfiguration; storageError: string | null; source: { available: boolean; baselined: boolean; revision: number; receivedAtMs: number }; activitySource?: { available: boolean; baselined: boolean; revision: number; classificationRevision?: number; receivedAtMs: number }; entries: DxAlertEntry[]; delivery: { error: string | null; suppressed: number; maximumPerWindow: number; windowSeconds: number }; limits: { maximumRules: number; maximumEntries: number } };
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const identifier = /^[a-z0-9-]{1,64}$/;
@@ -22,10 +22,13 @@ const strings = (value: unknown, maximum: number) => Array.isArray(value) && val
 export function checkedDxAlerts(input: unknown): DxAlertsSnapshot {
   const value = input as DxAlertsSnapshot;
   if (!value || !uuid.test(value.epoch) || !integer(value.revision) || !value.configuration || !value.source || !value.delivery || !value.limits ||
+    value.completed !== undefined && (!Array.isArray(value.completed) || value.completed.length > 4992 || value.completed.some(c=>typeof c!=="string"||c.length>128)) ||
+    value.progressReady !== undefined && typeof value.progressReady !== "boolean" ||
     typeof value.configuration.generation !== "string" || !uuid.test(value.configuration.generation) || !integer(value.configuration.revision) ||
     typeof value.configuration.enabled !== "boolean" || typeof value.configuration.nativePopup !== "boolean" || typeof value.configuration.notificationSound !== "boolean" || value.configuration.notificationSound && !value.configuration.nativePopup || !integer(value.configuration.dedupSeconds, 3_600) || value.configuration.dedupSeconds < 15 || !integer(value.configuration.retentionMinutes, 1_440) || value.configuration.retentionMinutes < 1 ||
     !Array.isArray(value.configuration.rules) || value.configuration.rules.length > 32 || value.configuration.rules.some(rule => !rule || !identifier.test(rule.id) ||
       typeof rule.name !== "string" || !rule.name.trim() || rule.name.length > 80 || typeof rule.enabled !== "boolean" || typeof rule.callsignGlob !== "string" || rule.callsignGlob.length > 32 ||
+      rule.chaseModes !== undefined && (!Array.isArray(rule.chaseModes) || rule.chaseModes.length > 12 || new Set(rule.chaseModes).size !== rule.chaseModes.length || rule.chaseModes.some(m=>!["CW","SSB","AM","FM","RTTY","FT8","FT4","PSK","DATA"].includes(m))) ||
       rule.sources !== undefined && (!Array.isArray(rule.sources) || rule.sources.length < 1 || rule.sources.length > 2 || new Set(rule.sources).size !== rule.sources.length || rule.sources.some(source => !["cluster", "wsjtx"].includes(source))) ||
       typeof rule.commentContains !== "string" || new TextEncoder().encode(rule.commentContains).length > 80 || /[\x00-\x1f\x7f-\x9f]/.test(rule.commentContains) || !!rule.commentContains && !rule.commentContains.trim() ||
       !numbers(rule.dxEntities,999) || !numbers(rule.spotterEntities,999) || !numbers(rule.dxCqZones,40) || !numbers(rule.dxItuZones,90) || !continents(rule.dxContinents) || !continents(rule.spotterContinents) || !strings(rule.bands, 13) || !strings(rule.modes, 3) || !strings(rule.callStatuses, 7) || !strings(rule.dxccStatuses, 10) || !strings(rule.specials, 16)) ||
@@ -63,15 +66,23 @@ export function connectDxAlerts(changed: (value: DxAlertsSnapshot) => void, fail
   return () => { active = false; stop?.(); window.removeEventListener("focus", focus); };
 }
 
-export const saveDxAlerts = (snapshot: DxAlertsSnapshot, configuration: Omit<DxAlertConfiguration, "generation" | "revision">) =>
-  invoke("dx_alerts_save", { expectedGeneration: snapshot.configuration.generation, expectedRevision: snapshot.configuration.revision, configuration }).then(checkedDxAlerts);
+export const dxAlertError = (cause: unknown, fallback: string) =>
+  cause instanceof Error ? cause.message : typeof cause === "string" && cause.trim() ? cause : fallback;
+
+export const saveDxAlerts = (snapshot: DxAlertsSnapshot, configuration: Omit<DxAlertConfiguration, "generation" | "revision">) => {
+  // Native snapshots also carry storage metadata (including version). The save
+  // owner accepts only these editable fields and rejects all unknown keys.
+  const { enabled, dedupSeconds, retentionMinutes, nativePopup, notificationSound, rules } = configuration;
+  return invoke("dx_alerts_save", { expectedGeneration: snapshot.configuration.generation, expectedRevision: snapshot.configuration.revision,
+    configuration: { enabled, dedupSeconds, retentionMinutes, nativePopup, notificationSound, rules } }).then(checkedDxAlerts);
+};
 export const testDxAlert = () => invoke("dx_alerts_test").then(checkedDxAlerts);
 export const clearDxAlerts = () => invoke("dx_alerts_clear").then(checkedDxAlerts);
 export const clearSelectedDxAlerts = (snapshot: DxAlertsSnapshot, ids: string[]) =>
   invoke("dx_alerts_clear_selected", { expectedEpoch: snapshot.epoch, ids }).then(checkedDxAlerts);
 
 export const previewDxAlerts = (rules:DxAlertRule[]) => invoke<{matches:{callsign:string;frequencyKHz:number;ruleNames:string[]}[]}>("dx_alerts_preview",{rules});
-export const reviewDxAlert = (epoch:string,id:string) => invoke<{entry:DxAlertEntry;observation:DxAlertEntry["observation"];admissible:boolean;reason:string|null;alternatives?:{id:string;callsign:string;frequencyKHz:number;activation:{sourceEpoch:string;spotVersion:string}}[]}>("dx_alerts_review",{epoch,id});
+export const reviewDxAlert = (epoch:string,id:string) => invoke<{entry:DxAlertEntry;observation:DxAlertEntry["observation"];currentObservation?:DxAlertEntry["observation"];admissible:boolean;reason:string|null;alternatives?:{id:string;callsign:string;frequencyKHz:number;activation:{sourceEpoch:string;spotVersion:string}}[]}>("dx_alerts_review",{epoch,id});
 export const dxRuleSummary = (rule:DxAlertRule) => [rule.bands.join(" / "),rule.modes.join(" / ").toUpperCase(),rule.callsignGlob,rule.dxccStatuses.join(" / "),
   rule.dxEntities?.length ? `DXCC ${rule.dxEntities.join(" / ")}` : "",rule.dxContinents?.join(" / "),
   rule.dxCqZones?.length ? `DX CQ ${rule.dxCqZones.join(" / ")}` : "",rule.dxItuZones?.length ? `DX ITU ${rule.dxItuZones.join(" / ")}` : "",

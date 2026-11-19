@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExternalStore, type SetStateAction } from "react";
 import { workerRequest } from "../worker";
 import QSOEditor from "./QSOEditorCore";
@@ -199,8 +200,8 @@ export function DetachedQSOSurface() {
   return <div className="app live monitor-app detached-qso-app"><main className="qso-feedback-area live-feedback-host" aria-label="Detached Log QSO">
     {loggedFeedback.toast}
     <StableFeedbackLayer>
-    {savingQSO && <p className="live-message" role="status">Saving QSO…</p>}
-    {error && <p className="live-error" role="alert">{error}</p>}
+    {savingQSO && <ErrorNotice><p className="live-message" role="status">Saving QSO…</p></ErrorNotice>}
+    {error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
     {readOperation.current && <button type="button" disabled={radioBusy} onClick={() => void checkReadRadio()}>Check Read radio</button>}
     <SpotActivationStatus status={spotEditor.status} error={spotEditor.error} reconcile={() => void spotEditor.reconcile()} />
     <OperatorDraftStatus state={state} session={session} run={run} />
@@ -215,7 +216,7 @@ export function DetachedQSOSurface() {
       beforeApply={async()=>{if(!acceptsInput()||localInput.current)throw new Error("Finish the buffered fields first.");await session.flush();}}
       onApplied={async result=>{await spotEditor.reconcile(result);}} />}
     <div className="detached-qso-modes" role="group" aria-label="QSO editor mode">{(["simple", "full"] as const).map(value => <button key={value} type="button" aria-pressed={mode === value} disabled={working || closing || blocked} onClick={() => switchMode(value)}>{value === "simple" ? "Simple" : "Full"}</button>)}</div>
-    {mode === "simple" ? <Suspense fallback={<p role="status">Loading simple QSO editor…</p>}><DeskQSO referenceEvidence={referenceEvidence} draft={state.draft} setDraft={setDraft} save={() => void save()} clear={clear}
+    {mode === "simple" ? <Suspense fallback={<ErrorNotice><p role="status">Loading simple QSO editor…</p></ErrorNotice>}><DeskQSO referenceEvidence={referenceEvidence} draft={state.draft} setDraft={setDraft} save={() => void save()} clear={clear}
       automaticStart={automaticStart}
       busy={working || closing || blocked} draftLocked={working || closing || inputBlocked} request={request} refresh={state.base?.revision ?? 0}
       follow={false} setFollow={() => {}} radioControls={false} onReadRadio={readRadio} onLocalInputState={inputState} canAcceptLocalInput={acceptsInput} />

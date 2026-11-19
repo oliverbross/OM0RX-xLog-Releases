@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestMethod, ContestRequest } from "./types";
 import { durationText } from "./contestSchedule";
@@ -53,10 +54,16 @@ export function ContestOperatingInfo({ request, scope, onPlanSave }: {
           expectedRevision: scope.revision, now: new Date().toISOString(),
         });
         if (!active) return;
-        if (!response.ok) throw new Error(response.error.message ?? "Operating information unavailable");
+        if (!response.ok) {
+          // A contact was just logged: the revision moved and this effect
+          // re-runs with the new one, so keep the current view quietly.
+          if (response.error.code === "stale_revision") return;
+          throw new Error(response.error.message ?? "Operating information unavailable");
+        }
         setSnapshot({ key, value: response.result }); setError("");
       } catch (failure) {
-        if (active) { setSnapshot(null); setError(String(failure instanceof Error ? failure.message : failure)); }
+        // Keep the last figures visible; the next 5 s read replaces them.
+        if (active) setError(String(failure instanceof Error ? failure.message : failure));
       } finally { pending = false; }
     };
     void refresh();
@@ -76,7 +83,7 @@ export function ContestOperatingInfo({ request, scope, onPlanSave }: {
   };
   return <section aria-label="Operating rules and plan" aria-busy={!data && !error}>
     <h3>Operating rules and plan</h3>
-    {error && <p role="alert">{error}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     {!data ? <p>Operating information unavailable for this log revision.</p> : <>
       <p>{data.profile ? `${data.profile.label} · ${data.profile.categoryBand} · ${data.profile.scope} scope` : data.unverifiedReason}</p>
       {data.profile && <p><a href={data.profile.sourceURL} target="_blank" rel="noreferrer">Official {data.profile.edition} rules</a>{" · "}
@@ -89,13 +96,13 @@ export function ContestOperatingInfo({ request, scope, onPlanSave }: {
         {data.allowance && <><dt>Reconstructed allowance use through last logged activity minute</dt><dd>{data.allowance.reconstructedMinutes} / {data.allowance.limitMinutes} min · {data.allowance.remainingMinutes} min remaining in reconstruction · {data.allowance.status.replaceAll("-", " ")}</dd></>}
       </dl>
       <p>{data.durationNote} Plans and rest notes are intentions, not observed intervals.</p>
-      {(data.invalidTimestampQSOs > 0 || data.excludedPeriodOrFutureQSOs > 0) && <p role="status">Excluded: {data.invalidTimestampQSOs} invalid timestamps; {data.excludedPeriodOrFutureQSOs} outside the selected period or after evaluation UTC.</p>}
+      {(data.invalidTimestampQSOs > 0 || data.excludedPeriodOrFutureQSOs > 0) && <ErrorNotice><p role="status">Excluded: {data.invalidTimestampQSOs} invalid timestamps; {data.excludedPeriodOrFutureQSOs} outside the selected period or after evaluation UTC.</p></ErrorNotice>}
       {data.bandChanges && <><p>QSO-observed band changes · maximum {data.bandChanges.limit} per UTC clock hour · mode changes excluded. Transmission compliance unverified.</p>
-        {!data.bandChanges.complete && <p role="status">Incomplete band/order evidence: {data.bandChanges.unknownOrderOrBandQSOs} QSO(s). Counts are lower bounds.</p>}
+        {!data.bandChanges.complete && <ErrorNotice><p role="status">Incomplete band/order evidence: {data.bandChanges.unknownOrderOrBandQSOs} QSO(s). Counts are lower bounds.</p></ErrorNotice>}
         {data.bandChanges.hours.length ? <ul>{data.bandChanges.hours.map(hour => <li key={hour.hourUTC}>{hour.hourUTC}: {hour.changes} / {data.bandChanges!.limit} · {hour.status.replaceAll("-", " ")}</li>)}</ul> : <p>No band changes observed in available QSO evidence.</p>}</>}
       {data.bandDwell&&<section aria-label="Functional signal clocks"><h4>Functional signal clocks · {data.bandDwell.limitMinutes} minutes</h4>
         <p>{data.bandDwell.roleEvidence}. Tuning/listening does not start these clocks. Unlogged transmission and CQ activity remain unknown.</p>
-        {!data.bandDwell.complete&&<p role="status">Unknown role or band for {data.bandDwell.unknownRoleOrBandIDs.length} activity record(s); available clocks are incomplete.</p>}
+        {!data.bandDwell.complete&&<ErrorNotice><p role="status">Unknown role or band for {data.bandDwell.unknownRoleOrBandIDs.length} activity record(s); available clocks are incomplete.</p></ErrorNotice>}
         <dl>{data.bandDwell.clocks.map(clock=><div key={clock.role}><dt>{clock.role} · {clock.band??"Unknown band"}</dt>
           <dd>{clock.eligibleUTC?`Next band eligibility ${clock.eligibleUTC} · ${durationText(clock.remainingSeconds??0)} remaining` : "No attributed start event"} · {clock.basis.replaceAll("-"," ")}</dd></div>)}</dl>
         {data.bandDwell.events.some(event=>event.status!=="clock-start")&&<ul>{data.bandDwell.events.filter(event=>event.status!=="clock-start").map((event,index)=><li key={`${event.id}/${index}`}>{event.atUTC} · {event.role}: {event.status.replaceAll("-"," ")} · record retained</li>)}</ul>}
@@ -104,7 +111,7 @@ export function ContestOperatingInfo({ request, scope, onPlanSave }: {
       {!!data.qtcActivityEvidence?.length&&<details><summary>QTC activity evidence</summary><ul>{data.qtcActivityEvidence.map(row=><li key={row.id}>
         {row.atUTC} · {row.band??"Unknown band"} · {row.evidence} · {row.frequencyBasis.replaceAll("-"," ")}
       </li>)}</ul></details>}
-      {!!data.invalidQTCActivity&&<p role="status">{data.invalidQTCActivity} QTC transfer timestamp(s) are unknown; off-time evidence is incomplete.</p>}
+      {!!data.invalidQTCActivity&&<ErrorNotice><p role="status">{data.invalidQTCActivity} QTC transfer timestamp(s) are unknown; off-time evidence is incomplete.</p></ErrorNotice>}
       {data.offTime && data.offTime.gaps.length > 0 && <details><summary>Contributing QSO gaps</summary><ul>{data.offTime.gaps.map(gap => <li key={gap.startUTC}>{gap.startUTC} – {gap.endUTCExclusive}: {gap.emptyMinutes} empty minutes · {gap.qualifiesLogCriterion ? "qualifies log criterion" : "below minimum"}</li>)}</ul></details>}
       {onPlanSave && <fieldset disabled={saving}><legend>Operator plan</legend>
         <label>Rule edition/category<select aria-label="Operating rule profile" value={plan.ruleProfileID} onChange={event => updatePlan({ ruleProfileID: event.target.value })}>

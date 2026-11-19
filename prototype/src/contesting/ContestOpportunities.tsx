@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ContestRequest } from "./types";
 import type { ContestSurfaceSpot } from "./contestSurfaceProtocol";
@@ -55,7 +56,7 @@ export function ContestOpportunities({scope,request,spots,bands,mode,currentCall
   const shared=new Map<string,number>();for(const row of opportunities)for(const item of previews[row.id]?.newDimensions??[]){const key=JSON.stringify(item);shared.set(key,(shared.get(key)??0)+1);}
   return <section className="contest-productivity-section" aria-label="Opportunities and Move Multipliers"><h2>Opportunities & Move Multipliers</h2>
     <p>Observations are grouped by call, band and mode. Conditional gains are not guaranteed results or expected probabilities. Shared new multipliers are not additive.</p>
-    {error&&<p role="alert">{error}</p>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     <div className="contest-opportunity-scroll"><table><thead><tr><th>Opportunity</th><th>Evidence</th><th>Plugin review</th><th>Conditional score gain</th></tr></thead><tbody>
       {opportunities.map(row=>{const preview=previews[row.id],age=formatSpotAge(Math.max(...row.observations.map(item=>item.receivedAt)),ageClock);return <tr key={row.id}>
         <th scope="row"><button type="button" aria-pressed={selected===row.id} onClick={()=>setSelected(row.id)}>{row.callsign} · {row.band}/{row.mode}</button></th>

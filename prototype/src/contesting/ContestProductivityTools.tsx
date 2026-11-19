@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestRequest } from "./types";
 import { ContestServerError } from "./client";
@@ -95,12 +96,12 @@ function NotesEditor({scope,request,disabled,onSave,onLast}:{scope:Scope;request
       setUncertain(attempted&&!confirmed);setError(message(cause));}finally{setSaving(false);}};
   const begin=(captured:CapturedNoteTarget)=>{try{retained.start(captured);setHidden(false);setNotice("");}catch(cause){setError(message(cause));}};
   return <section className="contest-productivity-section" aria-label="Contest notes"><h2>Notes</h2>
-    {recoveryFailure&&<div role="alert"><p>{recoveryFailure.message}</p><button onClick={()=>readRecovery(recoveryFailure.key)}>Retry saved recovery</button>
-      <button disabled={recoveryFailure.raw===null} onClick={archiveRecovery}>Archive unreadable recovery record</button></div>}
+    {recoveryFailure&&<ErrorNotice><div role="alert"><p>{recoveryFailure.message}</p><button onClick={()=>readRecovery(recoveryFailure.key)}>Retry saved recovery</button>
+      <button disabled={recoveryFailure.raw===null} onClick={archiveRecovery}>Archive unreadable recovery record</button></div></ErrorNotice>}
     <UnfinishedRecovery editor={retained}/>
     {operations.filter(key=>key!==pendingKey.current).map(key=><button key={key} disabled={saving} onClick={()=>readRecovery(key)}>Reconcile retained note {key.slice(-8)}</button>)}
-    {uncertain&&<p role="status">Save outcome uncertain. Reconcile the same note operation; its text cannot be edited or discarded.</p>}
-    {target&&(target.sessionID!==scope.sessionID||target.workspaceGeneration!==scope.workspaceGeneration)&&<p role="alert">Original note workspace or contest is incompatible. Copy or discard the retained draft; it cannot be rebound.</p>}
+    {uncertain&&<ErrorNotice><p role="status">Save outcome uncertain. Reconcile the same note operation; its text cannot be edited or discarded.</p></ErrorNotice>}
+    {target&&(target.sessionID!==scope.sessionID||target.workspaceGeneration!==scope.workspaceGeneration)&&<ErrorNotice><p role="alert">Original note workspace or contest is incompatible. Copy or discard the retained draft; it cannot be rebound.</p></ErrorNotice>}
     <div className="contest-productivity-actions"><button disabled={disabled||saving||uncertain||!!recoveryFailure||!!retained.draft} onClick={()=>begin({identity:{draftID:scope.draftID,...laneTarget},label:`Current draft ${scope.draftID.slice(0,8)}${laneLabel}`,sessionID:scope.sessionID,workspaceGeneration:scope.workspaceGeneration})}>Note current</button>
       <button disabled={disabled||saving||uncertain||!!recoveryFailure||!!retained.draft} onClick={()=>{const sessionID=scope.sessionID,workspaceGeneration=scope.workspaceGeneration,origin={...laneTarget};void onLast().then(row=>begin({identity:{qsoID:row.qsoID,...origin,...(row.laneID?{laneID:row.laneID,bindingVersion:row.bindingVersion,bindingGeneration:row.bindingGeneration}:{})},label:`Last QSO ${row.callsign}${laneLabel}`,sessionID,workspaceGeneration})).catch(cause=>setError(message(cause)));}}>Note last QSO</button></div>
     {hidden&&target&&<button onClick={()=>setHidden(false)}>Resume retained note</button>}
@@ -111,8 +112,8 @@ function NotesEditor({scope,request,disabled,onSave,onLast}:{scope:Scope;request
       {!uncertain&&<><button disabled={saving} onClick={()=>{try{retained.flush();setHidden(true);}catch(cause){setError(message(cause));}}}>Cancel note (retain draft)</button>
         <button disabled={saving} onClick={()=>{try{if(checkAttempt())return;retained.keepForLater();setHidden(false);}catch(cause){setError(message(cause));}}}>Keep draft for later</button>
         <button disabled={saving} onClick={()=>{try{if(checkAttempt())return;retained.clear();setHidden(false);}catch(cause){setError(message(cause));}}}>Discard draft</button></>}</div>}
-    {error&&<p role="alert">{error}</p>}
-    {notice&&<p role="status">{notice}</p>}
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
+    {notice&&<ErrorNotice><p role="status">{notice}</p></ErrorNotice>}
     <ul aria-label="Saved contest notes">{notes.map(note=><li key={note.id}><strong>{note.callsign||`Draft ${note.draft_id?.slice(0,8)}`}</strong> <time>{note.created_utc}</time><p>{note.body}</p></li>)}</ul>
     {!total&&<p>No notes yet. Attach an observation to the current draft or last saved QSO.</p>}
     <div className="contest-productivity-actions"><button disabled={offset===0} onClick={()=>setOffset(Math.max(0,offset-50))}>Previous notes</button><span>{total} notes</span><button disabled={offset+50>=total} onClick={()=>setOffset(offset+50)}>Next notes</button></div>
@@ -151,7 +152,7 @@ export function ContestSubmissionPanel({scope,request,formats,disabled,onExport,
       {onArchive&&<button disabled={disabled||reading} onClick={()=>void preflight(true)}>Review immutable archive</button>}
       {onInspectArchive&&<button disabled={disabled||reading} onClick={()=>void onInspectArchive().then(setInspection).catch(cause=>setError(message(cause)))}>Inspect saved archive…</button>}</div>
     {inspection!==null&&<details open><summary>Read-only archive verification</summary><pre style={{whiteSpace:"pre-wrap",overflowWrap:"anywhere"}}>{JSON.stringify(inspection,null,2)}</pre></details>}
-    {error&&<p role="alert">{error}</p>}{review&&<><ul>{review.checks.map(item=><li key={item.id}><strong>{item.status.toUpperCase()}</strong> · {item.message}</li>)}</ul>
+    {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{review&&<><ul>{review.checks.map(item=><li key={item.id}><strong>{item.status.toUpperCase()}</strong> · {item.message}</li>)}</ul>
       <p>Revision {review.revision} · {String(review.manifest.byteLength)} bytes · SHA-256 <code>{String(review.manifest.sha256)}</code></p>
       <div className="contest-productivity-actions"><button disabled={disabled||review.revision!==scope.revision} onClick={()=>{const selected=typeof review.manifest.siteID==="string"?review.manifest.siteID:undefined;
         void(selected?onExport(format as "edi",review.revision,String(review.manifest.sha256),selected):onExport(format as "cabrillo"|"adif"|"edi",review.revision,String(review.manifest.sha256))).catch(cause=>setError(message(cause)));}}>Save reviewed export</button>

@@ -1,6 +1,5 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
-import CoreFoundation
 import XCatIntegrationCore
 
 /// A rotor transport has its own lifetime, independent of either radio owner.
@@ -14,7 +13,7 @@ protocol RotorTransport: AnyObject, Sendable {
 
 extension DCU1RotatorClient: RotorTransport {}
 
-/// Network.framework delivers state and headings on one serial queue. Reduce
+/// The transport delivers state and headings on one serial queue. Reduce
 /// them synchronously there so bursts stay ordered without a task per sample.
 private final class RotorTelemetry: @unchecked Sendable {
     struct Value {
@@ -78,7 +77,7 @@ actor LiveRotorSession {
             return projection()
         case "station_rotor_connect":
             try requireKeys(params, allowed: ["provider", "host", "port", "name"])
-            let host = try LiveStationSession.validatedRotorHost(params["host"])
+            let host = try Self.validatedRotorHost(params["host"])
             guard let port = try Self.integer(params["port"]), (1...65_535).contains(port) else {
                 throw Self.invalidParams()
             }
@@ -104,8 +103,7 @@ actor LiveRotorSession {
             return projection()
         case "station_rotor_goto":
             try requireKeys(params, allowed: ["provider", "bearing", "label"])
-            guard let number = params["bearing"] as? NSNumber,
-                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+            guard let raw = params["bearing"], let number = LiveStationMethods.jsonNumber(raw),
                   number.doubleValue.isFinite, (0...360).contains(number.doubleValue),
                   params["label"] == nil || params["label"] is String else { throw Self.invalidParams() }
             let (client, captured, revision) = try beginCommand()
@@ -187,9 +185,18 @@ actor LiveRotorSession {
         }
     }
 
+    static func validatedRotorHost(_ value: Any?) throws -> String {
+        guard let raw = value as? String else { throw invalidParams() }
+        let host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (1...253).contains(host.utf8.count),
+              !host.contains(where: { $0.isWhitespace || $0.isNewline }),
+              !host.utf8.contains(0), !host.contains("/"), !host.contains("@"), !host.contains(":") else { throw invalidParams() }
+        return host
+    }
+
     private static func integer(_ raw: Any?) throws -> Int64? {
         guard let raw else { return nil }
-        guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+        guard let value = LiveStationMethods.jsonNumber(raw),
               value.doubleValue.isFinite, value.doubleValue.rounded() == value.doubleValue,
               value.doubleValue >= Double(Int64.min), value.doubleValue < Double(Int64.max) else {
             throw invalidParams()

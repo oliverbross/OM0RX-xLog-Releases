@@ -598,7 +598,7 @@ impl Selection {
     }
     pub(crate) fn receive_startup_control<G>(&self, request: Value, expected: u64, identity: &str, control_revision: u64,
         mut auto_rotor_epoch: u64, admit: impl FnOnce() -> Result<G, String>) -> Result<(Value, u64), String> {
-        if request["method"] != "station_connect" || request["params"]["provider"] != "direct_agent" {
+        if !saved_startup_route(&request) {
             return Err("Invalid saved station startup route.".into());
         }
         let result = self.control_scoped_dispatch_with_startup(request,
@@ -806,6 +806,30 @@ impl Selection {
         result
     }
 }
+fn saved_startup_route(request: &Value) -> bool {
+    match request["method"].as_str() {
+        Some("station_connect") => matches!(request["params"]["provider"].as_str(),
+            Some("direct_agent" | "direct_flex_lan" | "direct_tci")),
+        Some("hamlib_connect") => request["params"]["device"] == "radio",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn startup_routes_only_restore_connections() {
+    for provider in ["direct_agent", "direct_flex_lan", "direct_tci"] {
+        assert!(saved_startup_route(&json!({"method":"station_connect","params":{"provider":provider}})));
+    }
+    assert!(saved_startup_route(&json!({"method":"hamlib_connect","params":{"device":"radio"}})));
+    for request in [
+        json!({"method":"hamlib_connect","params":{"device":"rotor"}}),
+        json!({"method":"station_connect","params":{"provider":"unknown"}}),
+        json!({"method":"station_radio_control","params":{"provider":"direct_flex_lan","control":"ptt","enabled":true}}),
+        json!({"method":"station_tune","params":{"provider":"direct_agent"}}),
+    ] { assert!(!saved_startup_route(&request)); }
+}
+
 fn urgent_release(request: &Value) -> bool {
     match request["method"].as_str() {
         Some("station_action") => matches!(request["params"]["action"].as_str(), Some("cancel" | "standby")),

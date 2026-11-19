@@ -1,4 +1,5 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { ErrorNotice } from "./ErrorNotice";
+import { lazy, Suspense, useEffect, useState, type CSSProperties } from "react";
 import { ContactRound } from "lucide-react";
 import { countryDisplay } from "./countryDisplay";
 import { sameNormalLogCall } from "./draftEnrichment";
@@ -16,14 +17,21 @@ const utcSummary = (value: unknown) => typeof value === "string" && Number.isFin
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 
 type Evidence = { contextKey: string; call: string; adif: number | null; callCells?: Data[]; history?: Data; error?: string };
+const IntelligenceProgressDialog = lazy(() => import("./IntelligenceProgressDialog"));
 export function DeskIntelligence({ draft, lookup, previous, request, refresh, onRetryLookup, lookupPending = false, intelligenceBands, contextKey = "", emptyMessage = "Enter a callsign", taskOnly = false }: DeskIntelligenceProps) {
   const call = normalizedCall(draft?.call), sameLookup = call && normalizedCall(lookup?.call) === call;
   const info = sameLookup ? lookup : null;
   const adif = info && Number.isInteger(info.dxcc) && info.dxcc > 0 ? info.dxcc as number : null;
   const [evidence, setEvidence] = useState<Evidence | null>(null);
+  const [progress, setProgress] = useState(false);
+  useEffect(() => setProgress(false), [call, adif, contextKey]);
   useEffect(() => {
     if (!/^[A-Z0-9/-]{3,32}$/.test(call)) { setEvidence(null); return; }
-    let active = true; setEvidence({ contextKey, call, adif });
+    let active = true;
+    // Keep the matched matrix in place during passive refreshes: clearing it
+    // briefly changes the centered progress dialog's height and position.
+    setEvidence(previous => previous?.contextKey === contextKey && previous.call === call && previous.adif === adif
+      ? previous : { contextKey, call, adif });
     void Promise.allSettled([request("logbook_matrix", { call }), request("cluster_history", { call, ...(adif ? { adif } : {}) })]).then(([matrix, history]) => {
       if (!active) return;
       const cells = matrix.status === "fulfilled" && Array.isArray(matrix.value?.cells) ? matrix.value.cells : undefined;
@@ -54,13 +62,19 @@ export function DeskIntelligence({ draft, lookup, previous, request, refresh, on
     return <small title={full}><span aria-hidden="true">{workedText} wkd · {confirmedText} cnf</span><span className="desk-count-full">{full}</span></small>;
   };
   return <section className="desk-panel desk-intelligence" aria-label="Callsign and DXCC intelligence">{!taskOnly && <h2><ContactRound size={15} aria-hidden="true" /> Callsign &amp; DXCC intelligence</h2>}
-    <div className="desk-identity"><div><strong>{call || "—"}</strong><b>{name || "Name unavailable"}</b><span>{country || "Country unresolved"}</span></div><div className="desk-provenance"><b>{info?.source || (call ? "Lookup pending" : emptyMessage)}</b><small>{finite(info?.latitude) && finite(info?.longitude) ? info?.location_source || info?.source || "POSITION RESOLVED" : "NO POSITION"}</small></div></div>
+    <div className="desk-identity"><div><strong>{call || "—"}</strong><b>{name || "Name unavailable"}</b><span>{country || "Country unresolved"}</span></div><div className="desk-provenance"><div className="desk-identity-actions"><button type="button" disabled={!/^[A-Z0-9/-]{3,32}$/.test(call)} onClick={() => setProgress(true)}>Progress</button><b>{info?.source || (call ? "Lookup pending" : emptyMessage)}</b></div><small>{finite(info?.latitude) && finite(info?.longitude) ? info?.location_source || info?.source || "POSITION RESOLVED" : "NO POSITION"}</small></div></div>
     <dl className="desk-identity-facts">{[["DXCC", adif ? `#${adif}` : "—"], ["GRID", grid || "—"], ["CONT", continent || "—"], ["ZONES", `CQ ${cq || "—"} · ITU ${itu || "—"}`], ["DISTANCE", finite(info?.distance_km) ? `${Math.round(info.distance_km).toLocaleString()} km` : "—"]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd title={value}>{value}</dd></div>)}</dl>
+    {info && [info.qth, info.state, info.county, info.nickname].some(Boolean) && <dl className="desk-profile-details">
+      {Object.entries({ QTH: info.qth, State: info.state, County: info.county, Nickname: info.nickname }).filter(([, value]) => value).map(([label, value]) =>
+        <div key={label}><dt>{label}</dt><dd>{String(value)}</dd></div>)}
+    </dl>}
     <div className="desk-matrices"><div><h3>CALLSIGN {counts(current?.history?.previous_count, current?.history?.previous_confirmed_count)}</h3>{matrix("Callsign", current?.callCells)}</div><div><h3>DXCC {adif ? `#${adif}` : "—"} {counts(adif ? current?.history?.dxcc_contact_count : undefined, adif ? current?.history?.dxcc_confirmed_count : undefined)}</h3>{matrix("DXCC", adif ? current?.history?.matrix : undefined)}</div></div>
     <footer><span>{lastCall ? `CALL LAST · ${utcSummary(lastCall.date ?? lastCall.start)}` : current?.history?.previous_count === 0 ? "CALL · NEW" : "CALL LAST · —"}</span><span>DXCC LAST · {current?.history?.last_dxcc_qso ? utcSummary(current.history.last_dxcc_qso.date ?? current.history.last_dxcc_qso.start) : "Unavailable"}</span></footer>
-    {current?.error && <p className="desk-error" role="status">{current.error}</p>}
-    {info?.lookup_warning && <p className="desk-error" role="status">{info.lookup_warning}</p>}
-    {onRetryLookup && info && (info.lookup_error || ["unavailable", "settings_busy", "credential_required", "workspace_unavailable"].includes(info.lookup_status)) &&
+    {current?.error && <ErrorNotice when={Boolean(current.error) || undefined}><p className="desk-error" role="status">{current.error}</p></ErrorNotice>}
+    {info?.lookup_warning && <ErrorNotice when={Boolean(info.lookup_warning) || undefined}><p className="desk-error" role="status">{info.lookup_warning}</p></ErrorNotice>}
+    {onRetryLookup && call &&
       <button type="button" onClick={onRetryLookup} disabled={lookupPending}>{lookupPending ? "Retrying lookup…" : "Retry lookup"}</button>}
+    {progress && <Suspense fallback={<ErrorNotice><p role="status">Opening progress…</p></ErrorNotice>}><IntelligenceProgressDialog call={call} adif={adif} country={country} bands={visibleBands}
+      callCells={current?.callCells as any} dxccCells={adif ? current?.history?.matrix : undefined} error={current?.error} onClose={() => setProgress(false)}/></Suspense>}
   </section>;
 }

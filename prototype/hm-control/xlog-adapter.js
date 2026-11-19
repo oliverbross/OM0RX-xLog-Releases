@@ -1,10 +1,14 @@
 import { invoke } from '@tauri-apps/api/core';
+import { showHMError } from './feedback.js';
 import { frequencyBand, hamlibProjection } from '../src/live/hamlibStation';
 import { mapRadioFrequency, mapClusterFresh } from '../src/live/mapObservations';
 
-const status = (text, failed = false) => {
+// Failures show in the status line while recovery is automatic; the dialog
+// opens only once automatic recovery has stopped and the operator must act.
+const status = (text, failed = false, interrupt = false) => {
   const el = document.getElementById('xlog-link');
   el.textContent = text; el.classList.toggle('failed', failed);
+  if (interrupt) { try { showHMError(text, 'connection'); } catch { /* the status line already shows it */ } }
 };
 export function homeFrom(value) {
   const home = value?.context?.metadata?.home;
@@ -26,7 +30,7 @@ export async function connectXLog() {
   for (;;) {
     try { initial = await invoke('hm_control_snapshot'); homeFrom(initial); break; }
     catch (error) {
-      status(String(error), true); retry.hidden = false;
+      status(String(error), true, startupFailures >= 3); retry.hidden = false;
       // Read-only startup can race a busy station session; retry three times
       // without overlapping requests, while keeping manual reconnect available.
       await new Promise(resolve => {
@@ -59,7 +63,7 @@ export async function connectXLog() {
       if (disposed) return;
       failures++;
       callback?.({ ...link.current, rig: null });
-      status(`xLog updates paused · retained log · radio unavailable · reconnecting${failures > 3 ? ' (check the main window)' : '…'}`, true);
+      status(`xLog updates paused · retained log · radio unavailable · reconnecting${failures > 3 ? ' (check the main window)' : '…'}`, true, failures === 4);
     } finally { reading = false; }
   }
   const timer = setInterval(refresh, 2000);

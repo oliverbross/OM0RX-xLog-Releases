@@ -1,9 +1,10 @@
+import { ErrorNotice } from "./ErrorNotice";
 import type { ContactEditState, LogbookContactSession } from "./logbookContactSession";
 type Props = { state: ContactEditState; session: LogbookContactSession; run: (action: () => Promise<unknown>) => Promise<void> };
 export function ContactEditStatus({ state, session, run }: Props) {
   if (!state.error && !state.conflict) return null;
-  return <div className="live-error contact-recovery" role="alert" aria-label="Logged contact recovery">
-    <span>{state.error}</span>
+  return <ErrorNotice><div className="live-error contact-recovery" role="alert" aria-label="Logged contact recovery">
+    <ErrorNotice when={true}><span>{state.error}</span></ErrorNotice>
     {state.workspaceChanged ? <>
       <button type="button" disabled={state.locked} onClick={() => void run(() => session.useCurrent())}>Load current workspace contact</button>
       <button type="button" disabled={state.locked} onClick={() => void run(async () => session.cancel())}>Cancel edit</button>
@@ -16,5 +17,5 @@ export function ContactEditStatus({ state, session, run }: Props) {
       {state.draft && <button type="button" disabled={state.locked} onClick={() => void run(async () => session.cancel())}>Cancel edit</button>}
     </>}
     {state.draft && <button type="button" onClick={() => void run(() => navigator.clipboard.writeText(JSON.stringify(state.draft, null, 2)))}>Copy my edits</button>}
-  </div>;
+  </div></ErrorNotice>;
 }

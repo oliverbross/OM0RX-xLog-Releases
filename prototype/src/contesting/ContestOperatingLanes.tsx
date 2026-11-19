@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import type { KeyboardEvent, ReactNode } from "react";
 import { ContestTextField } from "./ContestPresentation";
 import { contestLaneTuningBlockReason } from "./contestLaneScope";
@@ -61,7 +62,7 @@ export function ContestOperatingLanes(props: ContestOperatingLanesProps) {
   if (props.mode === "SO1V") return null;
   const valid = props.lanes.length === 2 && new Set(props.lanes.map(lane => lane.laneID)).size === 2
     && new Set(props.lanes.map(lane => lane.draftID)).size === 2 && props.lanes.every(lane => Boolean(lane.draftID));
-  if (!valid) return <section aria-label="Operating lanes"><p role="alert">Two independent lane drafts are unavailable. Refresh the contest session before using two-lane entry.</p></section>;
+  if (!valid) return <section aria-label="Operating lanes"><ErrorNotice><p role="alert">Two independent lane drafts are unavailable. Refresh the contest session before using two-lane entry.</p></ErrorNotice></section>;
   const observed = props.observedTransmit;
   return <section className="contest-operating-lanes" aria-label={`${props.mode} operating lanes`}>
     <div className="contest-operating-lanes-facts" aria-label="Entry, listening and transmit state">
@@ -142,7 +143,7 @@ function Lane({ lane, disabled, entryLaneID, listeningLaneID, requestedTransmitL
       <span>RX {frequency(lane.receiveFrequencyHz)}<br/>Reserved serial {lane.reservedSerial ?? "unavailable"}</span></div>
     <div className={`contest-operating-lane-dupe is-${lane.dupe?.state ?? "unchecked"}`} role="status">
       {lane.dupe?.state === "duplicate" ? "Duplicate" : lane.dupe?.state === "clear" ? "Duplicate check clear" : "Duplicate check unavailable"}{lane.dupe?.reason ? ` · ${lane.dupe.reason}` : ""}</div>
-    {lane.errors?.length ? <p className="contest-operating-lane-error" role="alert">{lane.errors.join(" · ")}</p> : null}
+    {lane.errors?.length ? <ErrorNotice><p className="contest-operating-lane-error" role="alert">{lane.errors.join(" · ")}</p></ErrorNotice> : null}
     <div className="contest-operating-lane-style" role="group" aria-label={`${name} operating style`}>
       <label><input type="radio" name={`${lane.laneID}-style`} checked={lane.run} disabled={blocked} onChange={() => send({ kind: "run-change", value: true })}/>Run</label>
       <label><input type="radio" name={`${lane.laneID}-style`} checked={!lane.run} disabled={blocked} onChange={() => send({ kind: "run-change", value: false })}/>S&amp;P</label>

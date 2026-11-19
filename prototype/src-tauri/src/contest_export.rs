@@ -728,11 +728,12 @@ fn validate_queued_dialog(label: &str, exiting: bool) -> Result<(), &'static str
 
 #[cfg(not(target_os = "macos"))]
 fn choose_native(
-    _window: &tauri::WebviewWindow,
+    window: &tauri::WebviewWindow,
     suggested: &str,
     format: ExportFormat,
 ) -> Result<Option<PathBuf>, String> {
     Ok(rfd::FileDialog::new()
+        .set_parent(window)
         .set_title("Save verified contest export")
         .set_file_name(suggested)
         .add_filter("Contest export", &[format.extension()])

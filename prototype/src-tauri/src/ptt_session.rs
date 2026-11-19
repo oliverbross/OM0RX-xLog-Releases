@@ -306,6 +306,67 @@ impl Session {
         *s = next;
         Ok(json!(decision))
     }
+    /// Retire a release duty left by a PREVIOUS app run, which the ordinary
+    /// paths can never resolve: `reconcile`, Off and `recover` all require the
+    /// original worker process epoch, and that process ended with its app.
+    /// Before this, one uncertain release followed by a restart disabled TX
+    /// for good. The only proof accepted is the radio itself: fresh telemetry
+    /// (at most 1 s old, not from the future) on the same provider and selected
+    /// station shows it connected and not transmitting, and the current worker
+    /// owns no GUI PTT or carrier tune. Nothing is sent to the radio. A duty of
+    /// the current worker epoch is never touched here.
+    pub(crate) fn retire_prior_app_duty(&self, owner_id: &str, radio: &Value, now_ms: u64) -> Result<bool, String> {
+        let mut s = self.state.lock().map_err(|_| "PTT journal unavailable")?;
+        let Some(duty) = s.release_required.clone() else { return Ok(false) };
+        if duty.owner_id != owner_id || duty.worker_epoch.as_deref() == Some(crate::worker::process_epoch()) {
+            return Ok(false);
+        }
+        let t = &duty.target;
+        let fresh = radio["received_at_ms"].as_u64().is_some_and(|at| at <= now_ms && now_ms - at <= 1000);
+        let snapshot = &radio["snapshot"];
+        if !fresh
+            || radio["available"] != true
+            || radio["provider"] != t.provider
+            || radio["selection_id"] != t.selection_id
+            || snapshot["source"] != t.provider
+            || snapshot["radio"]["connected"] != true
+            || snapshot["radio"]["transmitting"] != false
+            || snapshot["ptt"]["release_required"] != false
+            || snapshot["carrier_tune"]["release_required"] == true
+        {
+            return Ok(false);
+        }
+        let mut next = s.clone();
+        retire_release(&mut next, owner_id);
+        for r in &mut next.receipts {
+            if r.owner_id == owner_id && unresolved(r) {
+                r.status = "reviewed".into();
+            }
+        }
+        next.recoveries.push(Recovery {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            enabled: false,
+            worker_epoch: duty.worker_epoch.clone(),
+            owner_id: owner_id.into(),
+            retired_target: duty.target.clone(),
+            target: duty.target.clone(),
+            status: "recovered".into(),
+        });
+        self.persist(&next)?;
+        *s = next;
+        Ok(true)
+    }
+    /// Whether this owner's PTT obligation is already over: no retained duty names it,
+    /// and a confirmed/released OFF or a recorded recovery decision does. Used to close a
+    /// companion TX record whose release was settled here but could not be journaled.
+    pub(crate) fn owner_released(&self, owner_id: &str) -> Result<bool, String> {
+        let s = self.state.lock().map_err(|_| "PTT journal unavailable")?;
+        Ok(s.release_required.as_ref().map_or(true, |d| d.owner_id != owner_id)
+            && (s.recoveries.iter().any(|r| r.owner_id == owner_id && r.status == "recovered")
+                || s.receipts.iter().any(|r| {
+                    r.owner_id == owner_id && !r.enabled && matches!(r.status.as_str(), "confirmed" | "released")
+                })))
+    }
     pub fn reconcile(&self, radio: &Value) -> Result<(), String> {
         let mut s = self.state.lock().map_err(|_| "PTT journal unavailable")?;
         let Some(owner) = s.release_required.clone() else {
@@ -384,6 +445,65 @@ impl Session {
         admit: impl FnOnce(&Target) -> Result<(), String>,
         dispatch: impl FnOnce(Value, &Target) -> Result<Value, String>,
     ) -> Result<Value, String> {
+        self.apply_inner(id, on, target, intent, None, None, false, admit, dispatch)
+    }
+    /// Digital output participates in the SAME durable PTT owner and shared
+    /// acquisition gate. It cannot use an ordinary acquisition to bypass an
+    /// existing digital reservation, or release another retained PTT owner.
+    pub(crate) fn apply_exact_admitted(
+        &self,
+        id: &str,
+        on: bool,
+        target: Target,
+        exact: &crate::output_authority::Reservation,
+        admit: impl FnOnce(&Target) -> Result<(), String>,
+        dispatch: impl FnOnce(Value, &Target) -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        exact.validate()?;
+        if on && id != exact.operation_id() { return Err("Digital PTT acquisition identity mismatch".into()); }
+        self.apply_inner(id, on, target, exact.intent_id(), Some(exact), None, false, admit, dispatch)
+    }
+    pub(crate) fn apply_exact_leased(&self,id:&str,target:Target,exact:&crate::output_authority::Reservation,
+        until_unix_ms:u64,transmit_slice:&str,admit:impl FnOnce(&Target)->Result<(),String>,dispatch:impl FnOnce(Value,&Target)->Result<Value,String>)->Result<Value,String>{
+        exact.validate()?;if id!=exact.operation_id()||target.provider!="direct_flex_lan"{return Err("Digital leased PTT route mismatch".into());}
+        let lease=digital_lease(exact,until_unix_ms,transmit_slice)?;
+        self.apply_inner(id,true,target,exact.intent_id(),Some(exact),Some(lease),false,admit,dispatch)
+    }
+    /// Normal completion still uses the same durable exact OFF path. The
+    /// caller has closed its finished output; continuation is granted only by
+    /// Authority::complete_exact after this returns observed release.
+    pub(crate) fn release_completed_exact(&self,id:&str,target:Target,exact:&crate::output_authority::Reservation,
+        admit:impl FnOnce(&Target)->Result<(),String>,dispatch:impl FnOnce(Value,&Target)->Result<Value,String>)->Result<Value,String>{
+        crate::output_authority::shared().require_exact(exact)?;
+        self.apply_inner(id,false,target,exact.intent_id(),Some(exact),None,true,admit,dispatch)
+    }
+    pub(crate) fn renew_exact(&self,target:&Target,exact:&crate::output_authority::Reservation,until_unix_ms:u64,transmit_slice:&str,
+        dispatch:impl FnOnce(Value,&Target)->Result<Value,String>)->Result<(),String>{
+        exact.validate()?;target.validate()?;crate::output_authority::shared().require_exact(exact)?;
+        let lease=digital_lease(exact,until_unix_ms,transmit_slice)?;
+        {
+            let s=self.state.lock().map_err(|_|"PTT lease owner unavailable")?;
+            let held=s.release_required.as_ref().ok_or("PTT lease has no retained owner")?;
+            if held.owner_id!=exact.operation_id()||held.worker_epoch.as_deref()!=Some(crate::worker::process_epoch())||!same_session(&held.target,target)
+                ||!s.receipts.iter().any(|r|r.operation_id==exact.operation_id()&&r.enabled&&r.status=="confirmed") {return Err("PTT lease cannot renew a different or unconfirmed acquisition".into());}
+        }
+        let request=json!({"id":uuid::Uuid::new_v4().to_string(),"method":"station_radio_control","params":{"provider":"direct_flex_lan","control":"ptt_lease","source":"gui","ptt_owner_id":exact.operation_id(),"expected_generation":target.connection_generation,"radio_id":target.radio_id,"digital_lease":lease}});
+        let reply=dispatch(request,target)?;
+        if reply["ok"]!=true||reply["result"]["lease_renewed"]!=true||reply["result"]["owner_id"]!=exact.operation_id()
+            ||reply["result"]["lease_id"]!=exact.lease_id()||reply["result"]["expires_at_unix_ms"].as_u64()!=Some(until_unix_ms){return Err("PTT lease renewal was not confirmed".into());}Ok(())
+    }
+    fn apply_inner(
+        &self,
+        id: &str,
+        on: bool,
+        target: Target,
+        intent: &str,
+        exact: Option<&crate::output_authority::Reservation>,
+        digital_lease: Option<Value>,
+        completed_output: bool,
+        admit: impl FnOnce(&Target) -> Result<(), String>,
+        dispatch: impl FnOnce(Value, &Target) -> Result<Value, String>,
+    ) -> Result<Value, String> {
         target.validate()?;
         if !uuid(id) {
             return Err("Invalid PTT identity".into());
@@ -407,10 +527,18 @@ impl Session {
             }
         }
         if !on {
-            crate::carrier_tune::revoke_output_intent()?;
+            if let Some(exact) = exact {
+                if !completed_output && !crate::output_authority::shared().revoke_exact(exact)? {
+                    return Err("The exact digital output reservation is no longer retained".into());
+                }
+            } else {
+                crate::carrier_tune::revoke_output_intent()?;
+            }
         }
         let _output = if on {
-            Some(crate::carrier_tune::reserve_output()?)
+            Some(if let Some(exact) = exact {
+                crate::output_authority::shared().reserve_exact(exact)?
+            } else { crate::carrier_tune::reserve_output()? })
         } else {
             None
         };
@@ -440,6 +568,9 @@ impl Session {
                     .release_required
                     .as_ref()
                     .ok_or("No retained GUI PTT owner may be released")?;
+                if exact.is_some_and(|ticket| ticket.operation_id() != o.owner_id) {
+                    return Err("Digital Stop cannot release a different PTT owner".into());
+                }
                 if o.worker_epoch.as_deref() != Some(crate::worker::process_epoch())
                     || !same_session(&o.target, &target)
                 {
@@ -468,6 +599,7 @@ impl Session {
             *s = next;
         }
         let mut request=json!({"id":id,"method":"station_radio_control","params":{"provider":target.provider,"control":"ptt","enabled":on,"source":"gui","ptt_owner_id":owner_id,"expected_generation":target.connection_generation}});
+        if let Some(lease)=digital_lease{request["params"]["digital_lease"]=lease;}
         if let Some(radio_id)=&target.radio_id{request["params"]["radio_id"]=json!(radio_id);}
         let result = dispatch(
             request,
@@ -545,6 +677,11 @@ fn outcome(
         "unknown"
     }
 }
+fn digital_lease(exact:&crate::output_authority::Reservation,until:u64,transmit_slice:&str)->Result<Value,String>{
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"PTT lease clock unavailable")?.as_millis() as u64;
+    if !matches!(transmit_slice,"A"|"B")||until<=now||until>now+1000{return Err("PTT lease deadline must retain its original bounded lifetime".into());}
+    Ok(json!({"lease_id":exact.lease_id(),"expires_at_unix_ms":until,"transmit_slice":transmit_slice}))
+}
 fn admission(
     selection: &Value,
     radio: &Value,
@@ -553,6 +690,9 @@ fn admission(
     now: u64,
     cw: &Value,
 ) -> Result<(), String> {
+    admission_for(selection,radio,t,on,now,cw,None)
+}
+fn admission_for(selection:&Value,radio:&Value,t:&Target,on:bool,now:u64,cw:&Value,leased_slice:Option<&str>)->Result<(),String> {
     let s = &radio["snapshot"];
     let station = &s["station"];
     let r = &s["radio"];
@@ -596,12 +736,26 @@ fn admission(
             .as_array()
             .is_some_and(|v| v.contains(&json!("ptt")))
             && r["vfos"].as_array().is_some_and(|vfos| {
-                vfos.iter()
-                    .any(|v| v["letter"] == r["receive_vfo"] && v["receive"] == true)
-                    && vfos
-                        .iter()
-                        .any(|v| v["letter"] == r["transmit_vfo"] && v["transmit"] == true)
+                if let Some(slice)=leased_slice {
+                    matches!(slice,"A"|"B") && r["transmit_vfo"]==slice
+                        && vfos.iter().filter(|v|v["letter"]==slice).count()==1
+                        && vfos.iter().any(|v|v["letter"]==slice&&v["transmit"]==true)
+                } else {
+                    vfos.iter().any(|v|v["letter"]==r["receive_vfo"]&&v["receive"]==true)
+                        && vfos.iter().any(|v|v["letter"]==r["transmit_vfo"]&&v["transmit"]==true)
+                }
             })
+    };
+    // Digital FLEX routes use the same actual liveness evidence as their TX
+    // context: an unchanged idle event can be kept current by a confirmed ping.
+    // Manual/CW/TCI admission retains its existing observation-age policy.
+    let observation_current = if t.provider == "direct_flex_lan" && leased_slice.is_some() {
+        let live = |v: &Value| v.as_f64().is_some_and(|v| {
+            v.is_finite() && v >= 0.0 && (0.0..=2500.0).contains(&(now as f64 - v * 1000.0))
+        });
+        live(&r["observed_at"]) || live(&s["heartbeat_at"])
+    } else {
+        recent(&r["observed_at"], 1000.0)
     };
     if !cap
         || radio["revision"] != t.observation_revision
@@ -609,11 +763,11 @@ fn admission(
         || radio["available"] != true
         || !recent(&radio["received_at_ms"], 1.0)
         || !recent(&s["generated_at"], 1000.0)
-        || !recent(&r["observed_at"], 1000.0)
+        || !observation_current
         || r["connected"] != true
         || r["observed"] != true
         || r["transmitting"] != false
-        || s["allow_transmit"] != true
+        || (s["allow_transmit"] != true && leased_slice.is_none())
         || s["carrier_tune"]["pending"] != false
         || s["carrier_tune"]["release_required"] != false
         || s["ptt"]["release_required"] != false
@@ -658,12 +812,25 @@ pub fn preflight(app: &tauri::AppHandle, t: &Target, on: bool, intent: &str) -> 
         .as_millis() as u64;
     admission(&selected, &radio, t, on, now, &cw)
 }
+pub(crate) fn preflight_leased(app:&tauri::AppHandle,t:&Target,intent:&str,slice:&str)->Result<(),String> {
+    crate::worker::require_existing_generation(t.worker_generation)?;
+    crate::carrier_tune::require_output_intent(intent)?;crate::carrier_tune::require_cw_ready(app)?;
+    let slot=t.radio_id.as_deref().ok_or("Digital PTT slot unavailable")?;
+    let selected=crate::station_selection::owner_for(app,slot)?.snapshot()?;
+    let radio=crate::station_telemetry::owner_for(app,slot)?.snapshot()?;
+    let cw=cw_for_acquisition(true,||crate::cw_session_backend::existing().map_or_else(||Ok(json!({"armed":false,"pending":false,"owner":null,"lease":null})),|s|s.snapshot()))?;
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"PTT clock unavailable")?.as_millis() as u64;
+    admission_for(&selected,&radio,t,true,now,&cw,Some(slice))
+}
 pub fn context(app: &tauri::AppHandle) -> Result<Value, String> {
-    let selection=crate::station_selection::owner(app)?.snapshot()?;
-    let radio=crate::station_telemetry::owner(app)?.snapshot()?;
+    context_for(app,&crate::radio_slots::active(app)?)
+}
+pub(crate) fn context_for(app:&tauri::AppHandle,slot:&str)->Result<Value,String> {
+    let selection=crate::station_selection::owner_for(app,slot)?.snapshot()?;
+    let radio=crate::station_telemetry::owner_for(app,slot)?.snapshot()?;
     let mut value=json!({"provider":selection["provider"],"selection_generation":selection["generation"],"selection_id":selection["selection_id"],"control_revision":selection["control_revision"],
         "worker_generation":radio["worker_generation"],"connection_generation":radio["snapshot"]["generation"],"observation_revision":radio["revision"],"received_at_ms":radio["received_at_ms"],
-        "radio_id":crate::radio_slots::active(app)?});
+        "radio_id":slot});
     if selection["provider"]=="direct_tci"{value["tci"]=json!({"trx":radio["snapshot"]["tci"]["trx"],"channel":radio["snapshot"]["tci"]["channel"]});}
     let target=serde_json::from_value::<Target>(value).ok().filter(|t|t.validate().is_ok());Ok(json!({"target":target}))
 }
@@ -775,8 +942,11 @@ pub fn execute(
         crate::carrier_tune::require_cw_ready(app)?;
     }
     crate::worker::require_existing_generation(t.worker_generation)?;
-    let selection = crate::station_selection::owner(app)?;
-    let telemetry = crate::station_telemetry::owner(app)?;
+    let leased_slice=request["params"]["digital_lease"]["transmit_slice"].as_str().map(str::to_owned);
+    let slot=if leased_slice.is_some(){t.radio_id.clone().ok_or("Digital PTT slot unavailable")?}else{crate::radio_slots::active(app)?};
+    let selection = crate::station_selection::owner_for(app,&slot)?;
+    let telemetry = crate::station_telemetry::owner_for(app,&slot)?;
+    let preserve_receive = crate::companion_host::is_receive_preserving_ptt(&request);
     let expected = json!({"provider":t.provider,"generation":t.selection_generation,"selection_id":t.selection_id,"control_revision":t.control_revision});
     selection.ptt_control(
         request,
@@ -796,8 +966,11 @@ pub fn execute(
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| "PTT clock unavailable")?
                 .as_millis() as u64;
-            admission(&expected, &telemetry.snapshot()?, t, on, now, &cw)?;
-            telemetry.control()
+            admission_for(&expected, &telemetry.snapshot()?, t, on, now, &cw,leased_slice.as_deref())?;
+            // Exact companion PTT changes only transmit state, not the sampled
+            // receive route. Keep its telemetry live while retaining all
+            // selection/output/PTT admission above and the exact reply below.
+            if preserve_receive { Ok(None) } else { telemetry.control().map(Some) }
         },
         |q| {
             if on {
@@ -822,6 +995,9 @@ pub fn require_idle(app: &tauri::AppHandle) -> Result<(), String> {
     let owner = owner(app)?;
     owner.reconcile(&crate::station_telemetry::owner(app)?.snapshot()?)?;
     owner.require_idle()
+}
+pub(crate) fn require_idle_for(app:&tauri::AppHandle,slot:&str)->Result<(),String> {
+    let owner=owner(app)?;owner.reconcile(&crate::station_telemetry::owner_for(app,slot)?.snapshot()?)?;owner.require_idle()
 }
 pub fn owner(app: &tauri::AppHandle) -> Result<Arc<Session>, String> {
     let mut slot = OWNER
@@ -883,6 +1059,88 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = Session::new(d.path().join("ptt.json")).unwrap();
         (d, s)
+    }
+    #[test]
+    fn digital_exact_ptt_uses_existing_owner_and_stop_bypasses_acquisition_lane() {
+        let _serial=crate::carrier_tune::OUTPUT_TEST.lock().unwrap();
+        let (_dir,s)=fixture();let mut t=target();t.provider="direct_flex_lan".into();
+        let authority=crate::output_authority::shared();let operation=uuid::Uuid::new_v4().to_string();
+        let ticket=authority.prepare(&operation,&authority.intent().unwrap()).unwrap();
+        let on=s.apply_exact_admitted(&operation,true,t.clone(),&ticket,|_|Ok(()),|q,target|{
+            assert!(authority.reserve_ordinary().is_err());
+            let off=s.apply_exact_admitted(&uuid::Uuid::new_v4().to_string(),false,target.clone(),&ticket,|_|Ok(()),|q,t|Ok(reply(&q,t,true))).unwrap();
+            assert_eq!(off["status"],"confirmed");
+            assert!(authority.require_exact(&ticket).is_err());
+            assert!(s.require_idle().is_err(),"on response still pending; release proof cannot retire a later possible effect");
+            Ok(reply(&q,target,true))
+        }).unwrap();
+        assert_eq!(on["status"],"confirmed");
+        assert!(s.apply_exact_admitted(&uuid::Uuid::new_v4().to_string(),true,t.clone(),&ticket,|_|Ok(()),|_,_|panic!("new operation reused ticket")).is_err());
+        assert!(authority.reserve_ordinary().is_err(),"revoked obligation remains owned");
+        authority.retire_exact(&ticket).unwrap();
+    }
+    #[test]
+    fn digital_exact_release_never_releases_an_unrelated_ptt_owner_or_replays_on() {
+        let _serial=crate::carrier_tune::OUTPUT_TEST.lock().unwrap();
+        let (_dir,s)=fixture();let mut t=target();t.provider="direct_flex_lan".into();
+        let authority=crate::output_authority::shared();let operation=uuid::Uuid::new_v4().to_string();
+        let ticket=authority.prepare(&operation,&authority.intent().unwrap()).unwrap();
+        s.apply_exact_admitted(&operation,true,t.clone(),&ticket,|_|Ok(()),|q,t|Ok(reply(&q,t,true))).unwrap();
+        let duplicate=s.apply_exact_admitted(&operation,true,t.clone(),&ticket,|_|panic!("duplicate admission"),|_,_|panic!("duplicate dispatch")).unwrap();
+        assert_eq!(duplicate["status"],"confirmed");
+        authority.retire_exact(&ticket).unwrap();
+        let foreign=authority.prepare(&uuid::Uuid::new_v4().to_string(),&authority.intent().unwrap()).unwrap();
+        assert!(s.apply_exact_admitted(&uuid::Uuid::new_v4().to_string(),false,t.clone(),&foreign,|_|Ok(()),|_,_|panic!("foreign release")).is_err());
+        assert_eq!(s.retained_target().unwrap(),Some(t));
+        authority.retire_exact(&foreign).unwrap();
+    }
+    #[test]
+    fn a_previous_app_duty_retires_only_on_fresh_idle_radio_of_the_same_station() {
+        let _serial = crate::carrier_tune::OUTPUT_TEST.lock().unwrap();
+        let (_d, s) = fixture();
+        let t = target();
+        let owner = uuid::Uuid::new_v4().to_string();
+        s.apply(&owner, true, t.clone(), &crate::carrier_tune::output_intent().unwrap(), |_, _| Err("lost".into()))
+            .unwrap();
+        let radio = |at: u64, transmitting: bool, selection: &str, ptt_owned: bool| json!({
+            "available":true,"provider":t.provider,"selection_id":selection,"received_at_ms":at,
+            "snapshot":{"source":t.provider,"radio":{"connected":true,"transmitting":transmitting},
+                "ptt":{"release_required":ptt_owned},"carrier_tune":{"release_required":false}}});
+        let now = 50_000;
+        // A duty of THIS worker epoch is never retired here; ordinary release owns it.
+        assert!(!s.retire_prior_app_duty(&owner, &radio(now, false, &t.selection_id, false), now).unwrap());
+        // Make it a previous app's duty, as after a restart.
+        {
+            let mut saved = s.state.lock().unwrap();
+            saved.release_required.as_mut().unwrap().worker_epoch = Some(uuid::Uuid::new_v4().to_string());
+            s.persist(&saved).unwrap();
+        }
+        let s = Session::new(s.path.clone()).unwrap();
+        assert!(s.require_idle().is_err());
+        for (why, r) in [
+            ("transmitting", radio(now, true, &t.selection_id, false)),
+            ("stale", radio(now - 1_001, false, &t.selection_id, false)),
+            ("future", radio(now + 1, false, &t.selection_id, false)),
+            ("other station", radio(now, false, &uuid::Uuid::new_v4().to_string(), false)),
+            ("current worker owns PTT", radio(now, false, &t.selection_id, true)),
+        ] {
+            assert!(!s.retire_prior_app_duty(&owner, &r, now).unwrap(), "{why} must not retire");
+        }
+        assert!(!s.retire_prior_app_duty(&uuid::Uuid::new_v4().to_string(), &radio(now, false, &t.selection_id, false), now).unwrap());
+        assert!(s.require_idle().is_err());
+        assert!(!s.owner_released(&owner).unwrap(), "a retained duty is not released");
+        assert!(s.retire_prior_app_duty(&owner, &radio(now - 1_000, false, &t.selection_id, false), now).unwrap());
+        assert!(s.require_idle().is_ok(), "the next acquisition is admitted");
+        assert!(s.owner_released(&owner).unwrap(), "the recovery settles this owner's release");
+        assert!(!s.owner_released(&uuid::Uuid::new_v4().to_string()).unwrap(), "an unknown owner has no release proof");
+        // A second retirement finds no duty; the TX record closes through `owner_released`.
+        assert!(!s.retire_prior_app_duty(&owner, &radio(now, false, &t.selection_id, false), now).unwrap());
+        // Durable across restart, with an auditable recovery decision.
+        let reloaded = Session::new(s.path.clone()).unwrap();
+        assert!(reloaded.require_idle().is_ok());
+        let saved = reloaded.state.lock().unwrap();
+        assert!(saved.recoveries.iter().any(|r| r.owner_id == owner && r.status == "recovered"));
+        assert!(saved.receipts.iter().filter(|r| r.owner_id == owner).all(|r| r.status != "unknown"));
     }
     #[test]
     fn ptt_previous_app_worker_one_cannot_alias_new_app_retired_worker_one() {
@@ -1248,6 +1506,18 @@ mod tests {
         );
     }
     #[test]
+    fn saved_audio_leased_admission_uses_exact_tx_slice_without_changing_manual_receive_gate() {
+        let mut t=target();t.provider="direct_flex_lan".into();
+        let sel=json!({"provider":t.provider,"generation":t.selection_generation,"selection_id":t.selection_id,"control_revision":t.control_revision});
+        let cw=json!({"armed":false,"pending":false,"owner":null,"lease":null});
+        let mut r=json!({"provider":t.provider,"selection_generation":t.selection_generation,"selection_id":t.selection_id,"worker_generation":t.worker_generation,"revision":t.observation_revision,"received_at_ms":t.received_at_ms,"available":true,"snapshot":{"source":t.provider,"generation":t.connection_generation,"generated_at":10.0,"allow_transmit":false,"capabilities":{"supported_commands":["ptt"]},"radio":{"connected":true,"observed":true,"observed_at":10.0,"transmitting":false,"receive_vfo":null,"transmit_vfo":"B","vfos":[{"letter":"B","receive":false,"transmit":true}]},"carrier_tune":{"pending":false,"release_required":false},"ptt":{"release_required":false}}});
+        assert!(admission_for(&sel,&r,&t,true,10000,&cw,Some("B")).is_ok());
+        assert!(admission(&sel,&r,&t,true,10000,&cw).is_err());
+        assert!(admission_for(&sel,&r,&t,true,10000,&cw,Some("A")).is_err());
+        r["snapshot"]["radio"]["transmitting"]=json!(true);assert!(admission_for(&sel,&r,&t,true,10000,&cw,Some("B")).is_err());
+        assert!(admission(&sel,&r,&t,false,999999,&cw).is_ok());
+    }
+    #[test]
     fn ptt_native_on_admission_requires_exact_fresh_policy_off_retains_stale_authority() {
         assert!(
             cw_for_acquisition(false, || panic!("Urgent PTT off queried a busy CW owner")).is_ok()
@@ -1310,5 +1580,136 @@ mod tests {
         let off_id=uuid::Uuid::new_v4().to_string();let off=s.apply(&off_id,false,retained.clone(),"",|q,target|{assert_eq!(q["params"]["radio_id"],"radio2");Ok(reply(&q,target,true))}).unwrap();
         assert_eq!(off["status"],"confirmed");assert!(s.require_idle().is_ok());
         s.apply(&off_id,false,retained,"",|_,_|panic!("duplicate off replayed")).unwrap();
+    }
+    #[test]
+    fn leased_ptt_renewal_and_normal_release_preserve_only_exact_completion() {
+        let _serial=crate::carrier_tune::OUTPUT_TEST.lock().unwrap();
+        let (_d,s)=fixture();let mut t=target();t.provider="direct_flex_lan".into();t.radio_id=Some("radio1".into());
+        let operation=uuid::Uuid::new_v4().to_string();
+        let authority=crate::output_authority::shared();
+        let ticket=authority.prepare(&operation,&authority.intent().unwrap()).unwrap();
+        let until=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64+800;
+        let on=s.apply_exact_leased(&operation,t.clone(),&ticket,until,"A",|_|Ok(()),|q,t|{
+            assert_eq!(q["params"]["digital_lease"]["lease_id"],ticket.lease_id());
+            assert_eq!(q["params"]["digital_lease"]["expires_at_unix_ms"],until);
+            Ok(reply(&q,t,true))
+        }).unwrap();assert_eq!(on["status"],"confirmed");
+        s.renew_exact(&t,&ticket,until,"A",|q,_|{
+            assert_eq!(q["params"]["control"],"ptt_lease");
+            Ok(json!({"ok":true,"result":{"lease_renewed":true,"owner_id":operation,"lease_id":ticket.lease_id(),"expires_at_unix_ms":until}}))
+        }).unwrap();
+        assert!(s.renew_exact(&t,&ticket,until,"A",|_,_|Ok(json!({"ok":true,"result":{"lease_renewed":true,"owner_id":operation,"lease_id":uuid::Uuid::new_v4().to_string(),"expires_at_unix_ms":until}}))).is_err());
+        let off=s.release_completed_exact(&uuid::Uuid::new_v4().to_string(),t.clone(),&ticket,|_|Ok(()),|q,t|Ok(reply(&q,t,true))).unwrap();
+        assert_eq!(off["status"],"confirmed");assert!(s.require_idle().is_ok());
+        assert!(authority.require_exact(&ticket).is_ok(),"normal OFF does not masquerade as user Stop");
+        let successor=authority.complete_exact(&ticket).unwrap().unwrap();
+        assert!(authority.require_intent(&successor).is_ok());
+        assert!(s.renew_exact(&t,&ticket,until,"A",|_,_|panic!("retired lease must not renew")).is_err());
+    }
+}
+
+// Kept self-contained so the exact production admission function can also be
+// exercised by the small Windows source-bound regression harness.
+#[cfg(test)]
+mod digital_heartbeat_admission_tests {
+    use super::*;
+
+    fn fixture() -> (Target, Value, Value, Value) {
+        let t = Target {
+            provider: "direct_flex_lan".into(), selection_generation: 2,
+            selection_id: "00000000-0000-4000-8000-000000000001".into(),
+            worker_generation: 4, connection_generation: 7, control_revision: 3,
+            observation_revision: 8, received_at_ms: 10000,
+            radio_id: Some("radio1".into()), tci: None,
+        };
+        let selected = json!({"provider":t.provider,"generation":t.selection_generation,
+            "selection_id":t.selection_id,"control_revision":t.control_revision});
+        let cw = json!({"armed":false,"pending":false,"owner":null,"lease":null});
+        let radio = json!({"provider":t.provider,"selection_generation":t.selection_generation,
+            "selection_id":t.selection_id,"worker_generation":t.worker_generation,
+            "revision":t.observation_revision,"received_at_ms":t.received_at_ms,"available":true,
+            "snapshot":{"source":t.provider,"radio_id":"radio1","generation":t.connection_generation,
+                "generated_at":10.0,"heartbeat_at":9.0,"allow_transmit":false,
+                "capabilities":{"supported_commands":["ptt"]},
+                "radio":{"connected":true,"observed":true,"observed_at":1.0,"transmitting":false,
+                    "receive_vfo":null,"transmit_vfo":"A","vfos":[{"letter":"A","receive":false,"transmit":true}]},
+                "carrier_tune":{"pending":false,"release_required":false},"ptt":{"release_required":false}}});
+        (t, selected, radio, cw)
+    }
+
+    #[test]
+    fn leased_flex_accepts_unchanged_idle_observation_with_confirmed_heartbeat() {
+        let (t, selected, radio, cw) = fixture();
+        t.validate().unwrap();
+        admission_for(&selected, &radio, &t, true, 10000, &cw, Some("A"))
+            .expect("fresh confirmed FLEX heartbeat must admit unchanged idle digital PTT observation");
+    }
+
+    #[test]
+    fn leased_flex_rejects_stale_invalid_or_future_liveness() {
+        let (t, selected, radio, cw) = fixture();
+        for heartbeat in [Value::Null, json!(7.499), json!(-1), json!(10.001), json!("9.0")] {
+            let mut changed = radio.clone();
+            changed["snapshot"]["heartbeat_at"] = heartbeat;
+            assert!(admission_for(&selected, &changed, &t, true, 10000, &cw, Some("A")).is_err());
+        }
+        let mut current = radio.clone();
+        current["snapshot"]["heartbeat_at"] = Value::Null;
+        current["snapshot"]["radio"]["observed_at"] = json!(7.5);
+        assert!(admission_for(&selected, &current, &t, true, 10000, &cw, Some("A")).is_ok());
+        current["snapshot"]["radio"]["observed_at"] = json!(7.499);
+        assert!(admission_for(&selected, &current, &t, true, 10000, &cw, Some("A")).is_err());
+    }
+
+    #[test]
+    fn leased_flex_retains_exact_session_route_and_idle_output_checks() {
+        let (t, selected, radio, cw) = fixture();
+        for (pointer, value) in [
+            ("/available", json!(false)), ("/worker_generation", json!(5)),
+            ("/selection_id", json!("00000000-0000-4000-8000-000000000002")),
+            ("/revision", json!(9)), ("/received_at_ms", json!(9999)),
+            ("/snapshot/generation", json!(8)), ("/snapshot/radio/connected", json!(false)),
+            ("/snapshot/radio/observed", json!(false)), ("/snapshot/radio/transmitting", json!(true)),
+            ("/snapshot/radio/transmit_vfo", json!("B")),
+            ("/snapshot/carrier_tune/pending", json!(true)),
+            ("/snapshot/carrier_tune/release_required", json!(true)),
+            ("/snapshot/ptt/release_required", json!(true)),
+        ] {
+            let mut changed = radio.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(admission_for(&selected, &changed, &t, true, 10000, &cw, Some("A")).is_err(), "{pointer}");
+        }
+        let mut busy = cw.clone(); busy["armed"] = json!(true);
+        assert!(admission_for(&selected, &radio, &t, true, 10000, &busy, Some("A")).is_err());
+        let mut changed = selected.clone(); changed["control_revision"] = json!(4);
+        assert!(admission_for(&changed, &radio, &t, true, 10000, &cw, Some("A")).is_err());
+    }
+
+    #[test]
+    fn manual_flex_and_tci_do_not_gain_heartbeat_admission() {
+        let (mut t, mut selected, mut radio, cw) = fixture();
+        radio["snapshot"]["allow_transmit"] = json!(true);
+        radio["snapshot"]["radio"]["receive_vfo"] = json!("A");
+        radio["snapshot"]["radio"]["vfos"][0]["receive"] = json!(true);
+        assert!(admission(&selected, &radio, &t, true, 10000, &cw).is_err());
+        radio["snapshot"]["radio"]["observed_at"] = json!(10.0);
+        assert!(admission(&selected, &radio, &t, true, 10000, &cw).is_ok());
+        t.provider = "direct_tci".into(); t.tci = Some(TCITarget { trx: 1, channel: 1 });
+        selected["provider"] = json!(t.provider);
+        radio["provider"] = json!(t.provider); radio["snapshot"]["source"] = json!(t.provider);
+        radio["snapshot"]["tci"] = json!({"trx":1,"channel":1,"transmit_enabled":true,"trx_observed_at":10.0});
+        assert!(admission(&selected, &radio, &t, true, 10000, &cw).is_ok());
+        radio["snapshot"]["radio"]["observed_at"] = json!(1.0);
+        assert!(admission(&selected, &radio, &t, true, 10000, &cw).is_err());
+    }
+
+    #[test]
+    fn exact_release_remains_independent_of_liveness() {
+        let (t, selected, mut radio, cw) = fixture();
+        radio["snapshot"]["heartbeat_at"] = Value::Null;
+        radio["snapshot"]["radio"]["connected"] = json!(false);
+        assert!(admission_for(&selected, &radio, &t, false, 999999, &cw, Some("A")).is_ok());
+        radio["worker_generation"] = json!(5);
+        assert!(admission_for(&selected, &radio, &t, false, 999999, &cw, Some("A")).is_err());
     }
 }

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LocalAwardProgressPanel } from "./LocalAwardProgressPanel";
 import { AlertTriangle, Award, BookOpen, CheckCircle2, Clock3, ExternalLink, Search, PanelsTopLeft } from "lucide-react";
@@ -260,8 +261,8 @@ export function AwardsPanel({ request, refresh, readScope, initialStats, onUndoc
       {onUndock && <button type="button" onClick={onUndock}><ExternalLink size={14} />Undock</button>}
       {onDock && <button type="button" onClick={onDock}><PanelsTopLeft size={14} />Dock back</button>}
     </div></header>}
-    {statsError && <p className="awards-error" role="alert">{statsError} <button type="button" onClick={() => setStatsRetry((value) => value + 1)}>Retry totals</button></p>}
-    {statsWaiting && !statsError && <p role="status">Award totals are updating. <button type="button" onClick={() => setStatsRetry(value => value + 1)}>Retry totals</button></p>}
+    {statsError && <ErrorNotice><p className="awards-error" role="alert">{statsError} <button type="button" onClick={() => setStatsRetry((value) => value + 1)}>Retry totals</button></p></ErrorNotice>}
+    {statsWaiting && !statsError && <ErrorNotice><p role="status">Award totals are updating. <button type="button" onClick={() => setStatsRetry(value => value + 1)}>Retry totals</button></p></ErrorNotice>}
     <ProgressOverview stats={stats} />
     <button type="button" aria-expanded={localProgressOpen} onClick={() => { setLocalProgressRequested(true); setLocalProgressOpen(value => !value); }}>Local progress and supporting contacts</button>
     <div hidden={!localProgressOpen}>{localProgressRequested && <LocalAwardProgressPanel readOnlySavedFilters={readOnlySavedFilters} request={request} refresh={refresh} readScope={readScope} />}</div>
@@ -274,11 +275,11 @@ export function AwardsPanel({ request, refresh, readScope, initialStats, onUndoc
         <label><span className="sr-only">Role</span><select aria-label="Role" value={role} onChange={(event) => changeFilter(setRole, event.target.value)}>{roleOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       </div>
       <p className="awards-filter-note">Mode and role facets use only explicit wording in the reviewed source record.</p>
-      {catalogueError && <p className="awards-error" role="alert">{catalogueError} <button type="button" onClick={() => setCatalogueRetry((value) => value + 1)}>Retry library</button></p>}
-      {catalogueWaiting && !catalogueError && <p role="status">Awards library is updating. <button type="button" onClick={() => setCatalogueRetry(value => value + 1)}>Retry library</button></p>}
-      {!catalogue && !catalogueError && !catalogueWaiting && <p className="awards-empty" role="status">Loading award programmes…</p>}
+      {catalogueError && <ErrorNotice><p className="awards-error" role="alert">{catalogueError} <button type="button" onClick={() => setCatalogueRetry((value) => value + 1)}>Retry library</button></p></ErrorNotice>}
+      {catalogueWaiting && !catalogueError && <ErrorNotice><p role="status">Awards library is updating. <button type="button" onClick={() => setCatalogueRetry(value => value + 1)}>Retry library</button></p></ErrorNotice>}
+      {!catalogue && !catalogueError && !catalogueWaiting && <ErrorNotice><p className="awards-empty" role="status">Loading award programmes…</p></ErrorNotice>}
       {catalogue && <><div className="awards-browser"><div className="awards-list"><div className="awards-list-head"><strong>{format(total)} programmes</strong>{filtered && <button type="button" onClick={() => { setSearch(""); setDebouncedSearch(""); setDelivery(""); setGroup(""); setMode(""); setRole(""); setOffset(0); }}>Clear filters</button>}</div>
-        {loading && <p className="awards-loading" role="status">Updating library…</p>}
+        {loading && <ErrorNotice><p className="awards-loading" role="status">Updating library…</p></ErrorNotice>}
         {!loading && programmes.length === 0 && <p className="awards-empty">{filtered ? "No award programmes match these filters." : "Award programmes are unavailable for this logbook."}</p>}
         <div className="awards-programmes">{programmes.map((programme) => {
           const Icon = deliveryIcons[programme.delivery_state as keyof typeof deliveryIcons] ?? BookOpen;

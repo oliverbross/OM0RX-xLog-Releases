@@ -1603,7 +1603,16 @@ mod tests {
         let other = root.join("other-capture");
         fs::create_dir(&other).unwrap();
         let alias = root.join("linked-capture");
-        symlink_dir(&other, &alias).unwrap();
+        if let Err(error) = symlink_dir(&other, &alias) {
+            // Standard Windows accounts can create NTFS junctions without the
+            // developer-mode privilege needed for directory symbolic links.
+            assert_eq!(error.raw_os_error(), Some(1314));
+            let status = std::process::Command::new("cmd.exe")
+                .current_dir(&root)
+                .args(["/d", "/c", "mklink", "/j", "linked-capture", "other-capture"])
+                .status().unwrap();
+            assert!(status.success());
+        }
         assert!(safe_path(&alias.join("media.wav")).is_err());
         assert!(free_bytes(&alias).is_err());
     }
@@ -1867,7 +1876,7 @@ mod tests {
         let (_t, root) = root();
         let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let result = std::process::Command::new(
-            std::env::var("XLOG_TEST_PYTHON").unwrap_or_else(|_| "python3.12".into()),
+            crate::test_support::python(),
         )
         .arg(project.join("python/tests/recorder_fixture.py"))
         .env("PYTHONPATH", project.join("python"))

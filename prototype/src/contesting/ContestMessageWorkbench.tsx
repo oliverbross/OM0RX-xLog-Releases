@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestSetupMacro } from "./ContestSetupPanel";
 import "./ContestMessageWorkbench.css";
@@ -130,6 +131,6 @@ export function ContestMessageWorkbench({ scope, effectiveMacros, draft, serial,
       </div>}
     </fieldset>
     <p>Only declared N1MM text translations are supported. Radio VOICE memories and managed WAV slots differ; missing voice assets never block manual logging. ESM and custom key bindings are preserved.</p>
-    {message && <p role="status">{message}</p>}
+    {message && <ErrorNotice when={true} title="Message"><p role="status">{message}</p></ErrorNotice>}
   </section>;
 }

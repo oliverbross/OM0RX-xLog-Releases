@@ -328,7 +328,7 @@ impl Signals {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod native {
     use super::*;
     use crate::contest_recorder_audio as shared;
@@ -640,9 +640,9 @@ mod native {
         .map_err(|e| format!("Native microphone unavailable (check permission): {e}"))
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub use native::*;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod unsupported {
     use super::*;
     pub struct Output {
@@ -666,10 +666,10 @@ mod unsupported {
         Err("Native voice recording is unavailable on this platform.".into())
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub use unsupported::*;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn recorded_wav(samples: &[i16], rate: u32, failed: bool) -> Result<Vec<u8>> {
     if failed {
         return Err("The selected microphone failed or its bounded capture queue overflowed; no slot was replaced.".into());

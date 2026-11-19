@@ -32,7 +32,8 @@ public final class LocalAcceptanceSession: @unchecked Sendable {
             throw error
         }
         let cluster = LiveClusterMethods(logbook: service,
-            configurationURL: clusterDirectory.appendingPathComponent("cluster.json"))
+            configurationURL: clusterDirectory.appendingPathComponent("cluster.json"),
+            radioSideEffectsAllowed: false)
         worker = LiveWorker(logbook: service, localAcceptance: true, cluster: cluster)
     }
 

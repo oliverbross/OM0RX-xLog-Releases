@@ -455,8 +455,8 @@ public actor SyncEngine {
             if step.done { break }
         }
 
-        // Retain oldest-update order and the accepted-row cap, while held or
-        // deferred contacts cannot force one all-history locked JSON decode.
+        // Retain oldest-update order within deletes and other changes, and the
+        // accepted-row cap; held/deferred rows cannot force a locked full decode.
         var pending: [QSO] = []
         var pendingCursor: Int64 = 0
         var seen = Set<UUID>()
@@ -468,7 +468,10 @@ public actor SyncEngine {
                 pending.append(qso)
             }
             pending.sort {
-                $0.updatedAt == $1.updatedAt ? $0.id.uuidString < $1.id.uuidString : $0.updatedAt < $1.updatedAt
+                // Complete removals before creating their replacements; Wavelog
+                // rejects nearby same-call/band contacts while the old ID exists.
+                if ($0.deletedAt != nil) != ($1.deletedAt != nil) { return $0.deletedAt != nil }
+                return $0.updatedAt == $1.updatedAt ? $0.id.uuidString < $1.id.uuidString : $0.updatedAt < $1.updatedAt
             }
             if pending.count > 500 { pending.removeLast(pending.count - 500) }
             try await betweenReconciliationSteps()
@@ -528,7 +531,7 @@ public actor SyncEngine {
                     }
                     try uploadConfirmed("create")
                     try validateSyncRun()
-                    try database.withSyncDatabaseLock(run) { try database.acknowledgeSynced(qso, wavelogID: remote.id) }
+                    try database.withSyncDatabaseLock(run) { try database.acknowledgeSynced(qso, wavelogID: remote.id, createdResponse: remote) }
                 }
                 report.pushed += 1
             } catch {

@@ -1,10 +1,16 @@
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import Foundation
 #if canImport(FoundationXML)
 import FoundationXML
 #endif
+#if os(Windows)
+import Crypto
+import WinSDK
+import XLogPortableCore
+#else
 import CryptoKit
 import XLogCore
+#endif
 
 /// Local, on-demand reference evidence. Owned by LiveReferenceMethods; never refreshes data or edits a log.
 final class LogReviewReferences {
@@ -109,6 +115,30 @@ final class LogReviewReferences {
     }
 
     private static func identity(_ url: URL) throws -> Identity {
+        #if os(Windows)
+        guard let path = LocalFilePath.nativeFileSystemPath(for: url) else { throw invalidData() }
+        let handle = path.withCString(encodedAs: UTF16.self) {
+            CreateFileW($0, DWORD(FILE_READ_ATTRIBUTES), DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+                        nil, DWORD(OPEN_EXISTING), DWORD(FILE_FLAG_OPEN_REPARSE_POINT), nil)
+        }
+        guard let handle, handle != HANDLE(bitPattern: -1) else {
+            let error = GetLastError()
+            if error == DWORD(ERROR_FILE_NOT_FOUND) || error == DWORD(ERROR_PATH_NOT_FOUND) {
+                throw CocoaError(.fileReadNoSuchFile)
+            }
+            throw CocoaError(.fileReadNoPermission)
+        }
+        defer { CloseHandle(handle) }
+        var info = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(handle, &info),
+              info.dwFileAttributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) == 0 else { throw invalidData() }
+        let size = UInt64(info.nFileSizeHigh) << 32 | UInt64(info.nFileSizeLow)
+        guard let size = Int64(exactly: size) else { throw invalidData() }
+        let ticks = UInt64(info.ftLastWriteTime.dwHighDateTime) << 32 | UInt64(info.ftLastWriteTime.dwLowDateTime)
+        let modified = Date(timeIntervalSince1970: Double(ticks) / 10_000_000 - 11_644_473_600)
+        return Identity(path: path, size: size, modified: modified,
+                        fileNumber: UInt64(info.nFileIndexHigh) << 32 | UInt64(info.nFileIndexLow))
+        #else
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         guard attributes[.type] as? FileAttributeType == .typeRegular,
               let size = attributes[.size] as? NSNumber,
@@ -116,6 +146,7 @@ final class LogReviewReferences {
               let fileNumber = attributes[.systemFileNumber] as? NSNumber else { throw invalidData() }
         return Identity(path: url.standardizedFileURL.path, size: size.int64Value,
                         modified: modified, fileNumber: fileNumber.uint64Value)
+        #endif
     }
 
     private static func clubLogResolver(_ data: Data) throws -> CTYResolver {
@@ -130,7 +161,7 @@ final class LogReviewReferences {
         // snapshot so an atomic cache replacement cannot change the hashed bytes.
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("xlog-review-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false,
-                                               attributes: [.posixPermissions: 0o700])
+                                               attributes: LocalFilePermissions.directoryAttributes)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let file = temporary.appendingPathComponent("cty.xml")
         // Normalize leaf <prefix> aliases to <call>: the legacy parser's rule

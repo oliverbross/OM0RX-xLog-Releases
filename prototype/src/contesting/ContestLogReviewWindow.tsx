@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { compareContestLog, defaultReviewOptions, reviewTime, type ReviewFinding, type ReviewOptions, type ReviewResult } from "./logReview";
@@ -103,7 +104,7 @@ export function ContestLogReviewWindow({read=readReview,compare=runReviewWorker}
       <label>Mismatch search ± minutes<input type="number" min={options.minutes} max="180" value={options.searchMinutes}
         onChange={e=>setOptions({...options,searchMinutes:Number(e.target.value)})}/></label>
     </fieldset>
-    {busy&&<p role="status">{progress}</p>}{error&&<p role="alert">{error}</p>}{notice&&<p role="status">{notice}</p>}
+    {busy&&<ErrorNotice><p role="status">{progress}</p></ErrorNotice>}{error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}{notice&&<ErrorNotice when={true} title="Message"><p role="status">{notice}</p></ErrorNotice>}
     {complete&&<>
       <section className="review-summary" aria-label="Review summary">
         <strong>{complete.result.checked.toLocaleString()} contacts checked · {findings.length} suggestions</strong>
@@ -138,10 +139,10 @@ export function ContestLogReviewWindow({read=readReview,compare=runReviewWorker}
             </tr>)}</tbody></table></div>
         </details>
         {(complete.snapshot.archive.recording.retainedGap || complete.snapshot.archive.recording.unknownGap) &&
-          <p role="alert">{complete.snapshot.archive.recording.unknownGap
+          <ErrorNotice><p role="alert">{complete.snapshot.archive.recording.unknownGap
             ? "The archive contains a recorded interruption with unknown loss. Coverage is incomplete, even if the known unrecorded count is zero."
-            : "The archive contains a recorded gap. These results use only the reports that were retained."}</p>}
-        {complete.snapshot.truncated&&<p role="alert">Partial archive: the 50,000-report limit was reached. Results do not cover every report in this window.</p>}
+            : "The archive contains a recorded gap. These results use only the reports that were retained."}</p></ErrorNotice>}
+        {complete.snapshot.truncated&&<ErrorNotice><p role="alert">Partial archive: the 50,000-report limit was reached. Results do not cover every report in this window.</p></ErrorNotice>}
       </section>
       <div className="review-toolbar"><label>Show <select value={filter} onChange={e=>setFilter(e.target.value)}>
         {["Unreviewed","Possible typo","Frequency/time mismatch","Country / zone mismatch","Reviewed","All"].map(value=><option key={value}>{value}</option>)}
@@ -165,7 +166,7 @@ export function ContestLogReviewWindow({read=readReview,compare=runReviewWorker}
             {applying?"Applying callsign correction…":`Change callsign to ${candidate}`}</button>
             <p>Changes only {selected.qso.Call} → {candidate}. Time, frequency, reports and received exchange stay as logged. Score and multipliers follow the corrected callsign.</p></div>}
           {selected.kind==="Possible typo"&&!candidate&&<p>Reports suggest more than one callsign. Open this contact to verify and edit it.</p>}
-          {stale&&<p role="status">This review is out of date. Run again before applying another correction.</p>}
+          {stale&&<ErrorNotice><p role="status">This review is out of date. Run again before applying another correction.</p></ErrorNotice>}
           <p>Logged {utc(selected.qso.TS)} UTC · RX {selected.qso.Freq} kHz
             {Number(selected.qso.QSXFreq)>0&&` · split ${selected.qso.QSXFreq} kHz`} · {selected.qso.Mode}</p>
           <p>Logged country {selected.qso.CountryPrefix||"unavailable"} · received exchange {selected.qso.NR??"unavailable"}.</p>

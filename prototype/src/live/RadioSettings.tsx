@@ -1,4 +1,8 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
+import { XCatCompanion } from "./XCatCompanion";
+import { EmbeddedCATSettings } from "./EmbeddedCATSettings";
+import { workerRequest } from "../worker";
 import { AgentConnectionSetup } from "./AgentConnectionSetup";
 import { radioLabel, radioName, type RadioID, type StationSession } from "./stationSession";
 import "./RadioSettings.css";
@@ -22,11 +26,15 @@ export default function RadioSettings({ requestedRadioId, requestedRadioRevision
     </div>
     {radios.map(id => <div key={id} role="tabpanel" id={`radio-settings-panel-${id}`} aria-labelledby={`radio-settings-tab-${id}`} hidden={radioId !== id}>
       <AgentConnectionSetup radioId={id} radioForm onDraftState={blocked => onDraftState?.(id, blocked)} onSession={next => setSessions(previous => ({ ...previous, [id]: next }))} />
+      {sessions[id]?.selection.provider === "direct_flex_lan" &&
+        <EmbeddedCATSettings radioId={id} snapshot={sessions[id]?.radio?.snapshot} request={async (method, params) =>
+          (await workerRequest(method, { ...params, radio_id: id })).result as Record<string, any>} />}
     </div>)}
     {onRefreshLocalState && <details className="radio-settings-disclosure"><summary>Local app diagnostics</summary>
       <p>Refresh xLog's local draft and radio observation if a finished operation is blocking spot selection. This does not disconnect the Remote Station Agent, rotor, or Wavelog.</p>
       <button type="button" onClick={() => void onRefreshLocalState().then(setMessage, cause => setMessage(cause instanceof Error ? cause.message : "Local state could not be refreshed."))}>Refresh local radio state</button>
-      {message && <p role="status">{message}</p>}
+      {message && <ErrorNotice><p role="status">{message}</p></ErrorNotice>}
     </details>}
+    <XCatCompanion key={radioId} radioId={radioId} />
   </section>;
 }

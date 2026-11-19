@@ -1,5 +1,5 @@
 import Foundation
-#if os(macOS)
+#if os(macOS) || os(Windows)
 import XCatIntegrationCore
 
 /// Worker-owned TCI adapter. Receive controls and finite TCI 2.1 PTT/CW share
@@ -371,6 +371,7 @@ actor LiveTCISession {
                         "device": state?.device as Any? ?? NSNull(), "receive_only": state?.receiveOnly as Any? ?? NSNull(),
                         "program": state?.protocolAnnouncement.program as Any? ?? NSNull(), "protocol_version": state?.protocolAnnouncement.version as Any? ?? NSNull(),
                         "trx_count": state?.trxCount as Any? ?? NSNull(), "channel_count": state?.channelCount as Any? ?? NSNull(),
+                        "frequency_range_hz": state.map { [$0.vfoLimits.lower, $0.vfoLimits.upper] } as Any? ?? NSNull(),
                         "supported_modulations": state?.supportedModulations as Any? ?? NSNull()]
         return ["source": "direct_tci", "available": state != nil, "generation": generation,
                 "transport_state": transport, "generated_at": receivedAt?.timeIntervalSince1970 as Any? ?? NSNull(),

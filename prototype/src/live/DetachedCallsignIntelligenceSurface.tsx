@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { workerRequest } from "../worker";
 import { DeskIntelligence, type IntelligenceRequest } from "./CallsignIntelligence";
@@ -76,12 +77,12 @@ export function CallsignIntelligenceSurface({ request = requestDetachedIntellige
       .catch(cause => { if (mounted.current) health.failed(cause instanceof Error ? cause.message : "Shared draft unavailable."); });
   }, [cache, identity, follower, health]);
   return <div className="app live monitor-app detached-intelligence-app"><main aria-label="Detached Callsign Intelligence">
-    {(warning || state.error) && <p className="live-error" role="alert">{warning || state.error}</p>}
-    {historyWarning && <p className="live-error" role="status">{historyWarning}</p>}
+    {(warning || state.error) && <ErrorNotice><p className="live-error" role="alert">{warning || state.error}</p></ErrorNotice>}
+    {historyWarning && <ErrorNotice><p className="live-error" role="status">{historyWarning}</p></ErrorNotice>}
     {(warning || state.error || lookup?.key === identity && lookup.profile.lookup_warning) &&
       <button type="button" onClick={refresh} disabled={state.reading}>Retry intelligence</button>}
-    {preferences?.generation === generation && preferences.error && <p className="live-error" role="status">{preferences.error}</p>}
-    {!state.available && !state.error && <p role="status" className="secondary">Loading the shared new-QSO draft…</p>}
+    {preferences?.generation === generation && preferences.error && <ErrorNotice when={Boolean(preferences.error) || undefined}><p className="live-error" role="status">{preferences.error}</p></ErrorNotice>}
+    {!state.available && !state.error && <ErrorNotice><p role="status" className="secondary">Loading the shared new-QSO draft…</p></ErrorNotice>}
     <div className="detached-intelligence-content"><DeskIntelligence taskOnly draft={snapshot?.qso ?? null}
       lookup={lookup?.key === identity ? lookup.profile : null} previous={previous?.key === identity ? previous.rows : []}
       request={request} refresh={historyRefresh} contextKey={identity} intelligenceBands={preferences?.generation === generation ? preferences.bands : undefined}

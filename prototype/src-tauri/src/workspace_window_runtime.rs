@@ -1118,31 +1118,10 @@ mod tests {
         }
     }
     fn layout(revision: u64, windows: &[&str]) -> Value {
-        let roles = [
-            "active-qso",
-            "log-qso",
-            "logbook",
-            "callsign-intelligence",
-            "rotor",
-            "antenna",
-            "world-map",
-            "band-maps",
-            "dx-cluster",
-            "station-control",
-            "station-status",
-            "station-identity",
-            "cw",
-            "alerts",
-            "propagation",
-            "settings",
-            "sync",
-            "awards",
-            "chaser-dx",
-            "spot-history",
-            "monitor",
-        ];
+        // Every role the planner validates, in its own order (layout document v3).
+        let roles = crate::workspace_windows::ROLES;
         let panels: Vec<_> = roles.iter().enumerate().map(|(z, id)| json!({"id":id,"placement":if windows.contains(id) {"window"} else {"hidden"},"rect":{"x":0,"y":0,"width":640,"height":480},"z":z})).collect();
-        json!({"generation":"12345678-1234-1234-1234-123456789abc","revision":revision,"document":{"version":2,"activePresetID":"desk","presets":[{"id":"desk","name":"Desk","width":1920,"height":1080,"locked":true,"snap":true,"panels":panels}]}})
+        json!({"generation":"12345678-1234-1234-1234-123456789abc","revision":revision,"document":{"version":3,"activePresetID":"desk","presets":[{"id":"desk","name":"Desk","width":1920,"height":1080,"locked":true,"snap":true,"panels":panels}]}})
     }
     fn contest_layout(revision: u64, windows: &[&str]) -> Value {
         let mut layout = layout(revision, windows);

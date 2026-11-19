@@ -1,4 +1,9 @@
+#if canImport(Network)
 @preconcurrency import Network
+private typealias FlexConnection = NWConnection
+#elseif os(Windows)
+private typealias FlexConnection = WindowsTCPConnection
+#endif
 import Foundation
 
 enum FlexCommandResponseParser {
@@ -68,6 +73,7 @@ public actor FlexRadioClient: RadioControlling {
         var mode: String?
         var clientHandle: String?
         var indexLetter: String?
+        var daxChannel: Int?
         var active = false
         var transmit = false
         var inUse = true
@@ -88,11 +94,14 @@ public actor FlexRadioClient: RadioControlling {
     private let onSnapshot: SnapshotHandler
     private let queue = DispatchQueue(label: "com.oliverbross.OM0RXXCat.radio")
 
-    private var connection: NWConnection?
+    private var connection: FlexConnection?
+    private let digitalPTTOwner = DigitalPTTPermit.OwnerIdentity()
     private var generation = 0
     private var shouldRun = false
     private var reconnectAttempt = 0
     private var reconnectTask: Task<Void, Never>?
+    private var lastHeartbeat: Date?
+    public func confirmedHeartbeat() -> Date? { state == .ready && value.isConnected ? lastHeartbeat : nil }
     private var pingTask: Task<Void, Never>?
     private var inboundBuffer = Data()
     private var commandSequence = 1
@@ -111,6 +120,8 @@ public actor FlexRadioClient: RadioControlling {
     private var transportReady = false
     private var pendingCommands: [Int: PendingCommand] = [:]
     private var wordsPerMinute = 25
+    private var stationsByHandle: [String: String] = [:]
+    private var clientIDsByHandle: [String: String] = [:]
     private var reportedClientHandles: Set<String> = []
     private var reportedSliceIDs: Set<Int> = []
     private var ownClientHandle:UInt32?
@@ -225,22 +236,27 @@ public actor FlexRadioClient: RadioControlling {
     public func setPrimaryFrequency(_ frequencyHz: Int64) async throws {
         guard frequencyHz > 0 else { throw XCatError.invalidFrequency }
         guard let slice = stationSlice(letter: "A") else { throw XCatError.notConnected }
-        try await sendCommand("slice t \(slice.id) \(Self.formatMHz(frequencyHz))")
+        try await tuneSlice(slice.id, frequencyHz: frequencyHz)
     }
 
     /// Set the mode on the station-owned VFO A slice. Unlike `setMode`, this
     /// never follows the mutable selected slice and is therefore suitable for
     /// a command admitted against an explicit VFO-A observation.
     public func setPrimaryMode(_ mode: String) async throws {
+        try await setSliceMode(mode, letter: "A")
+    }
+    /// Exact station-owned logical slice, independent of GUI active selection.
+    public func setSliceMode(_ mode: String, letter: String) async throws {
+        guard ["A","B"].contains(letter) else { throw XCatError.unsupported }
         let normalized = try Self.validatedMode(mode)
-        guard let slice = stationSlice(letter: "A") else { throw XCatError.notConnected }
+        guard let slice = stationSlice(letter: letter) else { throw XCatError.notConnected }
         try await sendCommand("slice s \(slice.id) mode=\(normalized)")
     }
 
     public func setFrequency(_ frequencyHz: Int64) async throws {
         guard frequencyHz > 0 else { throw XCatError.invalidFrequency }
         guard let selectedSliceID else { throw XCatError.notConnected }
-        try await sendCommand("slice t \(selectedSliceID) \(Self.formatMHz(frequencyHz))")
+        try await tuneSlice(selectedSliceID, frequencyHz: frequencyHz)
     }
 
     public func setMode(_ mode: String) async throws {
@@ -257,7 +273,16 @@ public actor FlexRadioClient: RadioControlling {
     public func setSecondaryFrequency(_ frequencyHz: Int64) async throws {
         guard frequencyHz > 0 else { throw XCatError.invalidFrequency }
         guard let slice = stationSlice(letter: "B") else { throw XCatError.unsupported }
-        try await sendCommand("slice t \(slice.id) \(Self.formatMHz(frequencyHz))")
+        try await tuneSlice(slice.id, frequencyHz: frequencyHz)
+    }
+
+    private func tuneSlice(_ id: Int, frequencyHz: Int64) async throws {
+        let session = generation
+        try await sendCommand("slice t \(id) \(Self.formatMHz(frequencyHz))")
+        guard generation == session else { throw XCatError.notConnected }
+        // The FLEX-8400 can acknowledge a tune without echoing its changed
+        // frequency to the originating client. Request authoritative readback.
+        try await sendCommand("sub slice \(id)")
     }
 
     public func setSplitTransmit(_ enabled: Bool) async throws {
@@ -284,12 +309,28 @@ public actor FlexRadioClient: RadioControlling {
         }
         // Both releases are safety-critical. A failed tune-off reply must not
         // prevent the independent PTT-off command from being attempted.
+        async let pttOff: Void = sendCommand("xmit 0")
         var releaseError: Error?
         do { try await sendCommand("transmit tune 0") } catch { releaseError = error }
-        do { try await sendCommand("xmit 0") } catch {
+        do { try await pttOff } catch {
             if releaseError == nil { releaseError = error }
         }
         if let releaseError { throw releaseError }
+    }
+
+    public nonisolated var supportsDigitalPTTLease: Bool { true }
+    public func makeDigitalPTTPermit(deadline: ContinuousClock.Instant) throws -> DigitalPTTPermit {
+        guard transportReady, state == .ready, value.isConnected else { throw XCatError.notConnected }
+        return try DigitalPTTPermit(owner: digitalPTTOwner, connectionGeneration: generation, deadline: deadline)
+    }
+    /// The returned baseline is captured on the same actor immediately before
+    /// send initiation. OFF does not wait for tune-off, an ON ACK or an owner RPC.
+    public func setDigitalPTT(_ enabled: Bool, permit: DigitalPTTPermit) async throws -> UInt64 {
+        try permit.checkRelease(owner: digitalPTTOwner, connectionGeneration: generation)
+        let before = interlockObservationRevision
+        _ = try await sendReply(enabled ? "xmit 1" : "xmit 0", permit: enabled ? permit : nil)
+        try permit.checkRelease(owner: digitalPTTOwner, connectionGeneration: generation)
+        return before
     }
 
     public func setRFPower(_ watts: Int) async throws {
@@ -354,16 +395,17 @@ public actor FlexRadioClient: RadioControlling {
     }
 
     public func addSpot(_ spot: FlexSpot) async throws {
-        func encoded(_ value: String) -> String {
-            value.replacingOccurrences(of: " ", with: "\u{7F}")
-        }
+        try await sendCommand("spot add " + Self.spotFields(spot, source: spot.source))
+    }
+
+    private static func spotFields(_ spot: FlexSpot, source: String) -> String {
+        func encoded(_ value: String) -> String { value.replacingOccurrences(of: " ", with: "\u{7F}") }
         let frequency = String(format: "%.6f", Double(spot.frequencyHz) / 1_000_000)
-        let command = [
-            "spot add",
+        return [
             "rx_freq=\(frequency)",
             "callsign=\(encoded(spot.callsign))",
             "mode=\(encoded(spot.mode))",
-            "source=\(encoded(spot.source))",
+            "source=\(encoded(source))",
             "spotter_callsign=\(encoded(spot.spotter))",
             "timestamp=\(spot.timestamp)",
             "lifetime_seconds=\(spot.lifetimeSeconds)",
@@ -371,8 +413,95 @@ public actor FlexRadioClient: RadioControlling {
             "comment=\(encoded(spot.comment))",
             "color=\(spot.colorHex)",
         ].joined(separator: " ")
-        try await sendCommand(command)
     }
+
+    #if os(Windows)
+    private struct SpotIdentity: Equatable {
+        let callsign: String
+        let hz: Int64
+    }
+    private var spotSource: String?
+    private var ownedSpots: [Int: SpotIdentity] = [:]
+    private var spotCommandActive = false
+
+    /// The worker supplies the durable publisher ID. Re-subscribing on a new
+    /// transport rebuilds indexes from this radio's current ownership reports.
+    public func publishSpot(_ spot: FlexSpot, source: String, prior: Bool,
+                            beforeUpdate: @escaping @Sendable () async throws -> Void) async throws {
+        try await changeSpot(callsign: spot.callsign, frequencyHz: spot.frequencyHz, source: source, prior: prior, spot: spot, beforeUpdate: beforeUpdate)
+    }
+
+    public func withdrawSpot(callsign: String, frequencyHz: Int64, source: String, prior: Bool) async throws {
+        try await changeSpot(callsign: callsign, frequencyHz: frequencyHz, source: source, prior: prior, spot: nil)
+    }
+
+    private func changeSpot(callsign: String, frequencyHz: Int64, source: String, prior: Bool, spot: FlexSpot?,
+                            beforeUpdate: (@Sendable () async throws -> Void)? = nil) async throws {
+        guard state == .ready, value.isConnected, !spotCommandActive else { throw XCatError.notConnected }
+        spotCommandActive = true
+        defer { spotCommandActive = false }
+        let session = generation
+        if spotSource != source {
+            spotSource = source
+            ownedSpots.removeAll()
+            do { try await sendCommand("sub spot all") }
+            catch { if generation == session { spotSource = nil }; throw error }
+        }
+        guard generation == session, state == .ready else { throw XCatError.notConnected }
+        let identity = SpotIdentity(callsign: callsign, hz: frequencyHz)
+        // SmartSDR can report a spot a few Hz away after converting MHz to
+        // single precision. Carry the exact requested Hz across reconnects.
+        let taggedSource = "\(source)-\(frequencyHz)"
+        // The subscription ACK can precede the inventory by many packets.
+        // A retained attempt requires positive observation before index use.
+        if prior {
+            _ = try await waitForSpot(identity, session: session)
+        }
+        let matches = ownedSpots.filter { $0.value == identity }
+        guard matches.count <= 1 else { throw XCatError.server("Ambiguous FLEX spot ownership.") }
+        if let (index, _) = matches.first {
+            if let spot {
+                try await beforeUpdate?()
+                guard generation == session, ownedSpots[index] == identity else { throw XCatError.notConnected }
+                try await sendCommand("spot set \(index) " + Self.spotFields(spot, source: taggedSource))
+            } else {
+                try await sendCommand("spot remove \(index)")
+                let deadline = ContinuousClock.now + .seconds(4)
+                while ownedSpots[index] == identity {
+                    guard generation == session, ContinuousClock.now < deadline else { throw XCatError.notConnected }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+            }
+        } else if let spot {
+            let reply = try await sendReply("spot add " + Self.spotFields(spot, source: taggedSource))
+            guard let id = Int(reply), id >= 0, try await waitForSpot(identity, session: session) == id else { throw XCatError.server("Missing FLEX spot index.") }
+        }
+        guard generation == session else { throw XCatError.notConnected }
+    }
+
+    private func waitForSpot(_ identity: SpotIdentity, session: Int) async throws -> Int {
+        let deadline = ContinuousClock.now + .seconds(4)
+        while generation == session && ContinuousClock.now < deadline {
+            if let entry = ownedSpots.first(where: { $0.value == identity }) { return entry.key }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw XCatError.server("The radio has not confirmed this publisher’s spot.")
+    }
+
+    private func recordSpot(_ index: String?, properties: [String: String], removed: Bool) {
+        guard let raw = index, let id = Int(raw), id >= 0 else { return }
+        if removed { ownedSpots.removeValue(forKey: id); return }
+        guard let source = properties["source"] else { return }
+        guard let spotSource, source.hasPrefix(spotSource + "-"),
+              let hz = Int64(source.dropFirst(spotSource.count + 1)), (100_000...60_000_000).contains(hz),
+              let call = properties["callsign"], let mhz = properties["rx_freq"].flatMap(Double.init),
+              abs(mhz * 1_000_000 - Double(hz)) <= 4 else {
+            ownedSpots.removeValue(forKey: id)
+            return
+        }
+        ownedSpots[id] = SpotIdentity(callsign: call.uppercased(), hz: hz)
+    }
+    #endif
 
     public func setTransmit(_ mode: CATTransmitMode) async throws {
         guard state == .ready, value.isConnected, selectedSliceID != nil else { throw XCatError.notConnected }
@@ -391,6 +520,13 @@ public actor FlexRadioClient: RadioControlling {
         resetSessionState()
         transition(.connecting, "Connecting to \(host):\(port)")
 
+        #if os(Windows)
+        guard wanValidationHandle == nil, port != 0 else {
+            transition(.failed, "Direct LAN address and port required")
+            return
+        }
+        let newConnection = WindowsTCPConnection(host: host, port: port, queue: queue)
+        #else
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
             transition(.failed, "Invalid radio port")
             return
@@ -415,14 +551,19 @@ public actor FlexRadioClient: RadioControlling {
             parameters = .tcp
         }
         let newConnection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: parameters)
+        #endif
         connection = newConnection
         newConnection.stateUpdateHandler = { [weak self] networkState in
             Task { await self?.handle(networkState, generation: currentGeneration) }
         }
+        #if os(Windows)
+        newConnection.start()
+        #else
         newConnection.start(queue: queue)
+        #endif
     }
 
-    private func handle(_ networkState: NWConnection.State, generation currentGeneration: Int) async {
+    private func handle(_ networkState: FlexConnection.State, generation currentGeneration: Int) async {
         guard currentGeneration == generation else { return }
         switch networkState {
         case .ready:
@@ -437,6 +578,9 @@ public actor FlexRadioClient: RadioControlling {
                 try await bootstrap()
                 guard currentGeneration == generation else { return }
                 transition(.ready, "Connected; waiting for \(stationName) slice \(sliceLetter)")
+                // Initial slice, power and interlock reports may arrive while
+                // bootstrap is still waiting for the final command reply.
+                publishSnapshot()
                 startPingLoop(generation: currentGeneration)
                 // Optional advanced CW capability must not disable ordinary CAT
                 // or delay readiness/whole-message Send on older firmware.
@@ -448,16 +592,20 @@ public actor FlexRadioClient: RadioControlling {
             } catch {
                 await connectionFailed("Bootstrap failed: \(error.localizedDescription)", generation: currentGeneration)
             }
+        #if !os(Windows)
         case let .waiting(error):
             await connectionFailed("Network waiting: \(error.localizedDescription)", generation: currentGeneration)
+        #endif
         case let .failed(error):
             await connectionFailed("Connection failed: \(error.localizedDescription)", generation: currentGeneration)
+        #if !os(Windows)
         case .cancelled:
             if shouldRun, currentGeneration == generation {
                 await connectionFailed("Connection closed", generation: currentGeneration)
             }
         default:
             break
+        #endif
         }
     }
 
@@ -486,13 +634,18 @@ public actor FlexRadioClient: RadioControlling {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled else { return }
                 do {
-                    try await self?.sendCommand("ping")
+                    try await self?.confirmHeartbeat(generation: currentGeneration)
                 } catch {
                     await self?.connectionFailed("Radio heartbeat failed", generation: currentGeneration)
                     return
                 }
             }
         }
+    }
+
+    private func confirmHeartbeat(generation expected: Int) async throws {
+        try await sendCommand("ping")
+        if generation == expected && transportReady { lastHeartbeat = Date() }
     }
 
     private func receive(generation currentGeneration: Int) {
@@ -564,6 +717,10 @@ public actor FlexRadioClient: RadioControlling {
         }
 
         switch object {
+        #if os(Windows)
+        case "spot":
+            recordSpot(identifier, properties: properties, removed: tokens.dropFirst(2).first == "removed")
+        #endif
         case "client", "gui_client":
             applyClient(identifier: identifier, properties: properties)
         case "slice":
@@ -620,22 +777,36 @@ public actor FlexRadioClient: RadioControlling {
             let program = properties["program"] ?? "unknown program"
             onState(.connecting, "Found station \(observedStation) (\(program))")
         }
-        if properties["removed"] == "1" || properties.keys.contains("removed") {
-            if Self.normalizedHandle(identifier ?? properties["handle"]) == followedClientHandle {
+        guard let handle = Self.normalizedHandle(identifier ?? properties["handle"]) else { return }
+        if properties.keys.contains("removed") {
+            stationsByHandle.removeValue(forKey: handle)
+            clientIDsByHandle.removeValue(forKey: handle)
+            if handle == followedClientHandle {
                 followedClientHandle = nil
                 followedClientID = nil
                 selectedSliceID = nil
                 value.isConnected = false
-                publishSnapshot()
-                transition(.connecting, "Waiting for station \(stationName)")
+                value.vfos = []
             }
-            return
+        } else {
+            if let raw = properties["station"] {
+                let name = Self.displayStation(raw)
+                if !name.isEmpty && name.utf8.count <= 64 && name.utf8.allSatisfy({ (32...126).contains($0) && $0 != 124 }) {
+                    stationsByHandle[handle] = name
+                }
+            }
+            if let id = properties["client_id"] { clientIDsByHandle[handle] = id }
         }
-        guard Self.normalizedStation(properties["station"]) == Self.normalizedStation(stationName) else { return }
-        let newClientID = properties["client_id"]
+        value.availableStations = Array(Set(stationsByHandle.values)).sorted()
+        publishSnapshot()
+        selectBestSlice()
+    }
+
+    private func followStation(_ handle: String) {
+        let newClientID = clientIDsByHandle[handle]
         let shouldBind = newClientID != nil && newClientID != followedClientID
-        followedClientHandle = Self.normalizedHandle(identifier ?? properties["handle"])
-        followedClientID = newClientID ?? followedClientID
+        followedClientHandle = handle
+        followedClientID = newClientID
         if shouldBind, let followedClientID {
             let bindingGeneration=generation
             Task {
@@ -645,7 +816,6 @@ public actor FlexRadioClient: RadioControlling {
                 } catch { /* CAT observation remains available while Station binding fails. */ }
             }
         }
-        selectBestSlice()
     }
 
     private func applySlice(identifier: String?, properties: [String: String]) {
@@ -664,6 +834,7 @@ public actor FlexRadioClient: RadioControlling {
         if let mode = properties["mode"] { slice.mode = mode.uppercased() }
         if let handle = properties["client_handle"] { slice.clientHandle = Self.normalizedHandle(handle) }
         if let letter = properties["index_letter"] { slice.indexLetter = letter.uppercased() }
+        if let dax = properties["dax"] { slice.daxChannel = FlexDAXAssignment.parse(dax) }
         if let active = properties["active"] { slice.active = active == "1" || active.uppercased() == "T" }
         if let transmit = properties["tx"] { slice.transmit = transmit == "1" || transmit.uppercased() == "T" }
         if let inUse = properties["in_use"] { slice.inUse = inUse == "1" || inUse.uppercased() == "T" }
@@ -678,7 +849,17 @@ public actor FlexRadioClient: RadioControlling {
     }
 
     private func selectBestSlice() {
-        guard let followedClientHandle else { return }
+        let automatic = stationName.isEmpty || (stationName == "OM0RX-xLog" && !stationsByHandle.values.contains(stationName))
+        let handles = stationsByHandle.keys.filter { handle in
+            if !automatic { return Self.normalizedStation(stationsByHandle[handle]) == Self.normalizedStation(stationName) }
+            return slices.values.contains { $0.clientHandle == handle && $0.inUse && $0.frequencyMHz != nil }
+        }.sorted()
+        guard let handle = followedClientHandle.flatMap({ handles.contains($0) ? $0 : nil }) ?? handles.first else {
+            if value.isConnected { value.isConnected = false; value.vfos = []; publishSnapshot() }
+            return
+        }
+        followStation(handle)
+        let followedClientHandle = handle
         let candidates = slices.values.filter { slice in
             slice.clientHandle == followedClientHandle && slice.inUse && slice.frequencyMHz != nil
         }
@@ -719,10 +900,13 @@ public actor FlexRadioClient: RadioControlling {
                 frequencyHz: Int64((frequencyMHz * 1_000_000).rounded()),
                 mode: slice.mode ?? "?",
                 isReceive: slice.active,
-                isTransmit: slice.transmit
+                isTransmit: slice.transmit,
+                flexSliceID: slice.id,
+                flexClientHandle: slice.clientHandle,
+                daxChannel: slice.daxChannel
             )
         }.sorted { $0.letter < $1.letter }
-        value.station = stationName
+        value.station = stationsByHandle[handle] ?? stationName
         value.isConnected = true
         reconnectAttempt = 0
         publishSnapshot()
@@ -743,7 +927,7 @@ public actor FlexRadioClient: RadioControlling {
         _ = try await sendReply(body,timeout:timeout)
     }
 
-    private func sendReply(_ body:String,timeout:Duration = .seconds(5)) async throws -> String {
+    private func sendReply(_ body:String,timeout:Duration = .seconds(5),permit:DigitalPTTPermit? = nil) async throws -> String {
         guard transportReady, let connection else { throw XCatError.notConnected }
         let commandGeneration = generation
         let sequence = commandSequence
@@ -756,11 +940,30 @@ public actor FlexRadioClient: RadioControlling {
                 await self?.commandTimedOut(sequence, generation: commandGeneration)
             }
             pendingCommands[sequence] = PendingCommand(continuation: continuation, timeoutTask: timeoutTask)
-            connection.send(content: Data(command.utf8), completion: .contentProcessed { error in
+            let completion: @Sendable (Error?) -> Void = { error in
                 if let error {
                     Task { [self] in await self.failCommand(sequence, generation: commandGeneration, error: error) }
                 }
-            })
+            }
+            do {
+                if let permit {
+                    #if os(Windows) && !canImport(Network)
+                    // Windows has a userland send queue; guard its eventual
+                    // nonblocking write too, not just enqueue admission.
+                    try permit.withSendPermission(owner: digitalPTTOwner, connectionGeneration: commandGeneration) {
+                        connection.send(content: Data(command.utf8), completion: .contentProcessed(completion),
+                                        permit: permit, permitOwner: digitalPTTOwner, permitGeneration: commandGeneration)
+                    }
+                    #else
+                    try permit.withSendPermission(owner: digitalPTTOwner, connectionGeneration: commandGeneration) {
+                        connection.send(content: Data(command.utf8), completion: .contentProcessed(completion))
+                    }
+                    #endif
+                } else { connection.send(content: Data(command.utf8), completion: .contentProcessed(completion)) }
+            } catch {
+                pendingCommands.removeValue(forKey: sequence)?.timeoutTask.cancel()
+                continuation.resume(throwing: error)
+            }
         }
     }
 
@@ -837,6 +1040,11 @@ public actor FlexRadioClient: RadioControlling {
     }
 
     private func resetSessionState() {
+        lastHeartbeat = nil
+        #if os(Windows)
+        spotSource = nil
+        ownedSpots.removeAll()
+        #endif
         cwx.reset(generation: generation)
         ownClientHandle=nil
         pingTask?.cancel()
@@ -848,6 +1056,9 @@ public actor FlexRadioClient: RadioControlling {
         followedClientHandle = nil
         followedClientID = nil
         clientHandleReceived = false
+        stationsByHandle.removeAll()
+        clientIDsByHandle.removeAll()
+        value.availableStations = []
         reportedClientHandles.removeAll(keepingCapacity: true)
         reportedSliceIDs.removeAll(keepingCapacity: true)
         transportReady = false

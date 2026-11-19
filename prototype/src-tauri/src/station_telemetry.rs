@@ -261,11 +261,23 @@ impl StationTelemetry {
             let radio = &snapshot["radio"];
             let source_age = snapshot["generated_at"].as_f64().map(|time| now as f64 - time * 1000.0);
             let observed_age = radio["observed_at"].as_f64().map(|time| now as f64 - time * 1000.0);
-            source_age.is_some_and(|age| age.is_finite() && age.abs() <= 5000.0)
-                && observed_age.is_some_and(|age| age.is_finite() && age.abs() <= 5000.0)
+            // FLEX publishes slice/interlock changes on a subscribed TCP connection.
+            // A successful ping on that same connection confirms a quiet subscription is live.
+            let heartbeat_age = snapshot["heartbeat_at"].as_f64().map(|time| now as f64 - time * 1000.0);
+            let recent = |age: f64| age.is_finite() && (-1000.0..=5000.0).contains(&age);
+            let receive = radio["receive_vfo"].as_str();
+            let vfos = radio["vfos"].as_array();
+            // station_tune selects A and confirms both slices before tuning. Exact
+            // single-field controls still require A to be the current receiver.
+            let receiver_known = receive.is_some_and(|letter| {
+                (letter == "A" || control == "tune_simplex" && letter == "B")
+                    && vfos.is_some_and(|vfos| vfos.iter().any(|vfo| vfo["letter"] == letter && vfo["receive"] == true)
+                        && vfos.iter().any(|vfo| vfo["letter"] == "A"))
+            });
+            source_age.is_some_and(recent)
+                && (observed_age.is_some_and(recent) || provider == "direct_flex_lan" && heartbeat_age.is_some_and(recent))
                 && snapshot["source"] == provider && snapshot["generation"].as_u64() == Some(connection)
-                && radio["connected"] == true && radio["observed"] == true && radio["transmitting"] == false && radio["receive_vfo"] == "A"
-                && radio["vfos"].as_array().is_some_and(|vfos| vfos.iter().any(|vfo| vfo["letter"] == "A" && vfo["receive"] == true))
+                && radio["connected"] == true && radio["observed"] == true && radio["transmitting"] == false && receiver_known
                 && control_supported
         };
         if self.stopped.load(Ordering::Acquire) || state.controls != 0
@@ -461,6 +473,7 @@ pub fn owner_for(app: &tauri::AppHandle, radio_id: &str) -> Result<Arc<StationTe
                     crate::qsy_clear::observe(&value);
                     crate::radio_follow::observe(&value);
                     crate::antenna_profile::observe(&value);
+                    crate::elecraft::observe(&value);
                     let _ = app.emit_to("alerts", "xlog:alerts", ());
                     for label in ["main", "log-qso", "monitor", "world-map", "band-maps", "station-status", "station-control", "contest--station-control"] {
                         let _ = app.emit_to(
@@ -650,6 +663,33 @@ mod tests {
         state.projection = json!({"revision":1,"provider":provider,"selection_id":identity,"selection_generation":2,"available":true,"received_at_ms":10000,"snapshot":snapshot});
         drop(state); (owner, identity)
     }
+    #[test]
+    fn simplex_can_select_a_when_maestro_is_receiving_on_b() {
+        let (owner, identity) = receive_fixture("direct_flex_lan");
+        {
+            let mut state = owner.state.lock().unwrap();
+            let radio = &mut state.projection["snapshot"]["radio"];
+            radio["receive_vfo"] = json!("B");
+            radio["vfos"] = json!([{"letter":"A","receive":false},{"letter":"B","receive":true}]);
+        }
+        assert!(owner.receive_control_at(2, &identity, 13, "set_frequency_a", 10000).is_err());
+        assert!(owner.receive_control_at(2, &identity, 13, "tune_simplex", 10000).is_ok());
+    }
+
+    #[test]
+    fn quiet_flex_slice_requires_current_heartbeat_or_new_radio_status() {
+        for (heartbeat, idle, accepted) in [(9.8, true, true), (1.0, true, false), (9.8, false, false)] {
+            let (owner, identity) = receive_fixture("direct_flex_lan");
+            {
+                let mut state = owner.state.lock().unwrap();
+                state.projection["snapshot"]["radio"]["observed_at"] = json!(1.0);
+                state.projection["snapshot"]["heartbeat_at"] = json!(heartbeat);
+                state.projection["snapshot"]["radio"]["transmitting"] = json!(!idle);
+            }
+            assert_eq!(owner.receive_control_at(2, &identity, 13, "tune_simplex", 10000).is_ok(), accepted);
+        }
+    }
+
     #[test]
     fn exact_receive_admission_requires_fresh_known_receive_vfo_connection_and_capability_without_io() {
         for change in 0..14 {

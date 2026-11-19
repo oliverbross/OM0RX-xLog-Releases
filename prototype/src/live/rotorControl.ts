@@ -20,7 +20,7 @@ export function rotorProjection(snapshot: RotorSnapshot | null): Record<string, 
   const azimuth = native ? number(backend?.azimuth) : number(position?.Azimuth);
   return { ...(native ? backend : {}), owner: snapshot?.owner ?? null, generation: snapshot?.generation,
     connected: snapshot?.state === "active" && snapshot.backend_available !== false && (native ? backend?.connected === true : azimuth !== undefined),
-    name: native ? backend?.name || "DCU-1 rotor" : "Hamlib rotor", azimuth,
+    name: native ? backend?.name || "DCU-1 rotor" : snapshot?.owner === "hamlib" ? "Hamlib rotor" : "Rotor", azimuth,
     elevation: native ? undefined : number(position?.Elevation),
     observed_at: native ? backend?.observed_at : number(backend?.observed_at_ms) === undefined ? undefined : backend!.observed_at_ms / 1000,
     status: snapshot?.state === "uncertain" ? "Connection needs attention" : native ? backend?.status || "Disconnected" : azimuth === undefined ? "Disconnected" : "Observed",

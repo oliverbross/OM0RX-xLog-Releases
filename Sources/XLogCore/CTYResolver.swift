@@ -34,15 +34,15 @@ public final class CTYResolver: @unchecked Sendable {
         public let policy: String
         public let locationPrecision: String
     }
-    public static let factsPolicy = "xlog-country-facts-v2"
+    public static let factsPolicy = "xlog-country-facts-v3"
     public let contentDigest: String
     private var primarySnapshotIdentity: String {
         let catalogue = countryPack != nil ? ":entity-catalogue:\(Self.entityCatalogueDigest)" : ""
         return "\(Self.factsPolicy):\(contentDigest)\(catalogue)"
     }
     public var snapshotIdentity: String {
-        guard let neutralFallback else { return primarySnapshotIdentity }
-        return "\(primarySnapshotIdentity):fallback:\(Self.digest(Data(neutralFallback.snapshotIdentity.utf8)))"
+        let base = neutralFallback.map { "\(primarySnapshotIdentity):fallback:\(Self.digest(Data($0.snapshotIdentity.utf8)))" } ?? primarySnapshotIdentity
+        return currentCTY.map { "\(base):cty-dat:\($0.contentDigest)" } ?? base
     }
     public var primaryReferenceRevision: String { primarySnapshotIdentity }
     public var fallbackReferenceRevision: String? { neutralFallback?.snapshotIdentity }
@@ -55,11 +55,22 @@ public final class CTYResolver: @unchecked Sendable {
         var names: [Int: String] = [:]
         // Use the same winning rules as entities, without sorting display names
         // just to rebuild a dictionary keyed by ADIF identity.
-        for rule in entityCatalogue?.rules ?? [] where rule.country.latitude != nil && rule.country.longitude != nil {
+        // A starred CTY primary prefix is a WAE-only subdivision, not the
+        // canonical DXCC entity. Its aliases can sort before the entity's own
+        // prefix (for example 4U1VIC before OE), so never use its display name
+        // as the label for every station sharing that ADIF identity.
+        for rule in entityCatalogue?.rules ?? [] where !rule.primaryPrefix.hasPrefix("*") && rule.country.latitude != nil && rule.country.longitude != nil {
             names[rule.country.adif] = names[rule.country.adif] ?? rule.country.name
         }
         return names
     }()
+    /// The facts that identify an entity for logging and scoring, without
+    /// the area description or coordinates.
+    private struct EntityFacts: Hashable {
+        let adif: Int, continent: String, cqZone: Int, ituZone: Int
+        init(_ country: CountryInfo) { adif = country.adif; continent = country.continent; cqZone = country.cqZone; ituZone = country.ituZone }
+    }
+
     private static func entityNamedCountry(_ country: CountryInfo) -> CountryInfo {
         CountryInfo(name: entityNames[country.adif] ?? country.name, adif: country.adif,
             continent: country.continent, cqZone: country.cqZone, ituZone: country.ituZone,
@@ -79,13 +90,15 @@ public final class CTYResolver: @unchecked Sendable {
     private let rules: [Rule]
     private let endpointRules: [Rule]
     private let ignoredSuffixes: Set<String> = ["P", "M", "MM", "AM", "QRP", "QRPP", "A", "B", "QTH", "LH"]
-    private let endpointIndex: [Character: [Rule]]
+    private let endpointIndex: [String: [Rule]]
     public let countryPack: CountryReferencePack?
     private let packedRules: [CountryReferencePack.CompiledRule]
     private let packedExactIndex: [String: [CountryReferencePack.CompiledRule]]
     private let packedIndex: [String: [CountryReferencePack.CompiledRule]]
     private let packedWildcards: [CountryReferencePack.CompiledRule]
     private let neutralFallback: CTYResolver?
+    private var currentCTY: CTYResolver?
+    public private(set) var countryFilesVersion: String?
 
     public init(csvURL: URL) throws {
         neutralFallback = nil
@@ -114,8 +127,66 @@ public final class CTYResolver: @unchecked Sendable {
         }
         rules = Self.sortedRules(parsed, by: \.token)
         endpointRules = Self.sortedRules(parsed, by: \.endpointToken)
-        endpointIndex = Dictionary(grouping: endpointRules, by: { $0.endpointToken.first! })
+        endpointIndex = Dictionary(grouping: endpointRules, by: \.endpointToken)
         contentDigest = Self.digest(Data(text.utf8))
+    }
+
+    /// AD1C CTY.DAT: exact-call exceptions, prefix aliases and per-token zones.
+    /// CTY.DAT omits ADIF IDs; join its primary prefixes to the bundled CTY CSV
+    /// catalogue. Do not confuse WAE-only entries with DXCC entities.
+    public convenience init(countryFiles data: Data) throws {
+        guard data.count <= 4_000_000, let text = String(data: data, encoding: .utf8),
+              let versionRange = text.range(of: #"(?<==)VER[0-9]{8}(?=[,;\s])"#, options: .regularExpression) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let version = String(text[versionRange])
+        let format = DateFormatter(); format.locale = Locale(identifier: "en_US_POSIX")
+        format.timeZone = TimeZone(secondsFromGMT: 0); format.dateFormat = "yyyyMMdd"; format.isLenient = false
+        guard let start = format.date(from: String(version.dropFirst(3))),
+              format.string(from: start) == String(version.dropFirst(3)) else { throw CocoaError(.fileReadCorruptFile) }
+        let catalogue = try Self.bundled()
+        let catalogueByPrefix = Dictionary(catalogue.rules.map { ($0.primaryPrefix, $0.country) }, uniquingKeysWith: { first, _ in first })
+        var parsed: [Rule] = []
+        let blocks = text.split(separator: ";", omittingEmptySubsequences: false)
+        guard blocks.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true else { throw CocoaError(.fileReadCorruptFile) }
+        for block in blocks.dropLast() {
+            let fields = block.split(separator: ":", maxSplits: 8, omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            guard fields.count == 9, let cq = Int(fields[1]), (1...40).contains(cq),
+                  let itu = Int(fields[2]), (1...90).contains(itu),
+                  ["AF", "AN", "AS", "EU", "NA", "OC", "SA"].contains(fields[3]),
+                  let lat = Double(fields[4]), (-90...90).contains(lat),
+                  let lon = Double(fields[5]), (-180...180).contains(lon) else { throw CocoaError(.fileReadCorruptFile) }
+            if fields[7].hasPrefix("*") { continue }
+            let prefix = fields[7].uppercased()
+            guard let entity = catalogueByPrefix[prefix] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let info = CountryInfo(name: entity.name, adif: entity.adif, continent: fields[3], cqZone: cq,
+                ituZone: itu, latitude: lat, longitude: -lon)
+            for raw in [prefix] + fields[8].split(separator: ",").map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) {
+                let token = Self.cleanEndpointToken(Self.cleanLegacyToken(raw))
+                guard !token.isEmpty, token.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "/") }) else { throw CocoaError(.fileReadCorruptFile) }
+                parsed.append(Rule(token: token, endpointToken: token, primaryPrefix: prefix, exact: raw.hasPrefix("="),
+                    country: info, endpointCountry: Self.applyingOverrides(in: raw, to: info), start: start, end: nil))
+            }
+        }
+        guard Set(parsed.map { $0.country.adif }).count >= 300 else { throw CocoaError(.fileReadCorruptFile) }
+        self.init(rules: parsed, content: data)
+        countryFilesVersion = version
+    }
+
+    public static func bundledCountryFiles() throws -> CTYResolver {
+        guard let root = Bundle.module.resourceURL else { throw CocoaError(.fileNoSuchFile) }
+        return try CTYResolver(countryFiles: Data(contentsOf: root.appendingPathComponent("cty.dat")))
+    }
+
+    /// Current CTY exact calls can disambiguate an expired historical exception.
+    /// Its release date bounds applicability; older QSO facts remain historical.
+    public func supplemented(withCountryFiles current: CTYResolver) -> CTYResolver {
+        let copy = CTYResolver(primary: self, fallback: neutralFallback)
+        copy.currentCTY = current
+        return copy
     }
 
     public static func bundled() throws -> CTYResolver {
@@ -165,7 +236,7 @@ public final class CTYResolver: @unchecked Sendable {
         countryPack = nil; packedRules = []; packedExactIndex = [:]; packedIndex = [:]; packedWildcards = []
         self.rules = Self.sortedRules(rules, by: \.token)
         endpointRules = Self.sortedRules(rules, by: \.endpointToken)
-        endpointIndex = Dictionary(grouping: endpointRules, by: { $0.endpointToken.first! })
+        endpointIndex = Dictionary(grouping: endpointRules, by: \.endpointToken)
         contentDigest = Self.digest(content)
     }
 
@@ -258,6 +329,22 @@ public final class CTYResolver: @unchecked Sendable {
     /// never substitutes today's date or strips invalid input into another call.
     /// The legacy resolve APIs retain their historical home-entity semantics.
     public func facts(_ literal: String, at date: Date?) -> Facts {
+        let base = factsWithoutCurrentCTY(literal, at: date)
+        guard let currentCTY, [.resolved, .unknown, .ambiguous].contains(base.status) else { return base }
+        let extra = currentCTY.primaryFacts(literal, at: date)
+        guard extra.status == .resolved, let rule = extra.matchedRule else { return base }
+        let isExact = currentCTY.endpointIndex[rule]?.contains(where: \.exact) == true
+        guard isExact || base.status == .unknown else { return base }
+        return Facts(literalCall: extra.literalCall, normalizedCall: extra.normalizedCall,
+            operatorCall: extra.operatorCall, qualifier: extra.qualifier, observedAt: extra.observedAt,
+            status: extra.status, country: extra.country, operatingPrefix: extra.operatingPrefix,
+            matchedRule: extra.matchedRule, matchedDescription: extra.matchedDescription,
+            matchedReferenceRevision: extra.matchedReferenceRevision, validFrom: extra.validFrom,
+            validUntil: extra.validUntil, referenceRevision: snapshotIdentity, policy: Self.factsPolicy,
+            locationPrecision: extra.locationPrecision)
+    }
+
+    private func factsWithoutCurrentCTY(_ literal: String, at date: Date?) -> Facts {
         let primary = primaryFacts(literal, at: date)
         guard primary.status == .unknown, let neutralFallback else { return primary }
         let fallback = neutralFallback.facts(literal, at: date)
@@ -292,8 +379,16 @@ public final class CTYResolver: @unchecked Sendable {
         guard let date, date.timeIntervalSince1970.isFinite else { return result(.missingDate) }
         if countryPack != nil { return packedFacts(literal, call: call, parts: parts, operatorCall: operatorCall, qualifier: qualifier, at: date) }
         func matches(_ candidate: String, exactOnly: Bool = false) -> [Rule] {
-            guard let first = candidate.first else { return [] }
-            return (endpointIndex[first] ?? []).filter { rule in
+            // A call can only match its own full token and successively shorter
+            // prefixes. Avoid scanning thousands of unrelated exact exceptions
+            // that happen to begin with the same letter on every spot/history read.
+            var token = candidate, candidates: [Rule] = []
+            while !token.isEmpty {
+                candidates += endpointIndex[token] ?? []
+                if exactOnly { break }
+                token.removeLast()
+            }
+            return candidates.filter { rule in
                 guard Self.isActive(rule, at: date), !exactOnly || rule.exact,
                       rule.exact ? candidate == rule.endpointToken : candidate.hasPrefix(rule.endpointToken) else { return false }
                 return !(rule.endpointToken == "KG4" && candidate.range(of: #"^KG4[A-Z]{3}$"#, options: .regularExpression) != nil
@@ -460,7 +555,12 @@ public final class CTYResolver: @unchecked Sendable {
                 return !exact && pack.ambiguousPrefixes.contains(where: { key.hasPrefix($0) }) ? output(.ambiguous) : nil
             }
             let peers = candidates.prefix { $0.rank == best.rank }
-            guard Set(peers.map { $0.record.country }).count == 1 else { return output(.ambiguous) }
+            // Equal-rank records that differ only in their area description
+            // (e.g. two Greek special-station areas for SX6) still name one
+            // DXCC entity. They are ambiguous only if any entity-level fact
+            // differs: ADIF, continent, CQ zone or ITU zone.
+            guard Set(peers.map { $0.record.country }).count == 1
+                    || Set(peers.map { EntityFacts($0.record.country) }).count == 1 else { return output(.ambiguous) }
             if best.record.country.adif == 0 { return output(.knownNoEntity, best) }
             // An explicitly ambiguous prefix needs a finer rule. Exact dated
             // exceptions remain usable without guessing from the broad prefix.

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { activatePreset, deletePreset, duplicatePreset, maxWorkspacePresets, validatePresetName } from "./workspacePresetActions";
 import { panelMinimum, type LayoutPreset, type LayoutSnapshot, type LayoutState, type WorkspacePanelID, type WorkspaceLayoutSession } from "./workspaceLayoutSession";
@@ -12,7 +13,7 @@ const names: Record<WorkspacePanelID, string> = {
   rotor: "Rotor", antenna: "Antenna", "world-map": "World map", "band-maps": "Band maps", "dx-cluster": "DX Cluster",
   "station-control": "Station control", "station-status": "Station status", "station-identity": "Station identity", cw: "CW macros",
   alerts: "Alerts", propagation: "HF propagation", settings: "Settings", sync: "Sync", awards: "Awards", "chaser-dx": "Chaser & DX",
-  "spot-history": "Spot History", monitor: "Monitor",
+  "spot-history": "Spot History", monitor: "Monitor", "previous-qsos": "Previous QSOs", kpa500: "KPA500", kat500: "KAT500",
 };
 type Draft = { base: LayoutSnapshot; preset: LayoutPreset };
 type Props = { state: LayoutState; session: WorkspaceLayoutSession; subscriptionError?: string;
@@ -117,10 +118,10 @@ export default function WorkspaceSettings({ state, session, subscriptionError, a
       ? "Traditional keeps the familiar docked desk. Duplicate it to choose panels and arrange your own workspace."
       : "Use this layout on the Operator Desk. Edit its panels here; move and resize them on the desk with Arrange panels."}</p>}
     {(hasSavedWindows || native.error || native.status?.state === "error") && <div className="workspace-native-outcome" role="status">
-      <p>{native.error || (native.retrying ? "Applying saved windows…"
+      <ErrorNotice when={Boolean(native.error || native.status?.state === "error") || undefined}><p>{native.error || (native.retrying ? "Applying saved windows…"
         : native.status?.state === "error" ? `Layout saved; window placement needs attention. ${native.status.error}`
         : nativeCurrent && native.status?.state === "applied" ? "Saved window placement applied."
-        : "Saved window placement is waiting for native confirmation.")}</p>
+        : "Saved window placement is waiting for native confirmation.")}</p></ErrorNotice>
       <button type="button" disabled={blocked || native.retrying || native.status?.state === "applying" || !!native.status?.stopped}
         onClick={() => void native.retry()}>Apply saved windows</button>
     </div>}
@@ -150,7 +151,7 @@ export default function WorkspaceSettings({ state, session, subscriptionError, a
       <button className="primary" type="submit" disabled={blocked}>Save layout</button>
       <button type="button" disabled={working || state.saving || !!state.pending} onClick={() => { setDraft(null); setMessage(""); }}>Cancel editing</button>
     </form>}
-    {(message || state.error || subscriptionError) && <p role="status" className="workspace-settings-feedback">{message || state.error || subscriptionError}</p>}
+    {(message || state.error || subscriptionError) && <ErrorNotice when={Boolean(state.error || subscriptionError) || undefined}><p role="status" className="workspace-settings-feedback">{message || state.error || subscriptionError}</p></ErrorNotice>}
     {draft && message && !state.pending && <p>Your edits are retained. To review the current saved layout, cancel editing and open Edit layout again.</p>}
     {(state.pending || state.error || subscriptionError || !snapshot) && <div className="workspace-recovery">
       <button type="button" disabled={working || state.saving} onClick={() => void run(() => session.refresh())}>Reload saved layouts</button>

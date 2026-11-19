@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { historicalADIFRecords,type HistoricalADIFRecord } from "./contestAdifImport";
 import type { ADIFImportEncoding } from "../live/adifTransfer";
@@ -38,7 +39,7 @@ export function ContestHistoricalImport({scope,request,disabled,onApply}:{scope:
       <option>utf-8</option><option>windows-1252</option><option>iso-8859-1</option></select></label>
     <label>Source ADIF<input aria-label="Historical ADIF file" type="file" accept=".adi,.adif,.adx" disabled={disabled||working} onChange={event=>{const file=event.target.files?.[0];if(file)void choose(file);event.target.value="";}}/></label>
     <button disabled={disabled||working||!records.length} onClick={()=>void review()}>Review all source contacts</button>
-    <p role="status">{progress||`${records.length} decoded source contacts; no preview yet.`}</p>{error&&<p role="alert">{error}</p>}
+    <ErrorNotice><p role="status">{progress||`${records.length} decoded source contacts; no preview yet.`}</p></ErrorNotice>{error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
     {reviews.length>0&&<><p>{reviews.length} contacts reviewed at revision {revision}. Raw file SHA-256 <code>{records[0]?.sourceSHA256}</code>.</p>
       <ul>{reviews.slice(0,25).map(row=><li key={row.qsoID}>{row.status} · {row.fields.callsign} · {row.timestamp} · {row.frequencyHz} Hz · {row.family} · radio {row.radioAttribution}</li>)}</ul>
       {reviews.length>25&&<p>First 25 shown; every decoded contact was reviewed.</p>}

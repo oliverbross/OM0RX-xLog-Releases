@@ -1,3 +1,5 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { formatRadioFrequency } from "./radioFrequency";
 import { useEffect, useState, type ReactNode } from "react";
 import { connectMonitorContext, monitorRadioFresh, monitorStation, type MonitorContext } from "./monitorContext";
 import { RadioOperatingSelector } from "./RadioOperatingSelector";
@@ -12,7 +14,7 @@ import "./DetachedStationControlSurface.css";
 
 type Connection = { refresh: () => void; dispose: () => void };
 type Props = { connect?: (changed: (value: MonitorContext) => void, failed: (message: string) => void) => Connection; configuration?: ReactNode | ((context: MonitorContext | null) => ReactNode); configurationLabel?: string; rotorControls?: boolean; rotorSession?: ManualRotorGotoSession; contestRemoteVfo?: boolean; operatingSelector?: ReactNode };
-const frequency = (hz: unknown) => typeof hz === "number" && Number.isFinite(hz) ? `${(hz / 1e6).toFixed(6)} MHz` : "Unavailable";
+const frequency = (hz: unknown) => typeof hz === "number" && Number.isFinite(hz) ? `${formatRadioFrequency(hz)} MHz` : "Unavailable";
 const value = (input: unknown) => input == null || input === "" ? "Unavailable" : String(input);
 const providers = { direct_agent: "Remote Station Agent", direct_flex_lan: "Direct FLEX LAN", direct_tci: "Direct TCI · receive control", hamlib: "Local Hamlib" };
 
@@ -36,10 +38,10 @@ export function StationControlSurface({ connect = connectMonitorContext, configu
     <section className="contest-remote-vfo" aria-label="Remote VFO observations">
       <header><h2>Remote VFO</h2><span className={`contest-remote-vfo-status ${fresh ? "is-live" : ""}`}>{fresh ? "Observed live" : "Retained / unavailable"}</span></header>
       {operatingSelector}
-      {error && <p className="live-station-error" role="alert">{error}</p>}
-      {!context && <p role="status">Loading retained native station observations…</p>}
-      {context?.acceptance && <p role="status">Synthetic isolated observation · read only</p>}
-      {context && !provider && <p role="status">No radio selected. Select and connect a radio in the main station controls.</p>}
+      {error && <ErrorNotice><p className="live-station-error" role="alert">{error}</p></ErrorNotice>}
+      {!context && <ErrorNotice><p role="status">Loading retained native station observations…</p></ErrorNotice>}
+      {context?.acceptance && <ErrorNotice><p role="status">Synthetic isolated observation · read only</p></ErrorNotice>}
+      {context && !provider && <ErrorNotice><p role="status">No radio selected. Select and connect a radio in the main station controls.</p></ErrorNotice>}
       {provider && <div className="contest-remote-vfo-readback">
         <span>VFO</span><strong>{frequency(radio.receive_frequency_hz ?? radio.frequency_hz)}</strong><b>{value(radio.mode)}</b>
         <small>{providers[provider]}</small>
@@ -54,12 +56,12 @@ export function StationControlSurface({ connect = connectMonitorContext, configu
       ? <ManualRotorControl context={context} session={rotorSession} /> : <ManualRotorStatus session={rotorSession} />)}
     <section className="live-station detached-station-observations" aria-label="Station observations">
       <h2>Observed station state</h2>
-      {error && <p className="live-station-error" role="alert">{error}</p>}
-      {!context && <p role="status">Loading retained native station observations…</p>}
-      {context?.acceptance && <p role="status">Synthetic isolated observation · read only</p>}
-      {provider === "direct_tci" && <p role="status">TCI permits explicit receive-frequency and mode tuning only. Transmit controls remain unavailable.</p>}
-      {context && !provider && <p role="status">No radio selected. Select and connect a radio{configuration ? " above" : " in the main station controls"}.</p>}
-      {provider && <><p>{providers[provider]} · <span role="status">{fresh ? "Observed live" : "Observation unavailable or stale · retained values"}</span></p>
+      {error && <ErrorNotice><p className="live-station-error" role="alert">{error}</p></ErrorNotice>}
+      {!context && <ErrorNotice><p role="status">Loading retained native station observations…</p></ErrorNotice>}
+      {context?.acceptance && <ErrorNotice><p role="status">Synthetic isolated observation · read only</p></ErrorNotice>}
+      {provider === "direct_tci" && <ErrorNotice><p role="status">TCI permits explicit receive-frequency and mode tuning only. Transmit controls remain unavailable.</p></ErrorNotice>}
+      {context && !provider && <ErrorNotice><p role="status">No radio selected. Select and connect a radio{configuration ? " above" : " in the main station controls"}.</p></ErrorNotice>}
+      {provider && <><p>{providers[provider]} · <ErrorNotice><span role="status">{fresh ? "Observed live" : "Observation unavailable or stale · retained values"}</span></ErrorNotice></p>
         <div className="live-station-readback"><div><span>Observed receive</span><strong>{frequency(radio.receive_frequency_hz ?? radio.frequency_hz)}</strong><span>{value(radio.mode)}</span></div></div>
         <dl><dt>Transmit frequency</dt><dd>{frequency(radio.transmit_frequency_hz)}</dd>
           <dt>PTT</dt><dd>{fresh && typeof radio.transmitting === "boolean" ? radio.transmitting ? "Transmitting" : "Receive" : "Unavailable"}</dd>
@@ -91,5 +93,5 @@ export function DetachedStationControlSurface() {
     return () => { active = false; stop?.(); };
   }, [localAcceptance]);
   return <StationControlSurface contestRemoteVfo={contestRemoteVFO} operatingSelector={contestRemoteVFO && !localAcceptance ? <RadioOperatingSelector /> : undefined} rotorControls={!contestRemoteVFO} configurationLabel={contestRemoteVFO ? "Remote VFO controls" : undefined} configuration={localAcceptance ? undefined : context => radioId ? <>{!contestRemoteVFO && <><RadioOperatingSelector /><p>Configure both radios in Settings → Radios. This window controls the active radio.</p></>}
-    {context?.selection?.provider && <ManualSimplexTune key={`${radioId}-tune`} radioId={radioId} provider={context.selection.provider} context={context} />}</> : <p role="status">Loading active radio routing…</p>} />;
+    {context?.selection?.provider && <ManualSimplexTune key={`${radioId}-tune`} radioId={radioId} provider={context.selection.provider} context={context} />}</> : <ErrorNotice><p role="status">Loading active radio routing…</p></ErrorNotice>} />;
 }

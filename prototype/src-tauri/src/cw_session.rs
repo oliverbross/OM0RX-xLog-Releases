@@ -1053,7 +1053,7 @@ mod tests {
     fn actual_host_default_macros_continue_pending_keyer_once_and_reject_replay() {
         let (session, backend, _) = fixture();
         let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let output = std::process::Command::new(std::env::var("XLOG_TEST_PYTHON").unwrap_or_else(|_| "python3.12".into()))
+        let output = std::process::Command::new(crate::test_support::python())
             .arg(project.join("python/tests/cw_continuation_fixture.py"))
             // Initial canonical observation retires epoch 0; explicit arm uses 2.
             .arg(json!({"ownerID":session.owner_id,"epoch":2}).to_string())

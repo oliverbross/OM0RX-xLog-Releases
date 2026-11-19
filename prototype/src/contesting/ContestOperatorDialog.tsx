@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { closeContestSetupDialog, saveContestSetupDialog, setupDialogRequest, type SetupDialogSnapshot } from "./contestSetupDialogs";
 import "./ContestWorkspace.css";
@@ -43,10 +44,10 @@ export function ContestOperatorDialog() {
     {snapshot ? <form onSubmit={submit}>
       <label><span>Operator callsign</span><input autoFocus required maxLength={20} value={operator}
         onChange={event => setOperator(event.target.value)} /></label>
-      {error && <p className="contest-alert is-error" role="alert">{error}</p>}
+      {error && <ErrorNotice><p className="contest-alert is-error" role="alert">{error}</p></ErrorNotice>}
       <footer><button type="button" disabled={saving} onClick={() => void closeContestSetupDialog()}>Cancel</button>
         <button className="contest-primary" type="submit" disabled={saving}>{saving ? "Saving…" : "Save"}</button></footer>
-    </form> : error ? <><p className="contest-alert is-error" role="alert">{error}</p>
-      <button type="button" onClick={() => void closeContestSetupDialog()}>Cancel</button></> : <p role="status">Loading operator…</p>}
+    </form> : error ? <><ErrorNotice><p className="contest-alert is-error" role="alert">{error}</p></ErrorNotice>
+      <button type="button" onClick={() => void closeContestSetupDialog()}>Cancel</button></> : <ErrorNotice><p role="status">Loading operator…</p></ErrorNotice>}
   </main>;
 }

@@ -4,7 +4,7 @@ import { useState } from "react";
 
 export function ContestRecorderStrip(){
   const {state,error}=useRecorderStatus(),[message,setMessage]=useState("");const active=state?.active;
-  const run=(action:string)=>void recorderKeyAction(action).catch(e=>setMessage(String(e)));
+  const run=(action:string)=>{setMessage("");void recorderKeyAction(action).catch(e=>setMessage(String(e)));};
   const healthError=error||state?.error;
   const savedSeconds=active?Math.floor((active.savedFrames??0)/active.rate):0;
   const savedTime=`${Math.floor(savedSeconds/60)}:${String(savedSeconds%60).padStart(2,"0")}`;
@@ -14,6 +14,6 @@ export function ContestRecorderStrip(){
   return <div className="contest-recorder-strip" aria-label="Contest recorder"><Circle size={10} aria-hidden="true"/>
     <span className="contest-recorder-strip-status" title={details} role={message?"status":undefined}>{summary}</span>
     {active&&<><button onClick={()=>run("REPLAY_10")}><Headphones size={12}/> Replay 10 s</button><button onClick={()=>run("BOOKMARK_NOW")}><Bookmark size={12}/> Bookmark</button></>}
-    <button onClick={()=>void openRecorder().catch(e=>setMessage(String(e)))}>Recorder…</button>
+    <button onClick={()=>{setMessage("");void openRecorder().catch(e=>setMessage(String(e)));}}>Recorder…</button>
   </div>;
 }

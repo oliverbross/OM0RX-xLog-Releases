@@ -12,6 +12,26 @@ public struct AwardReferences: Equatable, Sendable {
 }
 
 public enum AwardReferenceParser {
+    /// All activations in a report, including multi-park and multi-summit spots.
+    public static func specialReferences(comment: String, specialTags: [String] = []) -> [(kind: String, reference: String)] {
+        let text = ([comment] + specialTags).joined(separator: " ").uppercased()
+        var result = potaReferences(comment: comment, specialTags: specialTags).map { (kind: "pota", reference: $0) }
+        for (kind, pattern) in [("sota", #"\b[A-Z0-9]{1,3}/[A-Z0-9]{1,3}-\d{3,4}\b"#),
+                                ("iota", #"\b(?:AF|AN|AS|EU|NA|OC|SA)-\d{3}\b"#),
+                                ("wwff", #"\b[A-Z0-9]{1,4}FF-\d{3,5}\b"#)] {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+            result += expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+                Range(match.range, in: text).map { (kind: kind, reference: String(text[$0])) }
+            }
+        }
+        let castle = extract(comment: comment, specialTags: specialTags)
+        if ["WCA", "COTA", "CASTLE"].contains(castle.sig), !castle.sigInfo.isEmpty {
+            result.append((kind: "castle", reference: castle.sigInfo.replacingOccurrences(of: #"^(?:WCA|COTA|CASTLE)[-:\s]+"#, with: "", options: .regularExpression)))
+        }
+        var seen = Set<String>()
+        return result.filter { seen.insert($0.kind + ":" + $0.reference).inserted }
+    }
+
     public static func extract(comment: String, specialTags: [String] = []) -> AwardReferences {
         let tags = Set(specialTags.map { $0.uppercased() })
         let text = ([comment] + specialTags).joined(separator: " ").uppercased()

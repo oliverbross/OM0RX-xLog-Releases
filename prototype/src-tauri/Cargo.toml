@@ -1,6 +1,6 @@
 [package]
 name = "xlog-prototype"
-version = "1.6.0"
+version = "1.6.74"
 description = "Shared xLog desktop with integrated station and cluster services"
 edition = "2021"
 license = "GPL-3.0-only"
@@ -11,6 +11,13 @@ contesting-test = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.build-dependencies]
+cc = "1"
+
+[target.'cfg(windows)'.dependencies]
+dunce = "1"
+socket2 = "0.6"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -29,12 +36,20 @@ libc = "0.2"
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 rfd = "0.16"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 cpal = "=0.18.2"
 rtrb = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSOpenPanel", "NSSavePanel", "NSAlert"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
+
+[profile.dev]
+# Incremental session data grew the debug target to 65 GB on Windows
+# (2026-11-19). Without it, each change rebuilds this crate fully but the
+# target stays bounded.
+incremental = false
 
 [profile.release]
 # Avoid rust-objcopy LINKEDIT misalignment on current macOS toolchains.

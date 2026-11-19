@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { connectConnectionDoctor, type ConnectionDoctorPreview, type DoctorReason } from "./connectionDoctor";
@@ -39,10 +40,10 @@ export function DetachedConnectionDoctorSurface() {
   const attention = preview?.checks.filter(check => check.status === "attention").length ?? 0;
   const unknown = preview?.checks.filter(check => check.status === "unknown").length ?? 0;
   return <div className="app live detached-task-app detached-connection-doctor-app"><main aria-label="Connection Doctor">
-    <p className="connection-doctor-summary" role="status">{preview
+    <ErrorNotice><p className="connection-doctor-summary" role="status">{preview
       ? `${providers[preview.provider]} · ${attention ? `${attention} item${attention === 1 ? "" : "s"} need attention` : unknown ? `${unknown} stage${unknown === 1 ? "" : "s"} unknown` : "Retained checks passed"}`
-      : "Reading retained station state…"}</p>
-    {error && <p className="live-error" role="alert">{error}</p>}
+      : "Reading retained station state…"}</p></ErrorNotice>
+    {error && <ErrorNotice><p className="live-error" role="alert">{error}</p></ErrorNotice>}
     {preview && <>
       <section className="connection-doctor-overview" aria-label="Retained connection summary"><dl>
         <div><dt>Provider</dt><dd>{providers[preview.provider]}</dd></div>
@@ -63,7 +64,7 @@ export function DetachedConnectionDoctorSurface() {
       <section aria-label="Redacted export">
         <button type="button" disabled={exporting} onClick={() => void exportRedacted()}>{exporting ? "Saving…" : "Export redacted report…"}</button>
         <p className="secondary">Only when you click: save the displayed diagnostic categories as redacted JSON. No secrets, endpoints, identifiers, errors, radio values, timestamps or log contents are included. No new station read occurs.</p>
-        {exportStatus && <p role="status">{exportStatus}</p>}
+        {exportStatus && <ErrorNotice><p role="status">{exportStatus}</p></ErrorNotice>}
       </section>
     </>}
   </main></div>;

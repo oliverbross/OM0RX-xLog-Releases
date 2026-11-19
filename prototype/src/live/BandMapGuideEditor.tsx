@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useState } from "react";
 import { BAND_ORDER } from "./band";
 import { validateGuide, type BandMapGuide, type GuideMarker } from "./bandMapGuides";
@@ -33,7 +34,7 @@ export function BandMapGuideEditor({ initial, busy, save, cancel }: { initial: B
         <button type="button" onClick={() => setGuide({ ...guide, markers: guide.markers.filter((_, i) => i !== index) })}>Remove marker {index + 1}</button>
       </div></details>)}
       <button type="button" disabled={guide.markers.length >= 128} onClick={() => setGuide({ ...guide, markers: [...guide.markers, { frequencyHz: 14025000, label: "Personal marker", category: "personal" }] })}>Add personal marker</button>
-      {error && <p role="alert">{error}</p>}
+      {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
       <div className="band-map-guide-editor-actions"><button type="submit">Save custom guide</button><button type="button" onClick={cancel}>Cancel editing</button></div>
     </fieldset>
   </form>;

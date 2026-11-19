@@ -1,5 +1,7 @@
+import { ErrorNotice } from "./ErrorNotice";
+import { formatRadioFrequency, decimalMHz } from "./radioFrequency";
 import {editorCommand,commandTitle} from "./normalCommands";
-import { useEffect, useLayoutEffect, useRef, useState, type SetStateAction, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type SetStateAction, type ReactNode } from "react";
 import { Radio, Navigation, CircleX, CircleCheck } from "lucide-react";
 import { DeskIntelligence } from "./CallsignIntelligence";
 export { DeskIntelligence } from "./CallsignIntelligence";
@@ -13,13 +15,15 @@ import QSOHeader, { ReferenceEvidenceStatus, type ReferenceEvidence } from "./QS
 import { useDuplicateContact } from "./useDuplicateContact";
 import { applyModeSignalReportDefaults } from "./signalReportDefaults";
 import { useCurrentUTC } from "./useCurrentUTC";
+import { ManualRotorStatus } from "./ManualRotorControl";
+import { manualRotorGotoSession, type ManualRotorGotoSession } from "./manualRotorGoto";
 
 type Data = Record<string, any>;
 type Request = (method: string, params?: Data) => Promise<any>;
 type Props = { draft: Data | null; setDraft: (value: SetStateAction<Data | null>) => void; save: (draft?:Data) => void; clear: () => void; busy: boolean; draftLocked?: boolean; referenceEvidence?: ReferenceEvidence | null;
   lookup: Data | null; previous: Data[]; onRetryLookup?: () => void; lookupPending?: boolean; request: Request; refresh: number; onEditor: () => void; onReadRadio: () => Promise<void>;
   follow: boolean; setFollow: (value: boolean) => void; rotor: RotorSnapshot | null; rotorConfigured?: boolean; autoRotor: boolean; setAutoRotor: (value: boolean) => void; onManualRotor: () => void; isEditing?: boolean; intelligenceBands?: string[]; equipment?: unknown; cwControls?: ReactNode;
-  canAcceptLocalInput?: () => boolean; onLocalInputState?: (pending: boolean) => void; resetInputEpoch?: number; automaticStart?: boolean };
+  canAcceptLocalInput?: () => boolean; onLocalInputState?: (pending: boolean) => void; resetInputEpoch?: number; automaticStart?: boolean; rotorSession?: ManualRotorGotoSession };
 const normalizedCall = (value: unknown) => String(value ?? "").trim().toUpperCase();
 const bands = ["160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "70cm"];
 const modes = ["CW", "SSB", "FT8", "FT4", "FT2", "RTTY", "JTTY", "PSK", "DIGI", "AM", "FM"];
@@ -56,8 +60,8 @@ export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftL
     // after a same-ID canonical replacement (including native spot activation).
     // Matching the next value would also erase raw text after each local key.
     if (previous.frequencyHz !== next.frequencyHz) setFrequencyText(text => text !== null &&
-      (text === "" ? previous.frequencyHz == null : /^\d+(?:\.\d{0,6})?$/.test(text) && Number(text) > 0 &&
-        Math.round(Number(text) * 1e6) === previous.frequencyHz) ? null : text);
+      (text === "" ? previous.frequencyHz == null : /^\d+(?:\.\d{0,6})?$/.test(decimalMHz(text)) && Number(decimalMHz(text)) > 0 &&
+        Math.round(Number(decimalMHz(text)) * 1e6) === previous.frequencyHz) ? null : text);
     if (previous.start !== next.start) setTimeText(parts => {
       if (!parts?.date || !parts.time) return parts;
       const candidate = `${parts.date}T${parts.time.length === 5 ? parts.time + ":00" : parts.time}Z`;
@@ -65,7 +69,7 @@ export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftL
     });
   }, [draft?.id, draft?.frequencyHz, draft?.start]);
   const pendingInput = frequencyText !== null && (frequencyText === "" ? draft?.frequencyHz != null :
-    !/^\d+(?:\.\d{0,6})?$/.test(frequencyText) || Number(frequencyText) <= 0 || Math.round(Number(frequencyText) * 1e6) !== draft?.frequencyHz) ||
+    !/^\d+(?:\.\d{0,6})?$/.test(decimalMHz(frequencyText)) || Number(decimalMHz(frequencyText)) <= 0 || Math.round(Number(decimalMHz(frequencyText)) * 1e6) !== draft?.frequencyHz) ||
     timeText !== null && (!timeText.date || !timeText.time || !Number.isFinite(Date.parse(`${timeText.date}T${timeText.time.length === 5 ? timeText.time + ":00" : timeText.time}Z`)) ||
       Date.parse(`${timeText.date}T${timeText.time.length === 5 ? timeText.time + ":00" : timeText.time}Z`) !== Date.parse(draft?.start ?? ""));
   useLayoutEffect(() => { onLocalInputState?.(pendingInput); });
@@ -90,11 +94,12 @@ export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftL
     const candidate = `${next.date}T${next.time.length === 5 ? next.time + ":00" : next.time}Z`;
     if (next.date && next.time && Number.isFinite(Date.parse(candidate)) && utc(candidate).slice(0, 10) === next.date) update("start", candidate);
   };
-  const mhz = frequencyText ?? (finite(draft.frequencyHz) && draft.frequencyHz > 0 ? (draft.frequencyHz / 1e6).toFixed(6) : "");
-  const validFrequency = !mhz || /^\d+(?:\.\d{0,6})?$/.test(mhz) && Number(mhz) > 0 && Number(mhz) <= 1_000_000;
+  const mhz = frequencyText ?? (finite(draft.frequencyHz) && draft.frequencyHz > 0 ? formatRadioFrequency(draft.frequencyHz) : "");
+  const decimal = decimalMHz(mhz);
+  const validFrequency = !mhz || /^\d+(?:\.\d{0,6})?$/.test(decimal) && Number(decimal) > 0 && Number(decimal) <= 1_000_000;
   const candidate = `${date}T${time.length === 5 ? time + ":00" : time}Z`;
   const validTime = !!date && !!time && Number.isFinite(Date.parse(candidate)) && utc(candidate).slice(0, 10) === date;
-  const frequencyBand = mhz && validFrequency ? bandForRadio(Math.round(Number(mhz) * 1e6)) : null;
+  const frequencyBand = mhz && validFrequency ? bandForRadio(Math.round(Number(decimal) * 1e6)) : null;
   const canSave = !busy && !reading && !pendingInput && acceptsInput() && /^[A-Z0-9/-]{3,32}$/.test(normalizedCall(draft.call)) && validFrequency && validTime && !!draft.band && !!draft.mode && (!frequencyBand || frequencyBand === draft.band);
   const read = async () => { if (!acceptsInput() || !onReadRadio) return; const identity = draft.id; setReading(true); setError(""); try { await onReadRadio(); if (acceptsInput() && draftIdentity.current === identity) setFrequencyText(null); } catch (cause) { if (draftIdentity.current === identity) setError(cause instanceof Error ? cause.message : "Radio readback unavailable."); } finally { setReading(false); } };
   const saveCurrent = () => {
@@ -109,35 +114,38 @@ export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftL
     <div className="desk-active-primary">{textField("call", "Callsign", "desk-call")}
       <label className="desk-date"><span>Date</span><input aria-label="Desk UTC date" type="date" value={date} onChange={event => changeTime("date", event.target.value)} /></label>
       <label className="desk-time"><span>UTC</span><input aria-label="Desk UTC time" type="time" step={1} value={time} onChange={event => changeTime("time", event.target.value)} /></label>
-      <label className="desk-frequency"><span>Frequency MHz</span><input aria-label="Desk Frequency MHz" inputMode="decimal" value={mhz} aria-invalid={!validFrequency} onChange={event => {
+      <label className="desk-frequency"><span>Frequency MHz</span><input aria-label="Desk Frequency MHz" inputMode="decimal" value={mhz} aria-invalid={!validFrequency} onBlur={() => { if (validFrequency) setFrequencyText(null); }} onChange={event => {
         if (!acceptsInput()) return;
         onLocalInputState?.(true);
         const value = event.target.value; setFollow(false); setFrequencyText(value);
         if (!value) update("frequencyHz", null);
-        else if (/^\d+(?:\.\d{0,6})?$/.test(value) && Number(value) > 0 && Number(value) <= 1_000_000) {
-          const frequencyHz = Math.round(Number(value) * 1e6), band = bandForRadio(frequencyHz);
+        else if (/^\d+(?:\.\d{0,6})?$/.test(decimalMHz(value)) && Number(decimalMHz(value)) > 0 && Number(decimalMHz(value)) <= 1_000_000) {
+          const frequencyHz = Math.round(Number(decimalMHz(value)) * 1e6), band = bandForRadio(frequencyHz);
           setDraft(current => current ? { ...current, frequencyHz, ...(band ? { band } : {}) } : current);
         }
       }} /></label>{selectField("band", "Band", bands)}{selectField("mode", "Mode", modes)}{textField("rstSent", "RST S")}{textField("rstReceived", "RST R")}
     </div>
     <div className="desk-active-location">{textField("name", "Name")}{textField("comment", "Comment")}{textField("gridSquare", "Grid")}{textField("country", "Country")}{textField("county", "County")}</div>
-    <div className="desk-active-references">{textField("potaReference", "POTA")}{textField("sotaReference", "SOTA")}{textField("iota", "IOTA")}{textField("wwffReference", "WWFF")}{textField("sigInfo", "Castle")}<div className="desk-ref-slot"><ReferenceEvidenceStatus call={draft.call} evidence={referenceEvidence} /></div></div>
-    {duplicateDate && <p className="desk-active-duplicate" role="status" title="Previously worked on this band and mode · UTC date">Dupe: Worked on {duplicateDate}</p>}
-    {error && <p className="desk-error" role="alert">{error}</p>}
-    {(!validFrequency || !validTime || frequencyBand && frequencyBand !== draft.band) && <p className="desk-error" role="alert">Check the UTC date, frequency and band before logging.</p>}
+    <div className="desk-active-references">{textField("potaReference", "POTA")}{textField("sotaReference", "SOTA")}{textField("iota", "IOTA")}{textField("wwffReference", "WWFF")}{textField("sigInfo", "Castle")}</div>
+    {duplicateDate && <ErrorNotice><p className="desk-active-duplicate" role="status" title="Previously worked on this band and mode · UTC date">Dupe: Worked on {duplicateDate}</p></ErrorNotice>}
+    <div className="desk-ref-slot"><ReferenceEvidenceStatus call={draft.call} evidence={referenceEvidence} /></div>
+    {error && <ErrorNotice><p className="desk-error" role="alert">{error}</p></ErrorNotice>}
+    {(!validFrequency || !validTime || frequencyBand && frequencyBand !== draft.band) && <ErrorNotice><p className="desk-error" role="alert">Check the UTC date, frequency and band before logging.</p></ErrorNotice>}
     <footer className="desk-active-actions">{onEditor && <button type="button" onClick={() => { if (!acceptsInput()) return; if (pendingInput) { setError("Finish the buffered frequency and UTC fields before changing editor views."); return; } onEditor(); }}>Full editor</button>}{(radioControls || onReadRadio) && <button type="button" disabled={busy || reading || !onReadRadio} onClick={() => void read()}><Radio size={12} />{reading ? "Reading…" : "Read radio"}</button>}{followControls && <label className="desk-toggle"><input type="checkbox" checked={follow} onChange={event => { if (acceptsInput()) setFollow(event.target.checked); }} />Follow radio</label>}<span /><button type="button" disabled={busy} onClick={() => { if (acceptsInput()) clear(); }}><CircleX size={12} />Clear QSO</button><button className="desk-log" title={commandTitle("save-current-qso")} disabled={!canSave}><CircleCheck size={13} />{isEditing ? "Update QSO" : "Log QSO"}</button></footer>
-  </form>{cwControls}</section>;
+  </form><div className="desk-macros">{cwControls}</div></section>;
 }
 
-export function DeskRotor({ draft, lookup, rotor, request, onManualRotor }: Props) {
+export function DeskRotor({ draft, lookup, rotor, request, onManualRotor, rotorSession = manualRotorGotoSession() }:
+  Pick<Props, "draft" | "lookup" | "rotor" | "request" | "onManualRotor" | "rotorSession">) {
   const [path, setPath] = useState<"SP" | "LP">("SP"), [busy, setBusy] = useState(false), [message, setMessage] = useState("");
+  const manualState = useSyncExternalStore(rotorSession.subscribe, rotorSession.getSnapshot);
   const observed = rotorProjection(rotor), call = normalizedCall(draft?.call);
   const info = call && normalizedCall(lookup?.call) === call ? lookup : null;
   const bearing = path === "SP" ? info?.bearing : info?.long_path_bearing;
   const distance = rotorPathDistance(info?.distance_km, path);
   const turn = async (nextPath: "SP" | "LP") => {
     const nextBearing = nextPath === "SP" ? info?.bearing : info?.long_path_bearing;
-    if (!observed.connected || !finite(nextBearing) || nextBearing < 0 || nextBearing > 360 || busy) return;
+    if (!observed.connected || !finite(nextBearing) || nextBearing < 0 || nextBearing > 360 || busy || manualState.busy || manualState.pending) return;
     onManualRotor(); setPath(nextPath); setBusy(true); setMessage("");
     try { await request("rotor_goto", rotorCommandParams(rotor, { bearing: nextBearing, label: call })); setMessage(`${nextPath} move accepted; watch the observed bearing.`); }
     catch (cause) { setMessage(cause instanceof Error ? cause.message : "Rotor motion unavailable."); }
@@ -146,8 +154,9 @@ export function DeskRotor({ draft, lookup, rotor, request, onManualRotor }: Prop
   return <section className="desk-panel desk-rotor" aria-label="Rotor"><header className="desk-rotor-heading"><h2><Navigation size={15} aria-hidden="true" /> Rotor</h2><small className={`desk-rotor-connection ${observed.connected ? "teal" : "desk-offline"}`} title={observed.status || "Rotor telemetry unavailable"}>● {observed.connected ? "ROTOR CONNECTED" : "ROTOR OFFLINE"}</small></header>
     <div className="desk-rotor-body"><RotorCompass connected={observed.connected} azimuth={observed.azimuth} target={bearing} path={path}
       readout={{ call, distanceKm: distance, status: observed.status }} pathControls={{ shortBearing: info?.bearing,
-        longBearing: info?.long_path_bearing, busy, onSelect: next => void turn(next) }} /></div>
-    {message && <p className="desk-rotor-result" role="status">{message}</p>}
+        longBearing: info?.long_path_bearing, busy: busy || manualState.busy || !!manualState.pending, onSelect: next => void turn(next) }} /></div>
+    {message && <ErrorNotice when={true} title="Message"><p className="desk-rotor-result" role="status">{message}</p></ErrorNotice>}
+    <ManualRotorStatus session={rotorSession} onResolved={() => setMessage("")} />
   </section>;
 }
 

@@ -1,6 +1,8 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen, Mic, Play, Square } from "lucide-react";
+import MacroWorkbench from "./MacroWorkbench";
 import "./VoiceDesk.css";
 
 type Route={deviceId:string;channels:number[];sampleRate:number};
@@ -15,7 +17,7 @@ const native:Request=params=>invoke("voice_request",{params});
 const defaultProfile=():Profile=>({version:1,profilePath:"",labels:Array.from({length:10},(_,i)=>`Voice ${i+1}`),routes:{input:null,monitor:null,transmit:null},edits:Array.from({length:10},()=>({trimStartMs:0,trimEndMs:null,gainDb:0}))});
 const same=(a:unknown,b:unknown)=>JSON.stringify(a)===JSON.stringify(b);
 
-export default function VoiceDesk({request=native}:{request?:Request}){
+export default function VoiceDesk({request=native,compact=false}:{request?:Request;compact?:boolean}){
   const root=useRef<HTMLDivElement>(null),mounted=useRef(true),running=useRef(false),dirty=useRef(false),editVersion=useRef(0),snapshotRef=useRef<Snapshot|null>(null),editBase=useRef<{revision:number;generation:string}|null>(null);
   const activeRequest=useRef(request),refreshFlight=useRef<{request:Request;promise:Promise<void>}|null>(null);activeRequest.current=request;
   const sendGeneration=useRef(0);
@@ -32,7 +34,10 @@ export default function VoiceDesk({request=native}:{request?:Request}){
       .finally(()=>{if(refreshFlight.current?.promise===promise)refreshFlight.current=null;});
     refreshFlight.current={request,promise};return promise;
   },[request]);
-  useEffect(()=>{mounted.current=true;void refresh().catch(cause=>setError(String(cause)));const timer=window.setInterval(()=>{if(running.current||snapshotRef.current?.job)void refresh().catch(cause=>setError(String(cause)));},250);
+  useEffect(()=>{mounted.current=true;let pollError="";
+    // A good read clears only the error a failed read set, never an action's.
+    const poll=()=>refresh().then(()=>{if(pollError&&mounted.current){const cleared=pollError;pollError="";setError(current=>current===cleared?"":current);}},cause=>{pollError=String(cause);setError(pollError);});
+    void poll();const timer=window.setInterval(()=>{if(running.current||snapshotRef.current?.job)void poll();},250);
     return()=>{mounted.current=false;sendGeneration.current++;window.clearInterval(timer);};},[refresh]);
   const run=async(action:()=>Promise<void>)=>{if(running.current)return;running.current=true;setBusy(true);setError("");try{await action();}catch(cause){if(mounted.current)setError(cause instanceof Error?cause.message:String(cause));}finally{running.current=false;if(mounted.current){setBusy(false);await refresh().catch(cause=>setError(String(cause)));}}};
   const edit=(next:Profile)=>{if(!dirty.current&&snapshotRef.current)editBase.current={revision:snapshotRef.current.revision,generation:snapshotRef.current.generation};editVersion.current++;dirty.current=true;setProfile(next);setAnalysis(null);};
@@ -73,20 +78,13 @@ export default function VoiceDesk({request=native}:{request?:Request}){
     return <fieldset className="voice-route"><legend>{label}</legend><label>Native device<select value={route?.deviceId??""} onChange={e=>{const d=devices.find(d=>d.id===e.target.value);changeRoute(role,d?{deviceId:d.id,channels:[0],sampleRate:(input?d.inputRate:d.outputRate)??48000}:null);}}><option value="">Choose device…</option>{route&&!chosen&&<option value={route.deviceId}>Missing selected device</option>}{devices.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>
       <label>Channels (1-based)<input disabled={!route} value={route?.channels.map(c=>c+1).join(",")??""} placeholder="1 or 1,2" onChange={e=>{const text=e.target.value;const values=text.split(",").map(v=>Number(v.trim())-1);changeRoute(role,{channels:values});}}/></label>
       <label>Sample rate<input disabled={!route} type="number" min="8000" max="192000" step="1" value={route?.sampleRate??48000} onChange={e=>changeRoute(role,{sampleRate:Number(e.target.value)})}/></label>
-      {route&&!chosen&&<small role="status">The saved device is unavailable; no default device will be substituted.</small>}
+      {route&&!chosen&&<ErrorNotice><small role="status">The saved device is unavailable; no default device will be substituted.</small></ErrorNotice>}
     </fieldset>;
   };
   const currentEdit=profile.edits[selected-1];const updateEdit=(patch:Partial<Edit>)=>edit({...profile,edits:profile.edits.map((value,i)=>i===selected-1?{...value,...patch}:value)});
   const hasJob=!!snapshot?.job;const enabled=!!snapshot?.nativeAvailable;
-  return <div className="voice-desk" ref={root}>
-    <details><summary>Voice memories · normal SSB</summary>
-      <div className="voice-controls" role="group" aria-label="Voice memory controls">
-        <label>Memory<select value={selected} disabled={busy||hasJob} onChange={e=>setSelected(Number(e.target.value))}>{profile.labels.map((label,i)=><option key={i} value={i+1}>{i+1} · {label}</option>)}</select></label>
-        <button type="button" disabled={!enabled||busy||hasJob||dirty.current||!profile.routes.transmit} onClick={()=>void send()}><Play size={13}/>Send memory</button>
-        <button type="button" className="voice-stop" onClick={()=>void stop()}><Square size={13}/>Stop voice</button>
-        <button type="button" disabled={!enabled||busy||hasJob||dirty.current||!profile.routes.monitor} onClick={()=>void run(async()=>{await request({action:"preview",slot:selected,...reviewedScope()});setMessage("Monitor preview completed without PTT.");})}>Preview on monitor</button>
-      </div>
-      <p className={error?"voice-error":"voice-state"} role="status">{error||(!enabled&&snapshot?"Native voice routes are available on macOS in this release. Existing contest playback on other platforms is unchanged.":hasJob?`${snapshot.job!.kind} · ${snapshot.job!.phase} · ${snapshot.job!.consumedFrames}/${snapshot.job!.totalFrames} local frames consumed`:snapshot?.last?.error||message)}</p>
+  const options = <>
+      <ErrorNotice when={Boolean(error || snapshot?.last?.error) || undefined}><p className={error?"voice-error":"voice-state"} role="status">{error||(!enabled&&snapshot?"Native voice routes are available on macOS in this release. Existing contest playback on other platforms is unchanged.":hasJob?`${snapshot.job!.kind} · ${snapshot.job!.phase} · ${snapshot.job!.consumedFrames}/${snapshot.job!.totalFrames} local frames consumed`:snapshot?.last?.error||message)}</p></ErrorNotice>
       {analysis&&<p className={analysis.clippedSamples?"voice-warning":"voice-state"}>{(analysis.durationMs/1000).toFixed(2)} s · peak {(analysis.peak*100).toFixed(1)}%{analysis.clippedSamples?` · ${analysis.clippedSamples} clipped samples — lower gain to avoid clipping`:" · no clipping"}</p>}
       <details className="voice-settings"><summary>Library, recording and audio routes</summary>
         <p className="voice-state">Shared F1–F10 WAVs are Voice 1–10 here; contest mappings and F11/F12 remain intact. WAVs stay in the selected external folder; keep that folder with your backups.</p>
@@ -105,6 +103,16 @@ export default function VoiceDesk({request=native}:{request?:Request}){
           <label className="voice-import">Import PCM WAV<input type="file" accept=".wav,audio/wav" disabled={busy||hasJob||dirty.current||!profile.profilePath} onChange={e=>{const file=e.target.files?.[0];e.target.value="";if(file)void run(async()=>{const scope=reviewedScope();if(file.size>8*1024*1024)throw Error("Voice WAV must remain below 8 MiB.");const bytes=new Uint8Array(await file.arrayBuffer());let binary="";for(let i=0;i<bytes.length;i+=16384)binary+=String.fromCharCode(...bytes.subarray(i,i+16384));await request({action:"import",slot:selected,wavBase64:btoa(binary),overwrite:replace,...scope});setMessage("Voice WAV imported after native PCM validation.");});}}/></label>
         </div>
       </details>
-    </details>
+    </>;
+  const controls = <div className="voice-controls" role="group" aria-label="Voice memory controls">
+        <label>Memory<select value={selected} disabled={busy||hasJob} onChange={e=>setSelected(Number(e.target.value))}>{profile.labels.map((label,i)=><option key={i} value={i+1}>{i+1} · {label}</option>)}</select></label>
+        <button type="button" disabled={!enabled||busy||hasJob||dirty.current||!profile.routes.transmit} onClick={()=>void send()}><Play size={13}/>Send memory</button>
+        <button type="button" className="voice-stop" onClick={()=>void stop()}><Square size={13}/>Stop voice</button>
+        <button type="button" disabled={!enabled||busy||hasJob||dirty.current||!profile.routes.monitor} onClick={()=>void run(async()=>{await request({action:"preview",slot:selected,...reviewedScope()});setMessage("Monitor preview completed without PTT.");})}>Preview on monitor</button>
+        {compact && <MacroWorkbench title="Voice options">{options}</MacroWorkbench>}
+      </div>;
+  return <div className={`voice-desk${compact ? " macro-strip" : ""}`} ref={root}>
+    {compact ? controls
+      : <details><summary>Voice memories · normal SSB</summary>{controls}{options}</details>}
   </div>;
 }

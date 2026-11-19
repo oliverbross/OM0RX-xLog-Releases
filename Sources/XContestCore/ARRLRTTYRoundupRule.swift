@@ -203,15 +203,21 @@ private func arrlRTTYMultiplier(entity: ContestEntitySnapshot,
     if entity.adif == 291, let exchange, arrlRTTYUSLocations.contains(exchange) {
         return .init(kind: "arrl-us-state", value: exchange, scope: "contest")
     }
-    if entity.adif == 1, let exchange, arrlRTTYCanadaLocations.contains(exchange) {
+    if entity.adif == 1, let exchange = arrlCanonicalLocation(exchange, entity: entity), arrlRTTYCanadaLocations.contains(exchange) {
         return .init(kind: "arrl-ca-province", value: exchange, scope: "contest")
     }
     guard !arrlRTTYIsWVE(entity) else { return nil }
     return .init(kind: "arrl-dxcc", value: String(entity.adif), scope: "contest")
 }
 
+/// Newfoundland and Labrador stations commonly send NL; the ARRL list names
+/// the province NF, so both count as the same multiplier.
+internal func arrlCanonicalLocation(_ location: String?, entity: ContestEntitySnapshot) -> String? {
+    entity.adif == 1 && location == "NL" ? "NF" : location
+}
+
 internal func arrlRTTYLocationIsValid(_ location: String?, entity: ContestEntitySnapshot) -> Bool {
-    guard let location else { return false }
+    guard let location = arrlCanonicalLocation(location, entity: entity) else { return false }
     if entity.adif == 291 { return arrlRTTYUSLocations.contains(location) }
     if entity.adif == 1 { return arrlRTTYCanadaLocations.contains(location) }
     return false

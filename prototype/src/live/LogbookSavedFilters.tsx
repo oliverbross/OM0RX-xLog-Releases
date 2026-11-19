@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { duplicateSavedLogbookFilter, parseSavedLogbookFilterSnapshot, validateSavedLogbookFilterName,
   validateSavedLogbookFilterQuery, type SavedLogbookFilterSnapshot } from "./savedLogbookFilters";
@@ -79,7 +80,7 @@ export function LogbookSavedFilters({ onRequest, currentQuery, currentDefinition
   }
 
   return <section className="live-logbook-saved-filters" aria-label="Saved Logbook filters">
-    {snapshot?.warning && <p role="alert">{snapshot.warning}</p>}
+    {snapshot?.warning && <ErrorNotice><p role="alert">{snapshot.warning}</p></ErrorNotice>}
     <div className="live-logbook-filter-row">
       <label>Saved filter <select aria-label="Saved Logbook filter" disabled={busy || disabled || !snapshot}
         value={selected} onChange={event => { const value = event.target.value; setSelected(value); setName(value); setMessage(""); }}>
@@ -102,8 +103,8 @@ export function LogbookSavedFilters({ onRequest, currentQuery, currentDefinition
     </div>
     {readOnly && <p>Saved filters are read only here. Manage them in Logbook.</p>}
     {chosen && <p>Selected saved query: <span>{chosen.query} {chosen.definition && logbookQuerySummary(chosen.definition)}</span></p>}
-    <p className={message && !messageIsSuccess ? "error" : ""}
-      role={message && !messageIsSuccess ? "alert" : "status"}>{busy ? "Loading saved filters…" : message || "Saved filters reuse the same callsign, name, country or note search."}</p>
+    <ErrorNotice><p className={message && !messageIsSuccess ? "error" : ""}
+      role={message && !messageIsSuccess ? "alert" : "status"}>{busy ? "Loading saved filters…" : message || "Saved filters reuse the same callsign, name, country or note search."}</p></ErrorNotice>
     {saveToast.toast}
   </section>;
 }

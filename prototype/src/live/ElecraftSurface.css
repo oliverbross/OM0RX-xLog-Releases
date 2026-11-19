@@ -1,0 +1,233 @@
+.elecraft {
+  display: block;
+  min-height: 100vh;
+  height: 100vh;
+  overflow: auto;
+  box-sizing: border-box;
+  padding: clamp(14px, 2.6vw, 36px);
+  color: #e8f0f6;
+  background:
+    radial-gradient(ellipse at 4% 0%, #163039 0%, transparent 55%), #09131f;
+  font-family: inherit;
+}
+.ec-heading,
+.ec-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ec-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
+  gap: 16px;
+  max-width: 1480px;
+  margin: auto;
+  align-items: stretch;
+}
+.ec-device {
+  display: flex;
+  flex-direction: column;
+  --accent: #5adfc2;
+  border: 1px solid #314858;
+  border-top: 3px solid var(--accent);
+  padding: clamp(12px, 2vw, 24px);
+  border-radius: 12px;
+  background: linear-gradient(155deg, #163139 0%, #101e2d 46%);
+  min-width: 0;
+}
+.ec-device.ec-kat {
+  --accent: #a9acff;
+  background: linear-gradient(155deg, #252d47 0%, #131e30 46%);
+}
+.ec-heading small {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+.ec-device h2 {
+  font-size: 27px;
+  line-height: 1.1;
+  margin: 4px 0 0;
+  letter-spacing: -0.035em;
+}
+.ec-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #b1bdc9;
+  font-size: 12px;
+}
+.ec-state:before {
+  content: "";
+  height: 7px;
+  width: 7px;
+  border-radius: 50%;
+  background: #7a8796;
+}
+.ec-state.ec-online:before {
+  background: #49e1ae;
+}
+.ec-gauges {
+  display: flex;
+  justify-content: center;
+  gap: clamp(3px, 1vw, 15px);
+  padding: 16px 0 13px;
+}
+.ec-gauge {
+  flex: 0 1 calc((100% - 2 * clamp(3px, 1vw, 15px)) / 3);
+  min-width: 0;
+  max-width: 185px;
+  text-align: center;
+  margin: 0;
+}
+.ec-gauge svg {
+  width: 100%;
+  display: block;
+}
+.ec-track,
+.ec-arc {
+  fill: none;
+  stroke-width: 7;
+}
+.ec-track {
+  stroke: #334858;
+}
+.ec-arc {
+  stroke: currentColor;
+}
+.ec-tick {
+  stroke: #8195a8;
+  stroke-width: 1;
+}
+.ec-reading {
+  fill: #eff6ff;
+  font-size: 21px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.ec-unit,
+.ec-limit {
+  fill: #b4c2d1;
+  font-size: 9px;
+}
+.ec-gauge figcaption {
+  color: #e1e9ef;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ec-device dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 7px 0 14px;
+}
+.ec-device dl div {
+  border: 1px solid #293c50;
+  background: #0e1a29;
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+.ec-device dt {
+  color: #a9bdd0;
+  font-size: 11px;
+}
+.ec-device dd {
+  color: #f0f5f9;
+  font:
+    600 15px ui-monospace,
+    monospace;
+  margin: 3px 0 0;
+}
+.ec-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.elecraft output,
+.ec-preferences output {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+.ec-preferences {
+  display: grid;
+  gap: 14px;
+}
+.ec-preferences h2,
+.ec-preferences h3 {
+  margin: 0 0 8px;
+}
+.ec-preferences fieldset {
+  min-width: 0;
+  border: 1px solid var(--border, #345066);
+  border-radius: 7px;
+  padding: 12px;
+}
+.ec-preferences legend {
+  font-weight: 600;
+  color: var(--text, #e6edf6);
+}
+.ec-settings,
+.ec-hardware-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
+  gap: 12px;
+  margin: 8px 0;
+}
+.ec-settings label,
+.ec-preferences .ec-hardware-options label {
+  display: grid;
+  gap: 5px;
+  text-align: left;
+}
+.ec-settings span,
+.ec-hardware-options span,
+.ec-source {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.ec-settings input,
+.ec-settings select,
+.ec-hardware-options select {
+  min-width: 0;
+  width: auto;
+  flex: 1;
+}
+.ec-source {
+  justify-content: space-between;
+}
+.ec-source h2 {
+  margin: 0;
+}
+.ec-route-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.ec-route-table td,
+.ec-route-table th {
+  border-bottom: 1px solid #294155;
+  padding: 5px;
+  text-align: left;
+}
+.ec-route-table select {
+  width: 100%;
+}
+.ec-table-wrap {
+  overflow: auto;
+}
+.ec-preferences button:focus-visible,
+.ec-preferences select:focus-visible {
+  outline: 2px solid #66e1dc;
+}
+
+.ec-device > .ec-actions { margin-top: auto; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.ec-device > output:empty { display: none; }
+.ec-power-policy { min-width:0; margin:16px 0; }
+.ec-power-policy .agent-band-table { min-width:620px; }
+.ec-power-policy input[type="checkbox"] { width:16px; height:16px; min-height:0; accent-color:#12d6a0; }
+.ec-power-policy>label { display:flex; align-items:center; gap:8px; margin:12px 0; }
+.ec-power-policy .agent-band-table td { text-align:left; }
+.ec-power-policy .agent-band-table td:nth-child(2),.ec-power-policy .agent-band-table td:nth-child(5) { text-align:center; }

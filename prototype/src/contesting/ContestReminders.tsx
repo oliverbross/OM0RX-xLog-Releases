@@ -1,3 +1,4 @@
+import { ErrorNotice } from "../live/ErrorNotice";
 import { useEffect, useRef, useState } from "react";
 import type { ContestRequest } from "./types";
 import "./ContestReminders.css";
@@ -63,13 +64,13 @@ export function ContestReminders({scope,request,disabled,onMutate,onLoad,onLoadA
   const change=(key:keyof Editor,value:string)=>setEditor(previous=>previous?{...previous,[key]:value}:null);
   const item=data?.skeds.find(row=>row.id===selected),locked=disabled||working;
   const shown=data?.skeds.filter(row=>showHistory||row.status==="active").slice().sort((a,b)=>a.dueUTC.localeCompare(b.dueUTC)||a.id.localeCompare(b.id))??[];
-  return <><span className="contest-reminder-announcement" role="status" aria-live="polite">{announcement}</span>
+  return <><ErrorNotice><span className="contest-reminder-announcement" role="status" aria-live="polite">{announcement}</span></ErrorNotice>
     <section className="contest-reminders contest-productivity-section" aria-label="Contest skeds and reminders" hidden={!visible}>
       <h2>Skeds & reminders</h2><p>UTC reminders stay in this contest. Loading and tuning are explicit actions; completion is separate.</p>
       <div className="contest-productivity-actions"><button disabled={locked} onClick={()=>openEditor()}>New sked</button>
         <label><input type="checkbox" checked={showHistory} onChange={event=>setShowHistory(event.target.checked)}/> Include closed reminders</label>
         <span>{data?.dueCount??0} due</span></div>
-      {error&&<p role="alert">{error}</p>}
+      {error&&<ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
       {editor&&<form className="contest-sked-editor" onSubmit={event=>{event.preventDefault();save();}}>
         <label>Callsign<input value={editor.callsign} disabled={locked} maxLength={32} onChange={event=>change("callsign",event.target.value)}/></label>
         <label>Reminder text<input value={editor.text} disabled={locked} maxLength={512} onChange={event=>change("text",event.target.value)}/></label>

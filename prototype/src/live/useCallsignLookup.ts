@@ -4,12 +4,12 @@ import { normalizedCall } from "./draftEnrichment";
 type Data = Record<string, any>;
 type Request = (method: string, params?: Data) => Promise<any>;
 
-export function useCallsignLookup({ draft, generation, workspaceExists, request, canEnrich, enrich }: {
-  draft: Data | null; generation?: string; workspaceExists: boolean; request: Request;
+export function useCallsignLookup({ draft, generation, settingsRevision, workspaceExists, request, canEnrich, enrich }: {
+  draft: Data | null; generation?: string; settingsRevision?: number; workspaceExists: boolean; request: Request;
   canEnrich: () => boolean; enrich: (baseline: Data, profile: Data) => void;
 }) {
   const call = normalizedCall(draft?.call);
-  const scope = JSON.stringify([generation?.toLowerCase() ?? "", draft?.id ?? "", call]);
+  const scope = JSON.stringify([generation?.toLowerCase() ?? "", draft?.id ?? "", settingsRevision, call]);
   const handlers = useRef({ canEnrich, enrich }); handlers.current = { canEnrich, enrich };
   const latest = useRef({ scope, workspaceExists }); latest.current = { scope, workspaceExists };
   const [retry, setRetry] = useState({ scope: "", revision: 0 });

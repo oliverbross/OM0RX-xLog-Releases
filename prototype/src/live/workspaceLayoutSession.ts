@@ -1,13 +1,16 @@
+import { isReadContention } from "./readContention";
+
 const version1PanelIDs = ["active-qso", "log-qso", "logbook", "callsign-intelligence", "rotor", "antenna",
   "world-map", "band-maps", "dx-cluster", "station-control", "station-status", "station-identity", "cw", "alerts",
   "propagation", "settings", "sync", "awards", "chaser-dx"] as const;
-export const workspacePanelIDs = [...version1PanelIDs, "spot-history", "monitor"] as const;
+const version2PanelIDs = [...version1PanelIDs, "spot-history", "monitor"] as const;
+export const workspacePanelIDs = [...version2PanelIDs, "previous-qsos", "kpa500", "kat500"] as const;
 export type WorkspacePanelID = typeof workspacePanelIDs[number];
 export type WorkspaceLayoutScope = "normal_logging" | "contesting";
 export type LayoutRect = { x: number; y: number; width: number; height: number };
 export type PanelLayout = { id: WorkspacePanelID; placement: "canvas" | "window" | "hidden"; rect: LayoutRect; z: number };
 export type LayoutPreset = { id: string; name: string; width: number; height: number; locked: boolean; snap: boolean; panels: PanelLayout[] };
-export type LayoutDocument = { version: 2; activePresetID: string; presets: LayoutPreset[]; lastCanvasPresetID?: string };
+export type LayoutDocument = { version: 3; activePresetID: string; presets: LayoutPreset[]; lastCanvasPresetID?: string };
 export type LayoutSnapshot = { revision: number; generation: string; document: LayoutDocument; scope?: WorkspaceLayoutScope };
 export type LayoutChange = { action: "placePanel"; presetID: string; panel: PanelLayout } |
   { action: "savePreset"; presetID: string; preset: LayoutPreset } |
@@ -28,13 +31,15 @@ const sameDocument = (a: LayoutDocument, b: LayoutDocument) => stable(a) === sta
 export function panelMinimum(id: WorkspacePanelID): [number, number] {
   if (id === "active-qso") return [520, 240];
   if (id === "callsign-intelligence") return [360, 240];
+  if (id === "previous-qsos") return [280, 160];
+  if (id === "kpa500" || id === "kat500") return [200, 120];
   if (["rotor", "antenna"].includes(id)) return [240, 240];
   if (["world-map", "band-maps", "dx-cluster"].includes(id)) return [280, 200];
   if (["station-status", "station-identity", "propagation", "cw", "alerts"].includes(id)) return [240, 80];
   return [640, 480];
 }
 export function validLayoutDocument(value: any): value is LayoutDocument {
-  return validDocument(value, 2, workspacePanelIDs);
+  return validDocument(value, 3, workspacePanelIDs);
 }
 function validDocument(value: any, version: number, ids: readonly WorkspacePanelID[]): boolean {
   if (!object(value) || value.version !== version || !Array.isArray(value.presets) || !integer(value.presets.length, 1, 12) ||
@@ -56,16 +61,16 @@ function validDocument(value: any, version: number, ids: readonly WorkspacePanel
     });
   });
 }
-/** Version upgrades change representation, not the operator's revision or
- * placements. A v1 backup/journal gains only the two newly known hidden roles. */
+/** Upgrades retain every existing placement and add new roles hidden. */
 export function migratedLayoutDocument(value: any): LayoutDocument {
   if (validLayoutDocument(value)) return clone(value);
-  if (!validDocument(value, 1, version1PanelIDs)) throw new Error("The shared workspace layout could not be verified.");
+  const oldIDs = value?.version === 1 ? version1PanelIDs : version2PanelIDs;
+  if (![1, 2].includes(value?.version) || !validDocument(value, value.version, oldIDs)) throw new Error("The shared workspace layout could not be verified.");
   const document = clone(value);
-  document.version = 2;
+  document.version = 3;
   for (const preset of document.presets) {
-    for (const [offset, id] of (["spot-history", "monitor"] as const).entries()) {
-      preset.panels.push({ id, placement: "hidden", rect: { x: 0, y: 0, width: 640, height: 480 }, z: version1PanelIDs.length + offset });
+    for (const [offset, id] of workspacePanelIDs.slice(oldIDs.length).entries()) {
+      preset.panels.push({ id, placement: "hidden", rect: { x: 0, y: 0, width: 640, height: 480 }, z: oldIDs.length + offset });
     }
   }
   return document;
@@ -107,11 +112,11 @@ export function readLayoutJournal(raw: string | null, expectedScope: WorkspaceLa
     if (expectedScope === "normal_logging" ? value.scope !== undefined : value.scope !== expectedScope) return null;
     const base = checkedLayout(value.base, expectedScope);
     let change = clone(value.change);
-    if (value.base.document.version === 1) {
+    if (value.base.document.version === 1 || value.base.document.version === 2) {
       if (change?.action === "savePreset") {
-        const migrated = migratedLayoutDocument({ version: 1, activePresetID: change.presetID, presets: [change.preset] });
+        const migrated = migratedLayoutDocument({ version: value.base.document.version, activePresetID: change.presetID, presets: [change.preset] });
         change = { ...change, preset: migrated.presets[0] };
-      } else if (change?.action === "placePanel" && !version1PanelIDs.includes(change.panel?.id)) return null;
+      } else if (change?.action === "placePanel" && !(value.base.document.version === 1 ? version1PanelIDs : version2PanelIDs).includes(change.panel?.id)) return null;
     }
     changedLayout(base.document, change);
     return { base, change, ...(expectedScope === "normal_logging" ? {} : { scope: expectedScope }),
@@ -164,7 +169,7 @@ export class WorkspaceLayoutSession {
             : await this.request("workspace_layout_load", { scope: this.scope });
           const value = checkedLayout(response.layout, this.scope);
           if (epoch === this.epoch) this.accept(value);
-        } catch (cause) { if (epoch === this.epoch) this.update({ error: cause instanceof Error ? cause.message : "Shared layout unavailable." }); }
+        } catch (cause) { if (epoch === this.epoch && !isReadContention(cause)) this.update({ error: cause instanceof Error ? cause.message : "Shared layout unavailable." }); }
       } while (this.again && !this.state.saving && !this.recovering);
     })().finally(() => { this.reading = null; });
     return this.reading;

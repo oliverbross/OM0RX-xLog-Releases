@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useEffect, useState } from "react";
 import { connectStationIdentity, type IdentityProjection } from "./stationIdentity";
 import "./DetachedReferenceSurface.css";
@@ -13,7 +14,7 @@ export function DetachedStationIdentitySurface() {
   }, []);
   const identity = projection?.snapshot, current = verified && projection?.available === true;
   return <div className="app live detached-reference-app detached-identity-app"><main aria-label="Detached Station Identity"><section aria-label="Saved station identity">
-    {!current && <p role="status">{identity ? "Saved identity unavailable or changing · retained values only" : "No saved identity has been observed. Configure your station in Settings."}</p>}
+    {!current && <ErrorNotice><p role="status">{identity ? "Saved identity unavailable or changing · retained values only" : "No saved identity has been observed. Configure your station in Settings."}</p></ErrorNotice>}
     <div className="live-station-readback"><div><span>{current ? "Saved station callsign" : "Retained station callsign"}</span><strong>{shown(identity?.station_call)}</strong></div></div>
     <dl><dt>Operator callsign</dt><dd>{shown(identity?.operator_call)}</dd><dt>Grid</dt><dd>{shown(identity?.grid)}</dd>
       <dt>Location</dt><dd>{shown(identity?.location)}</dd><dt>Logbook mode</dt><dd>{identity?.logbook_mode === "local" ? "Integrated logbook only" : identity?.logbook_mode === "wavelog" ? "Integrated logbook + Wavelog synchronization" : "Unavailable"}</dd>
@@ -21,6 +22,6 @@ export function DetachedStationIdentitySurface() {
       <dt>Workspace generation</dt><dd>{identity?.workspace_generation ?? "Unavailable"}</dd>
       <dt>Workspace service generation</dt><dd>{identity?.worker_generation ?? "Unavailable"}</dd>
     </dl>
-    {error && <p role="alert">{error}</p>}
+    {error && <ErrorNotice><p role="alert">{error}</p></ErrorNotice>}
   </section></main></div>;
 }

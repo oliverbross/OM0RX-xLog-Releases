@@ -1,4 +1,7 @@
 import Foundation
+#if os(Windows)
+import CWindowsOfflineProfile
+#endif
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -40,19 +43,33 @@ public enum AppRuntimeProfile: Equatable, Sendable {
         }
         let testBundle = bundleIdentifier == contestingBundleIdentifier
         if arguments.contains(where: { $0.hasPrefix(offlineAcceptancePrefix) }) {
-            guard arguments.count == 1, bundleIdentifier == "com.oliverbross.xlog.integration" else {
+            #if os(Windows)
+            let candidate = windowsPackageContainsWorker(executableURL, fileManager: fileManager)
+            #else
+            let candidate = bundleIdentifier == "com.oliverbross.xlog.integration"
+            #endif
+            guard arguments.count == 1, candidate else {
                 throw WorkerFailure("runtime_profile_unbound", "Offline acceptance requires one production-candidate launch coordinate.")
             }
             let root = URL(fileURLWithPath: String(arguments[0].dropFirst(offlineAcceptancePrefix.count)), isDirectory: true)
             let resolved = try canonicalFilesystemPath(root)
-            let parents = try [fileManager.temporaryDirectory, URL(fileURLWithPath: "/tmp", isDirectory: true)].map { try canonicalFilesystemPath($0) }
+            var temporaryParents = [fileManager.temporaryDirectory]
+            #if !os(Windows)
+            temporaryParents.append(URL(fileURLWithPath: "/tmp", isDirectory: true))
+            #endif
+            let parents = try temporaryParents.map { try canonicalFilesystemPath($0) }
             let attributes = try fileManager.attributesOfItem(atPath: root.path)
             let marker = root.appendingPathComponent(".xlog-offline-acceptance.json")
             let markerAttributes = try fileManager.attributesOfItem(atPath: marker.path)
+            #if os(Windows)
+            let privateStorage = windowsPrivatePath(root, directory: true) && windowsPrivatePath(marker, directory: false)
+            #else
+            let privateStorage = ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o077 == 0
+            #endif
             guard root.path == resolved, root.lastPathComponent.hasPrefix("xlog-wave1-"),
                   parents.contains(root.deletingLastPathComponent().path),
                   attributes[.type] as? FileAttributeType == .typeDirectory,
-                  ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o077 == 0,
+                  privateStorage,
                   markerAttributes[.type] as? FileAttributeType == .typeRegular,
                   let bytes = fileManager.contents(atPath: marker.path), bytes.count <= 1024,
                   let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any], value["schema"] as? Int == 1,
@@ -72,6 +89,36 @@ public enum AppRuntimeProfile: Equatable, Sendable {
             in: .userDomainMask, appropriateFor: nil, create: false)
         return try contestingTestProfile(applicationSupport: applicationSupport, fileManager: fileManager)
     }
+
+    #if os(Windows)
+    // Windows packages place the host, worker and generated provenance together.
+    // This binds the profile to the package layout. Release digest verification
+    // remains an independent step before launching that package.
+    private static func windowsPackageContainsWorker(_ executable: URL, fileManager: FileManager) -> Bool {
+        let directory = executable.deletingLastPathComponent()
+        let host = directory.appendingPathComponent("xlog-prototype.exe")
+        let manifest = directory.appendingPathComponent("provenance.json")
+        guard executable.lastPathComponent == "xlog-prototype-worker.exe",
+              fileManager.fileExists(atPath: executable.path), fileManager.fileExists(atPath: host.path),
+              let size = try? manifest.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 1_048_576,
+              let data = try? Data(contentsOf: manifest),
+              let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              metadata["schema"] as? Int == 1, metadata["product"] as? String == "OM0RX-xLog",
+              metadata["platform"] as? String == "windows-x86_64",
+              let payloads = metadata["payloads"] as? [[String: Any]] else { return false }
+        let built = Set(payloads.filter { $0["origin"] as? String == "prototype-build" }.compactMap { $0["path"] as? String })
+        return built.contains(host.lastPathComponent) && built.contains(executable.lastPathComponent)
+    }
+
+    private static func windowsPrivatePath(_ url: URL, directory: Bool) -> Bool {
+        url.withUnsafeFileSystemRepresentation { native in
+            guard let native else { return false }
+            return String(cString: native).withCString(encodedAs: UTF16.self) {
+                xlog_private_windows_path($0, directory ? 1 : 0) != 0
+            }
+        }
+    }
+    #endif
 
     /// Match Rust's filesystem canonicalization. Foundation deliberately presents
     /// /private/tmp and /private/var through their shorter macOS aliases.

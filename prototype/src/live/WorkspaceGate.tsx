@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 type Workspace = { workspace_exists?: boolean; native_log_exists?: boolean } | null;
 
 /** Unknown is not empty: never offer creation until the worker has checked disk. */
@@ -7,9 +8,9 @@ export default function WorkspaceGate({ workspace, pending, busy, retry, create 
 }) {
   if (!workspace) return <section className="live-onboarding" aria-busy={pending}>
     <h2>{pending ? "Opening your integrated logbook" : "Logbook connection unavailable"}</h2>
-    <p role="status">{pending
+    <ErrorNotice><p role="status">{pending
       ? "Checking your existing workspace. Your contacts and settings have not been replaced."
-      : "The logbook service did not finish loading. Reconnect to check your existing workspace; do not create another logbook."}</p>
+      : "The logbook service did not finish loading. Reconnect to check your existing workspace; do not create another logbook."}</p></ErrorNotice>
     {!pending && <button disabled={busy} onClick={retry}>Retry connection</button>}
   </section>;
   return <section className="live-onboarding"><h2>Bring your logbook into the integrated app</h2>

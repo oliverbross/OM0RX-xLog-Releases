@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, ExternalLink, MoveDiagonal2, RefreshCw, Settings2, Sun, X } from "lucide-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -216,7 +217,7 @@ export default function HFPropagationLive({ initialOwnCall = "", initialLocator 
         <button type="button" aria-expanded={settingsOpen} aria-controls="hf-prop-settings" onClick={() => { setArranging(false); setDraft(settings); setSettingsOpen(value => !value); }}><Settings2 size={15} />Settings</button>
       </div>
     </header>
-    {(error || layoutStorageError) && <div className="hf-prop-error" role="alert">{error || layoutStorageError}<button type="button" onClick={() => { setError(""); setLayoutStorageError(""); }} aria-label="Dismiss"><X size={15} /></button></div>}
+    {(error || layoutStorageError) && <ErrorNotice><div className="hf-prop-error" role="alert">{error || layoutStorageError}<button type="button" onClick={() => { setError(""); setLayoutStorageError(""); }} aria-label="Dismiss"><X size={15} /></button></div></ErrorNotice>}
     {settingsOpen && <PropagationSettingsPanel value={draft} onChange={setDraft} onApply={applySettings} onClose={() => setSettingsOpen(false)} />}
     {canvasCompact && <p className="hf-prop-compact-note">Expand this window to arrange panels. The compact view keeps every card in a readable stack.</p>}
       <HFPropagationCanvas panels={dashboardPanels} layout={canvasLayout} arranging={arranging}

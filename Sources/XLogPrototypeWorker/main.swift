@@ -12,6 +12,12 @@ let worker = PrototypeWorker()
 let output = FileHandle.standardOutput
 let workerArguments = Array(CommandLine.arguments.dropFirst())
 
+#if os(Windows)
+if workerArguments == ["--standalone-xcat"] {
+    exit(await WindowsXCatCompanion.run())
+}
+#endif
+
 let runtimeProfile: AppRuntimeProfile
 let operatingModule: WorkerOperatingModule
 do {
