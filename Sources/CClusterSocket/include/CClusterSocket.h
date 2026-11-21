@@ -36,6 +36,11 @@ XLogSocket *xlog_tcp_accept_loopback(XLogSocket *listener);
 XLogSocket *xlog_spot_udp_listen(uint16_t port);
 int xlog_local_agent_http(const char *path, const char *method, const char *authorization,
                           const void *body, int length, void *response, int capacity, int *size);
+/* 1 when the IPv4 loopback/any listener on this TCP port belongs to FlexRadio
+ * SmartSDR's own CAT service (Cat.exe under a SmartSDR folder), 0 when it belongs
+ * to anything else or cannot be identified. Reads the TCP table only; it never
+ * connects to or sends bytes to the port. */
+int xlog_tcp_listener_is_smartsdr_cat(uint16_t port);
 /* Digital receivers accept only loopback or an explicitly joined IPv4 multicast group. */
 XLogSocket *xlog_digital_udp_listen(const char *group, uint16_t port);
 int xlog_digital_udp_read(XLogSocket *socket, void *bytes, int capacity, uint32_t *sender_ip, uint16_t *sender_port);

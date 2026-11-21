@@ -3143,7 +3143,9 @@ mod tests {
             (json!({"id":"radio","method":"station_action","params":{"action":"cancel"}}), true),
             (json!({"id":"rotor","method":"rotor_goto","params":{"azimuth":120}}), true),
             (json!({"id":"qso","method":"logbook_contact_apply","params":{"action":"save"}}), false),
-            (json!({"id":"cluster","method":"cluster_resume","params":{}}), false),
+            // cluster_resume deliberately keeps the worker on timeout; see
+            // startup_reference_and_cluster_resume_timeouts_preserve_station_routing.
+            (json!({"id":"cluster","method":"cluster_connect","params":{}}), false),
         ] {
             let method = request["method"].as_str().unwrap().to_owned();
             let session = scripted_session("IFS= read -r request; sleep 2");

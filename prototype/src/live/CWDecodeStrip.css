@@ -1,0 +1,9 @@
+/* Decoded CW beside a panel heading: one line, newest text at the right edge. */
+.cw-decode-strip { flex:1 1 240px; min-width:0; margin-left:2.5em; display:flex; align-items:baseline; gap:10px; overflow:hidden;
+  padding:3px 10px; border-radius:6px; background:rgba(18,214,160,.06); border:1px solid rgba(18,214,160,.18); }
+.cw-decode-strip .cw-decode-text { flex:1 1 auto; min-width:0; display:flex; justify-content:flex-end; overflow:hidden; white-space:pre;
+  font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:14px; font-weight:600; letter-spacing:.04em; color:var(--teal,#12d6a0); }
+.cw-decode-strip .cw-decode-text > .cw-decode-pending { color:inherit; opacity:.5; font-weight:500; }
+.cw-decode-strip .cw-decode-detail { flex:none; font-size:11px; color:var(--muted,#8b98a9); white-space:nowrap; }
+.cw-decode-strip.is-idle { background:transparent; border-color:rgba(139,152,169,.18); }
+.cw-decode-strip .cw-decode-idle { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; color:var(--muted,#8b98a9); }

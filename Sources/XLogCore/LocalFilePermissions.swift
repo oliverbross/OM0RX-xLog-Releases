@@ -111,10 +111,19 @@ public enum LocalFilePermissions {
                 NSUnderlyingErrorKey: NSError(domain: "Win32Error", code: Int(error))])
         }
         #else
-        if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(destination, withItemAt: source)
-        } else {
-            try FileManager.default.moveItem(at: source, to: destination)
+        // rename(2) atomically replaces an existing file but, like MoveFileExW
+        // above, refuses to replace a directory and leaves the staged file in
+        // place. FileManager.replaceItemAt would replace a directory on macOS.
+        let result = source.withUnsafeFileSystemRepresentation { from in
+            destination.withUnsafeFileSystemRepresentation { to -> Int32 in
+                guard let from, let to else { errno = EINVAL; return -1 }
+                return rename(from, to)
+            }
+        }
+        if result != 0 {
+            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: destination.path,
+                NSUnderlyingErrorKey: POSIXError(code)])
         }
         #endif
     }

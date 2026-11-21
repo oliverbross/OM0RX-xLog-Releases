@@ -1,10 +1,10 @@
 {
-  "canonicalCommit": "3a9abd5b00f5f619ecdfaa9536e592bc1a057752",
+  "canonicalCommit": "a5bbef1e623f8b9b3f214f896610776825c99287",
   "files": {
     ".gitattributes": {
-      "canonicalBlob": "90eabfa3c62125d941fda2377817318f5dbca83e",
+      "canonicalBlob": "6513ccbc70849b152a40a3e6a76e40e32856a03c",
       "mode": "100644",
-      "sha256": "4bd90b496a438b162cac0395f9f1ef0b5a84dc7c6de5e5cdf24101da1aa8f5d0"
+      "sha256": "1c8a331e2a7db54737e18e2548336130f9e81a9fb567e47afba7b1f25468a63f"
     },
     ".gitignore": {
       "canonicalBlob": "241b28a7d0877440a50ec06416bd04d85ac3419a",
@@ -27,14 +27,14 @@
       "sha256": "676e74d793d80d627e3f1c4f9f9751647d2add8298ec89be847761017b5e8440"
     },
     "Package.swift": {
-      "canonicalBlob": "0b5d47320e11158b125b31b5bf53d177e569bd68",
+      "canonicalBlob": "96ee4742372b629b53c2f3ca594035d149220d1a",
       "mode": "100644",
-      "sha256": "8bb5d81a8e33beb0faa75c81e3d4a408f81f1c83262635570513aec65abad3d3"
+      "sha256": "64b14dc43b015074102939ff454666ce37421ab20fe23b26a35bc38b475cf12c"
     },
     "README.md": {
-      "canonicalBlob": "a5593f1731927ef70a4d3e1b9cf6063b2cd81b6f",
+      "canonicalBlob": "9c5f2d2da95f675cd04ba4ac818f9bca1240d61f",
       "mode": "100644",
-      "sha256": "852fa264e0eb4307a4b4238afb1ae23fac16d67d6ceb60bd9ece4c62cd29d893"
+      "sha256": "6e9a88c74f5505983ac264da08312f95120d6a60259cac120277002be002cefd"
     },
     "Resources/AppIcon-1024.png": {
       "canonicalBlob": "3bfc3eb7049dc012cde2b75a751c668136718e55",
@@ -61,15 +61,20 @@
       "mode": "100644",
       "sha256": "1feb3935ff4c52c673f55c262cb8797400158683107f29caf7d15073e66645d1"
     },
-    "Sources/CClusterSocket/LocalStationAgent.c": {
-      "canonicalBlob": "46fd84f852c412ee0d819b29b092c4de05b10300",
+    "Sources/CClusterSocket/ListenerOwner.c": {
+      "canonicalBlob": "ce50361643920c5a91124ae5e03daf2ea5c01eac",
       "mode": "100644",
-      "sha256": "92bd960eff28e68a672d786cec48ef5603946715eff9be3fb86fa5c7b7cac55a"
+      "sha256": "f2984ee50974776426a5150b13809b0ea150c0eb5e379f1cb0992612983434a3"
+    },
+    "Sources/CClusterSocket/LocalStationAgent.c": {
+      "canonicalBlob": "84cb6c1dfb7fda83fcea6a1c4e9b03d0511cdc14",
+      "mode": "100644",
+      "sha256": "dbec4b66637d758c51daedac59eebeac36db905dca947737a2de8a5e35388827"
     },
     "Sources/CClusterSocket/include/CClusterSocket.h": {
-      "canonicalBlob": "7915dc24060219dbeb6483922a3cc8b42fbad558",
+      "canonicalBlob": "75aae910cf3dec4bf5be4f88f733833b981566bf",
       "mode": "100644",
-      "sha256": "11c88b171849c5bdf3d5994ea76a5ebd1da6fb67018cdbeaf595f3654919dd47"
+      "sha256": "60e70f056d5e134641817e929b8e2d25006a4e25582422cc4c003a83e7c3137e"
     },
     "Sources/CCurlBackup/CCurlBackup.c": {
       "canonicalBlob": "1fe9dc7a3d9a09bd86b115bb0a8bef381d0b9e53",
@@ -192,9 +197,9 @@
       "sha256": "1f254bef2f9b496d9d1830ed625f0a645e8fe04df680ec0cd72fbb47f040bd54"
     },
     "Sources/XCatIntegrationCore/RemoteAgentClient.swift": {
-      "canonicalBlob": "7eb6a2e21cd57d592ddeb0fbd5e08c782455d695",
+      "canonicalBlob": "8783f8a28e23fd1dcbef09dbcb8033d96e2d3604",
       "mode": "100644",
-      "sha256": "2530443c275dabb5372a05cdb8186758f16f4da95e13f9413a953cffb4c26608"
+      "sha256": "b44a12d6a7e4d7174f48ad73eea9973a7ae0504f61bdfc8abac0432cfba84dfc"
     },
     "Sources/XCatIntegrationCore/RemoteAgentModels.swift": {
       "canonicalBlob": "1083309cad12b3840fb8126dcb7f3bc6baac6f3e",
@@ -612,9 +617,9 @@
       "sha256": "0babf5f016b5b95dedd8f89ab3de98e0b96c6a324699c336196dae62ab455e16"
     },
     "Sources/XLogCore/CTYResolver.swift": {
-      "canonicalBlob": "faea0331f5fb0caa836c8d3554ad279693b43bce",
+      "canonicalBlob": "abf973a39b36fdf8f241dbd750c32b81bada8145",
       "mode": "100644",
-      "sha256": "38004510f72b7fcd8b2e01bad7259349d338f2cba0eee105f8e8d542a72c3cc1"
+      "sha256": "c9665155a427cf0447d9c9940a2ed699c8f48a830be08af377c6a3cb2b2cb1b9"
     },
     "Sources/XLogCore/CWProfile.swift": {
       "canonicalBlob": "9a1c3e700346904bb1c73a909d07b0a95d3484f5",
@@ -737,9 +742,9 @@
       "sha256": "4c7b8001ea03cae2c4ed97dce480aa5ad9a5996edf3839b534717417835c42c9"
     },
     "Sources/XLogCore/LocalFilePermissions.swift": {
-      "canonicalBlob": "feae0986a554aae041123eb73913f885760e3a82",
+      "canonicalBlob": "45a698e75e50128e15a6f7462322211dfabf6067",
       "mode": "100644",
-      "sha256": "5a951dcafc82fad7f5e8f78523e4d22be07d63ee8b79d7000a70aa7eca0f4576"
+      "sha256": "0064043b5bce5b966c68710954e7f481ab68e75f53d58185a05117865a7cfda9"
     },
     "Sources/XLogCore/LogbookAggregateRead.swift": {
       "canonicalBlob": "3185857f2e036e039c49048df37fb7881bd97654",
@@ -1167,9 +1172,9 @@
       "sha256": "806e5bc98e84392a872dc4b277f386b7950f00a0abecd9d9a88c046353e61400"
     },
     "Sources/XLogPrototypeSupport/LiveLogbookMethods.swift": {
-      "canonicalBlob": "d4011668a2a7b31893d5ac24619a86b6b33b52c6",
+      "canonicalBlob": "136e0f57e2002bb70444fb744ca9643061ec6cc7",
       "mode": "100644",
-      "sha256": "d1f47300190a0e07edf928fdd56f83e2ad5b01ac258f663aa57a7ee6a9825c9f"
+      "sha256": "c0e25ab13f923841e36b92bbb08f7b0b6313743db2d7e7c1972e8b8900e2c8d8"
     },
     "Sources/XLogPrototypeSupport/LiveOnlineLogDeliveryService.swift": {
       "canonicalBlob": "0abbac02dd46cd16bc2e527a880f360483309bf8",
@@ -1232,14 +1237,14 @@
       "sha256": "a6dc3b70dc080f7201077b835f2f265c5e6c784b18728c229b6b2d2441e52521"
     },
     "Sources/XLogPrototypeSupport/LiveStationMethods.swift": {
-      "canonicalBlob": "d4f3b6220b2f7a10d40d18a31d6dc192a2037986",
+      "canonicalBlob": "70b6893f5f624ab798f0e20e5b97191daab1fbea",
       "mode": "100644",
-      "sha256": "2a1a7cbd286968f82d08c77112df09d3c13b049b421b7c35cba63d7ce55cdab0"
+      "sha256": "d97480460969b3a593a1012ec0da5dd9bd019b227fe50aa12ea182e12bc190b4"
     },
     "Sources/XLogPrototypeSupport/LiveStationSession.swift": {
-      "canonicalBlob": "483dcf9fef5013ed368768a881a2e1cd11082082",
+      "canonicalBlob": "c820c8098ce4dfb376d3a22c4954237c796fa701",
       "mode": "100644",
-      "sha256": "42129e9820141412c849d4b0e84d260018f640607b797db8a415f5e843fc3fe1"
+      "sha256": "07376689f91a118179680795efb391c421b1b57479bd80e567f1727fe21c1f06"
     },
     "Sources/XLogPrototypeSupport/LiveTCISession.swift": {
       "canonicalBlob": "a1df4fd4b0b4d223fb921d896b0dbfd9cd1aa7d6",
@@ -1512,14 +1517,14 @@
       "sha256": "fc867b37c9a26d7260788526ed665b1dbfc5df3c89e7fc6e826bef1ce54bcfe5"
     },
     "prototype/package-lock.json": {
-      "canonicalBlob": "098a60efa8351c0cb9015fe5c724634c32b491ee",
+      "canonicalBlob": "f450e6cb975e10d403602024fa4c762bc0ad4c50",
       "mode": "100644",
-      "sha256": "7169c5851458516b4086706ce14b1b77aee2f7c9664609220a4eaf6dcda9c1b9"
+      "sha256": "d2e99d36dade1f4239ad2997510ddbac8c5b30e67cc709d8dfa325565ab27399"
     },
     "prototype/package.json": {
-      "canonicalBlob": "64f0a53ebe50615cd4500139e4bcf8d7b3d3d64b",
+      "canonicalBlob": "ec4c3c576741691a6ea33560def312fcfd8dcf62",
       "mode": "100644",
-      "sha256": "578520a7989f3dce0857aac84ae21691b1dc7348e23927acf53c818d5011b9b0"
+      "sha256": "9b437719aef6d00963324790583ea2f34d68293618ad0828f97e531afd3c671b"
     },
     "prototype/portable-swift-pins.json": {
       "canonicalBlob": "6e20b4179fee6cf65b15f284ab20b0dde5a50c9c",
@@ -1767,14 +1772,14 @@
       "sha256": "773b3fc9e798de2ed8fc43d69bd99c7788e11231ebcd904bfd11b767d5d409fb"
     },
     "prototype/src-tauri/Cargo.lock": {
-      "canonicalBlob": "7e3b74c4c06a5fdaa44fd681ce2993af1ab4a042",
+      "canonicalBlob": "8a8c20e51c859a56fa40b41f1f4efa44bbc76a65",
       "mode": "100644",
-      "sha256": "0886d028a280899ec048523a613e20def816ceab80b9af3850d8d01cb8a4da23"
+      "sha256": "7de2934cb864a238e6c4cf4a7437e05f0757ea05e3f087644dd9f1b0b1736a5c"
     },
     "prototype/src-tauri/Cargo.toml": {
-      "canonicalBlob": "8abef7ce2d64c290c44d68b08e4f55b65996a8aa",
+      "canonicalBlob": "1a3c298719ce16bc60f947dca28dd5771ca35d39",
       "mode": "100644",
-      "sha256": "c768e20ab624928e1be70c7d512445453ecba5fd21c100d4088e4833cf04a879"
+      "sha256": "4aad45e0aba5cdcf4f300a6d26d7694cc6a3519a989efdbc8ffab31f48044d20"
     },
     "prototype/src-tauri/Info.contesting-test.plist": {
       "canonicalBlob": "922e15bfa55cdfa2acbf2a65107ef12830b52969",
@@ -2136,6 +2141,11 @@
       "mode": "100644",
       "sha256": "f5e3eb94b0fd0b6bdd12c0d462129239c6e3f77be317fc965628c2d173326ba8"
     },
+    "prototype/src-tauri/src/cw_decode.rs": {
+      "canonicalBlob": "16853392ed35a856df0048201c596d1cd38cd03f",
+      "mode": "100644",
+      "sha256": "d73c0a2c8c013048925aeb688ed0615613d01f776700be4920e90d4c87d6e7f1"
+    },
     "prototype/src-tauri/src/cw_message.rs": {
       "canonicalBlob": "30244eae97a6fe3e5ee381cabf51141fe22b83d9",
       "mode": "100644",
@@ -2217,9 +2227,9 @@
       "sha256": "e1c62bf5272bfe421d9a739c7bec1e765b6ccc19d031a42b81833ef187a26cbd"
     },
     "prototype/src-tauri/src/main.rs": {
-      "canonicalBlob": "5201ddbe7b3e21cea36a59bad5031dcc6836d811",
+      "canonicalBlob": "49e5ed0a361a62c86a4948111d64bfa3b0998ecd",
       "mode": "100644",
-      "sha256": "c3fc0af0fc739504abd5fc30862c46fbee0250413b404a3f16947505ae59079d"
+      "sha256": "8e2623482440270ff784e2455c80747b7fcdf5d0128eceb2104dc161cd97cb8b"
     },
     "prototype/src-tauri/src/manual_rotor.rs": {
       "canonicalBlob": "7f125c81f27474657170f42197878048b93b71b2",
@@ -2427,9 +2437,9 @@
       "sha256": "0db4e75dba323928fe0dc5309a1a1ffb9fed944be52d22e8a8904af28a0e0832"
     },
     "prototype/src-tauri/src/worker.rs": {
-      "canonicalBlob": "23eb9a7ae3b535eaf838f92a014bb641ec54317b",
+      "canonicalBlob": "1a1e350e79958092a06dac6a6b5c236ae49af302",
       "mode": "100644",
-      "sha256": "3b697ad90713173a2689f970ac8560c7253ab5af70602e03e1c80cb56119b1ab"
+      "sha256": "a899e64a52a0939e5cdbf0d061ef1437087fee9307892488573b67388255517f"
     },
     "prototype/src-tauri/src/worker_health.rs": {
       "canonicalBlob": "29f04be6048001e5680a44294cb8119fff7ecfd0",
@@ -2462,9 +2472,9 @@
       "sha256": "9655d498bda1be8acc901dfa011482a340b03eb7ec94d1f44efeda22a72eb185"
     },
     "prototype/src-tauri/tauri.conf.json": {
-      "canonicalBlob": "b3ffec9c009b7dd89177d263ef9fab74ebda16d0",
+      "canonicalBlob": "06f6e8a4f1251b36fb9aa94e1dbedb14a21f5bb1",
       "mode": "100644",
-      "sha256": "91a2dc0da1f8a0372637e7efc0a214459f21bd9dee05c8d58d5c8356a57f9886"
+      "sha256": "0ed391809c1135fd86f8bfb2e505959ee1db73830cbe4de22327419961ac6b62"
     },
     "prototype/src-tauri/tauri.contesting-test.conf.json": {
       "canonicalBlob": "349f68a02c9da651dff3c5d279a839ec4565de25",
@@ -2482,9 +2492,9 @@
       "sha256": "abf938f467259cfd3e369fa0674895b03207051fb2ac9747b2ddbd192ab2af3c"
     },
     "prototype/src/LiveApp.tsx": {
-      "canonicalBlob": "0cddabc69bd0db65374641eb839de935db7ce9e3",
+      "canonicalBlob": "49b2f563e64a54e6db149a5a28736acf8d6b3a95",
       "mode": "100644",
-      "sha256": "9fcb3bc4c0c3be817082de8f4543e9ea4e037ccb5a5019e5803f588aec5fb261"
+      "sha256": "1c9b7e5d4668dd928f86d18fd32f1ac6d37facb578e93875805c0f38cdbf45c4"
     },
     "prototype/src/Map.css": {
       "canonicalBlob": "84e2b7dd3d718dd92c17b07c206af21252247a94",
@@ -2877,9 +2887,9 @@
       "sha256": "56d3453d45047d96d646b3aaba71cc2333f3eb04828ffeb666d8507cf742a138"
     },
     "prototype/src/contesting/Not1MMContestWorkspace.tsx": {
-      "canonicalBlob": "497ba321fd344a2994a1edf17ac94a4c534d5e99",
+      "canonicalBlob": "318c870fa9b70a8123386ccb304d029d26e17944",
       "mode": "100644",
-      "sha256": "10d9a6e2d30c2e10bc18f1ee53125ef799e0622cc5aa0b8c1f402577c8be5180"
+      "sha256": "2ecf7a200e3795b418573729beff1475fdc6856718920af5e5bd874a2e5b3a64"
     },
     "prototype/src/contesting/RecorderAudioAction.tsx": {
       "canonicalBlob": "b69b1a00f79682fe92257483d0933ee174aa7f0f",
@@ -3265,6 +3275,16 @@
       "canonicalBlob": "f2f70b84eb9a0d21458da892dc0190db489d7f44",
       "mode": "100644",
       "sha256": "b164b147f977e3d0483fa9a69f6d4369819625dba1a38c09577cc69babec200d"
+    },
+    "prototype/src/live/CWDecodeStrip.css": {
+      "canonicalBlob": "9f8994a15d40fab4dbf83f65e5df3c0bf756698c",
+      "mode": "100644",
+      "sha256": "3dea765b573c0b52747e693005dbb80c981931184d8a1918c0aa20620277e795"
+    },
+    "prototype/src/live/CWDecodeStrip.tsx": {
+      "canonicalBlob": "4114a62a711231ca2fcd38cf08fa259199ea0929",
+      "mode": "100644",
+      "sha256": "94edbe43ec7e1261adb65486431c96b9139b17ea6b5c5fe673077fe9480858de"
     },
     "prototype/src/live/CWDesk.tsx": {
       "canonicalBlob": "40c8ca4dcf5b4e1ce496a2f9bca7168144275957",
@@ -3837,9 +3857,9 @@
       "sha256": "089a4ccb0f09c456b28d64af81d8a9403e68a2f7a8c3e381030edea929ca24e9"
     },
     "prototype/src/live/OperatorDesk.tsx": {
-      "canonicalBlob": "0040156d313694f9c35d2dd1d6e1bd3b27767e7d",
+      "canonicalBlob": "7f5529c55c8d20a239996abba4cc748f6e440a55",
       "mode": "100644",
-      "sha256": "36eaa3e814fd5e98693294b1b36837ea7444643a4642ba03a094fc8e651693fa"
+      "sha256": "2b103c9d03add4d8dcb6a1986033da0328e7a0f34692929c41e6b6e19c900288"
     },
     "prototype/src/live/OperatorDraftStatus.tsx": {
       "canonicalBlob": "46cef0768493d4aca994d55ec7ff9f15b89ba8d1",

@@ -517,10 +517,18 @@ public final class CTYResolver: @unchecked Sendable {
             return Array(Set(primaryOnly().entities + neutralFallback.entities)).sorted { $0.name < $1.name }
         }
         if let countryPack { return Array(Set(countryPack.records.map { Self.entityNamedCountry($0.country) })).sorted { $0.name < $1.name } }
-        var unique: [Int: CountryInfo] = [:]
+        // As in `entityNames`: a starred primary prefix is a WAE-only
+        // subdivision (Vienna Intl Ctr, Bear Island), never the DXCC entity's
+        // label. Use it only when no ordinary row shares that ADIF identity.
+        var unique: [Int: CountryInfo] = [:], waeOnly: [Int: CountryInfo] = [:]
         for rule in rules where rule.country.latitude != nil && rule.country.longitude != nil {
-            unique[rule.country.adif] = unique[rule.country.adif] ?? rule.country
+            if rule.primaryPrefix.hasPrefix("*") {
+                waeOnly[rule.country.adif] = waeOnly[rule.country.adif] ?? rule.country
+            } else {
+                unique[rule.country.adif] = unique[rule.country.adif] ?? rule.country
+            }
         }
+        unique.merge(waeOnly) { ordinary, _ in ordinary }
         return unique.values.sorted { lhs, rhs in lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending }
     }
 

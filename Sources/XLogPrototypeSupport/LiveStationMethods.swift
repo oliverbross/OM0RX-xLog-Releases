@@ -79,7 +79,7 @@ enum LiveStationMethods {
                                        "station_forget", "station_configuration", "station_configuration_save",
                                         "station_radio_control", "station_transmit_permission", "station_rotor_snapshot", "station_rotor_connect", "station_rotor_disconnect",
                                        "station_rotor_goto", "station_rotor_stop", "station_add_spot", "station_remove_spot",
-                                       "station_cat_servers"]
+                                       "station_cat_servers", "station_cw_text"]
 
     struct Endpoint: Equatable {
         let host: String

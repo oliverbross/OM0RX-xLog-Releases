@@ -22,7 +22,7 @@ type Data = Record<string, any>;
 type Request = (method: string, params?: Data) => Promise<any>;
 type Props = { draft: Data | null; setDraft: (value: SetStateAction<Data | null>) => void; save: (draft?:Data) => void; clear: () => void; busy: boolean; draftLocked?: boolean; referenceEvidence?: ReferenceEvidence | null;
   lookup: Data | null; previous: Data[]; onRetryLookup?: () => void; lookupPending?: boolean; request: Request; refresh: number; onEditor: () => void; onReadRadio: () => Promise<void>;
-  follow: boolean; setFollow: (value: boolean) => void; rotor: RotorSnapshot | null; rotorConfigured?: boolean; autoRotor: boolean; setAutoRotor: (value: boolean) => void; onManualRotor: () => void; isEditing?: boolean; intelligenceBands?: string[]; equipment?: unknown; cwControls?: ReactNode;
+  follow: boolean; setFollow: (value: boolean) => void; rotor: RotorSnapshot | null; rotorConfigured?: boolean; autoRotor: boolean; setAutoRotor: (value: boolean) => void; onManualRotor: () => void; isEditing?: boolean; intelligenceBands?: string[]; equipment?: unknown; cwControls?: ReactNode; cwDecode?: ReactNode;
   canAcceptLocalInput?: () => boolean; onLocalInputState?: (pending: boolean) => void; resetInputEpoch?: number; automaticStart?: boolean; rotorSession?: ManualRotorGotoSession };
 const normalizedCall = (value: unknown) => String(value ?? "").trim().toUpperCase();
 const bands = ["160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "70cm"];
@@ -36,10 +36,10 @@ export function rotorPathDistance(shortPath: unknown, path: "SP" | "LP"): number
     ? path === "SP" ? shortPath : circumference - shortPath : undefined;
 }
 
-type DeskQSOProps = Pick<Props, "draft" | "setDraft" | "save" | "clear" | "busy" | "draftLocked" | "follow" | "setFollow" | "isEditing" | "cwControls" | "referenceEvidence" | "request" | "refresh" | "canAcceptLocalInput" | "onLocalInputState" | "resetInputEpoch"> & {
+type DeskQSOProps = Pick<Props, "draft" | "setDraft" | "save" | "clear" | "busy" | "draftLocked" | "follow" | "setFollow" | "isEditing" | "cwControls" | "cwDecode" | "referenceEvidence" | "request" | "refresh" | "canAcceptLocalInput" | "onLocalInputState" | "resetInputEpoch"> & {
   onEditor?: () => void; onReadRadio?: () => Promise<void>; radioControls?: boolean; followControls?: boolean;
 } & Partial<Omit<Props, "onEditor" | "onReadRadio">>;
-export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftLocked, onEditor, onReadRadio, follow, setFollow, isEditing, cwControls, referenceEvidence, request, refresh, canAcceptLocalInput, onLocalInputState, resetInputEpoch, radioControls = true, followControls = false, automaticStart: canonicalAutomaticStart }: DeskQSOProps) {
+export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftLocked, onEditor, onReadRadio, follow, setFollow, isEditing, cwControls, cwDecode, referenceEvidence, request, refresh, canAcceptLocalInput, onLocalInputState, resetInputEpoch, radioControls = true, followControls = false, automaticStart: canonicalAutomaticStart }: DeskQSOProps) {
   const acceptsInput = () => !draftLocked && (canAcceptLocalInput?.() ?? true);
   const setDraft: Props["setDraft"] = value => { if (acceptsInput()) writeDraft(value); };
   const duplicateDate = useDuplicateContact(draft, isEditing, request, refresh);
@@ -107,7 +107,7 @@ export function DeskQSO({ draft, setDraft: writeDraft, save, clear, busy, draftL
     now.setUTCMilliseconds(0);
     save(automaticStart && canonicalAutomaticStart === undefined ? { ...draft, start: now.toISOString() } : draft);
   };
-  return <section className="desk-panel desk-active" aria-label="Active QSO"><QSOHeader title="Active QSO" /><form inert={draftLocked} aria-busy={draftLocked} onSubmit={event => { event.preventDefault(); if (acceptsInput() && canSave) saveCurrent(); }} onKeyDown={event => {
+  return <section className="desk-panel desk-active" aria-label="Active QSO"><QSOHeader title="Active QSO" actions={cwDecode} /><form inert={draftLocked} aria-busy={draftLocked} onSubmit={event => { event.preventDefault(); if (acceptsInput() && canSave) saveCurrent(); }} onKeyDown={event => {
     if (editorCommand(event,{save:()=>{if(acceptsInput()&&canSave)saveCurrent();},focus:()=>event.currentTarget.querySelector<HTMLInputElement>('[aria-label="Desk Callsign"]')?.focus()})) return;
     if (event.key === "Escape") { event.preventDefault(); event.currentTarget.querySelector<HTMLInputElement>('[aria-label="Desk Callsign"]')?.focus(); }
   }}>

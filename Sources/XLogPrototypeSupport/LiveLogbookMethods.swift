@@ -86,17 +86,6 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     /// and still undecoded; each page read decodes just its own contacts, so
     /// no whole-log snapshot is built and content cannot change mid-export.
     private var adifExport: (token: String, generation: String, created: Date, records: [Data])?
-    /// The last settings_load answer, shared by the several panels and native
-    /// owners that each read settings within the same second (about 90 reads a
-    /// minute, each re-reading storage and checking sync authorization). Any
-    /// request outside `settingsCacheKeepers` clears it, so a change is visible
-    /// on the next read; otherwise it lives at most `settingsCacheLifetime`.
-    private var settingsCache: (at: Date, generation: String, value: [String: Any])?
-    static let settingsCacheLifetime: TimeInterval = 1.5
-    private static let settingsCacheKeepers: Set<String> = [
-        "settings_load", "workspace_status", "logbook_operator_draft", "logbook_list", "logbook_previous",
-        "logbook_duplicate", "logbook_matrix", "lookup_call", "cluster_history", "sync_summary",
-        "workspace_layout_load", "workspace_preferences_load", "workspace_rotor_configuration_load", "logbook_chase_progress"]
     private var potaExport: (token: String, preview: POTAExportPreview)?
     private struct ADIFPreviewSession {
         let token: String
@@ -995,6 +984,14 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
         return ("bundled", resolver)
     }
 
+    /// True only when neither a downloaded country pack/XML nor a downloaded
+    /// cty.dat is in use (the bundled cty.dat always supplements). A resolver
+    /// snapshot's `source` is a cache key, never a reference label.
+    private func countryReferenceIsBundled() throws -> Bool {
+        let downloadedCTY = fileManager.fileExists(atPath: workspaceURL.appendingPathComponent("Reference Data/cty.dat").path)
+        return try baseCTYResolverSnapshot().source == "bundled" && !downloadedCTY
+    }
+
     func currentCTYResolver() throws -> CTYResolver {
         try lock.withLock {
             try currentCTYResolverSnapshot().resolver
@@ -1235,7 +1232,6 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
     }
 
     public func handle(method: String, params: [String: Any]) throws -> [String: Any] {
-        if !Self.settingsCacheKeepers.contains(method) { lock.withLock { settingsCache = nil } }
         if method == "logbook_companion_bearing" {
             try requireKeys(params, allowed: ["callsign", "originGrid", "generation"], required: ["callsign", "originGrid", "generation"])
             guard let call = params["callsign"] as? String, CompanionBearing.normalizedCall(call) != nil,
@@ -1469,10 +1465,7 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 let limit = try integer(params, "limit", default: 20, range: 1...25)
                 let offset = try integer(params, "offset", default: 0, range: 0...Int(Int32.max))
                 let source = try currentCTYResolverSnapshot()
-                // "bundled" only when neither a downloaded country pack/XML nor a
-                // downloaded cty.dat is in use (the bundled cty.dat always supplements).
-                let downloadedCTY = fileManager.fileExists(atPath: workspaceURL.appendingPathComponent("Reference Data/cty.dat").path)
-                let bundled = try baseCTYResolverSnapshot().source == "bundled" && !downloadedCTY
+                let bundled = try countryReferenceIsBundled()
                 return ["preview": try json(readyDatabase().pjCorrectionPreview(resolver: source.resolver, limit: limit, offset: offset)),
                         "source": bundled ? "bundled" : "downloaded",
                         "read_only": true]
@@ -1745,9 +1738,10 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 let generation = try editGeneration(createIfMissing: false)
                 if try !matchesEditGeneration(params, generation) { return ["status": "workspace_changed", "generation": generation] }
                 let reference = try? currentCTYResolverSnapshot()
+                let referenceLabel = (try? countryReferenceIsBundled()) == true ? "bundled_cty" : "local_cty"
                 do {
                     let report = try readyDatabase().contactDataQuality(contactID: id, expectedRevision: Int64(revision),
-                        reference: reference.map { .init(resolver: $0.resolver, source: $0.source == "bundled" ? "bundled_cty" : "local_cty") },
+                        reference: reference.map { .init(resolver: $0.resolver, source: referenceLabel) },
                         conflictID: conflictID)
                     return ["generation": generation, "read_only": true,
                             "duplicate_review": "boundedLocalReview", "conflict_review": conflictID == nil ? "notRequested" : "retainedConflict",
@@ -1781,7 +1775,7 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 }
                 let source = try currentCTYResolverSnapshot()
                 let report = QSODataQuality.inspect(current, reference: .init(resolver: source.resolver,
-                    source: source.source == "bundled" ? "bundled_cty" : "local_cty"))
+                    source: try countryReferenceIsBundled() ? "bundled_cty" : "local_cty"))
                 guard report.findings.contains(where: { $0.kind == .storedDXCCDisagreesWithReference }),
                       let comparison = report.referenceComparison,
                       comparison.field == "dxcc", comparison.source == .suppliedCTYReference,
@@ -2158,10 +2152,6 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                         "count": qsos.count, "offset": offset, "total": try db.stats().qsoCount, "fieldMetadata": metadata]
             case "settings_load":
                 try requireKeys(params, allowed: [])
-                if let cached = settingsCache, Date().timeIntervalSince(cached.at) < Self.settingsCacheLifetime,
-                   (try? storedEditGeneration()) == cached.generation {
-                    return cached.value
-                }
                 // All helpers run synchronously under this request's lock. Share
                 // its freshly validated workspace instead of walking the same
                 // filesystem ancestors repeatedly; the next request validates anew.
@@ -2172,10 +2162,8 @@ public final class LiveLogbookMethods: RemoteBackupWorkspaceGenerationSource, Re
                 let context = SettingsReadContext(generation: generation, keychainService: workspace.keychainService,
                                                   syncTargetRevision: snapshot.syncTargetRevision)
                 let settings = try presentedSettings(snapshot.settings, readContext: context)
-                let value: [String: Any] = ["settings": try json(settings), "revision": snapshot.revision,
+                return ["settings": try json(settings), "revision": snapshot.revision,
                         "generation": generation, "automatic_sync": settings.automaticSync]
-                settingsCache = (Date(), generation, value)
-                return value
             case "settings_receipt":
                 try requireKeys(params, allowed: ["operationID", "generation"], required: ["operationID", "generation"])
                 guard let raw = params["operationID"] as? String, let operationID = UUID(uuidString: raw) else { throw invalid() }

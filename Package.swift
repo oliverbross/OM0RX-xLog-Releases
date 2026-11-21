@@ -102,7 +102,7 @@ portableTargets.append(contentsOf: [
     .systemLibrary(name: "CZlibReference"),
     .systemLibrary(name: "CSQLitePrototype", pkgConfig: sqlitePkgConfig, providers: [.apt(["libsqlite3-dev"])]),
     .target(name: "CPlatformDigest", linkerSettings: [.linkedLibrary("bcrypt", .when(platforms: [.windows]))]),
-    .target(name: "CClusterSocket", linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows]))]),
+    .target(name: "CClusterSocket", linkerSettings: [.linkedLibrary("ws2_32", .when(platforms: [.windows])), .linkedLibrary("iphlpapi", .when(platforms: [.windows]))]),
     .target(name: "CPlatformVault", dependencies: platformVaultDependencies,
             linkerSettings: [.linkedLibrary("Advapi32", .when(platforms: [.windows]))]),
     .target(name: "XClusterIntegrationCore", dependencies: ["CClusterSocket"]),

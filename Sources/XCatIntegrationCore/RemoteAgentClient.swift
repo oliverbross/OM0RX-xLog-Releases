@@ -461,6 +461,20 @@ public actor RemoteAgentClient: RadioControlling {
         return try Self.configurationData(fromResponse: data)
     }
 
+    /// Decoded CW text relayed from OM0RX-Skimmer: every signal, or with
+    /// `after` only the signals changed since that relay sequence. Receive-only.
+    public func fetchCWTextData(after: Int?) async throws -> Data {
+        var request = endpoint.httpRequest(path: "/api/v1/cw_text", token: token)
+        request.timeoutInterval = 5
+        if let after, let url = request.url, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.queryItems = [URLQueryItem(name: "after", value: String(after))]
+            request.url = components.url
+        }
+        let (data, response) = try await transport(request)
+        try Self.validate(response: response, data: data)
+        return data
+    }
+
     private func connect() async {
         guard shouldRun else { return }
         generation += 1
@@ -483,7 +497,7 @@ public actor RemoteAgentClient: RadioControlling {
         #if os(Windows)
         if let components = URLComponents(url: endpoint.baseURL, resolvingAgainstBaseURL: false),
            LocalStationAgent.isLocal(components), let url = request.url, let auth = request.value(forHTTPHeaderField: "Authorization") {
-            let path = url.path, verb = request.httpMethod ?? "GET", payload = request.httpBody ?? Data()
+            let path = url.path + (url.query.map { "?" + $0 } ?? ""), verb = request.httpMethod ?? "GET", payload = request.httpBody ?? Data()
             let (data, code) = try await Task.detached {
                 var bytes = [UInt8](repeating: 0, count: 512 * 1024)
                 var length: Int32 = 0

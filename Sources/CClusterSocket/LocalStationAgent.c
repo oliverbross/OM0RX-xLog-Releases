@@ -7,13 +7,28 @@
 #include "CClusterSocket.h"
 #pragma comment(lib, "winhttp.lib")
 
+// Receive-only decoded CW text: "/api/v1/cw_text" or "/api/v1/cw_text?after=<1-16 digits>".
+static int xlog_local_agent_cw_text_path(const char *path) {
+    static const char base[] = "/api/v1/cw_text", query[] = "?after=";
+    if (strncmp(path, base, sizeof(base) - 1)) return 0;
+    const char *rest = path + sizeof(base) - 1;
+    if (!*rest) return 1;
+    if (strncmp(rest, query, sizeof(query) - 1)) return 0;
+    rest += sizeof(query) - 1;
+    size_t digits = 0;
+    while (rest[digits] >= '0' && rest[digits] <= '9') digits++;
+    return digits >= 1 && digits <= 16 && !rest[digits];
+}
+
 // Local credentials are scoped to the installed Agent. Never follow redirects
 // or allow a system proxy to receive this bearer token.
 int xlog_local_agent_http(const char *path, const char *method, const char *authorization,
                           const void *body, int length, void *response, int capacity, int *size) {
     if (!path || !method || !authorization || !response || !size || length < 0 || capacity <= 0) return -1;
-    if (strcmp(path,"/api/v1/state") && strcmp(path,"/api/v1/config") && strcmp(path,"/api/v1/commands")) return -1;
+    if (strcmp(path,"/api/v1/state") && strcmp(path,"/api/v1/config") && strcmp(path,"/api/v1/commands")
+        && !xlog_local_agent_cw_text_path(path)) return -1;
     if (strcmp(method,"GET") && strcmp(method,"PUT") && strcmp(method,"POST")) return -1;
+    if (xlog_local_agent_cw_text_path(path) && strcmp(method,"GET")) return -1;
     if (strlen(authorization)>4104 || strpbrk(authorization,"\r\n")) return -1;
     wchar_t route[64], verb[8], header[4200];
     if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,path,-1,route,64) ||

@@ -66,6 +66,7 @@ mod detached_geometry;
 mod window_geometry;
 mod winkeyer;
 mod cw_session;
+mod cw_decode;
 mod cw_message;
 mod cw_session_backend;
 mod tci_permission;
@@ -1888,6 +1889,14 @@ async fn station_telemetry_snapshot(window: tauri::WebviewWindow, app: tauri::Ap
     station_telemetry::validate(window.label(), runtime_profile::isolated(state.path.is_some()), provider.is_some())?;
     radio_slots::index(&radio_id)?;
     station_telemetry::owner_for(&app, &radio_id)?.snapshot()
+}
+
+/// Receive-only decoded CW text (OM0RX-Skimmer) for the signal at the radio frequency.
+#[tauri::command]
+async fn cw_decode_snapshot(state: tauri::State<'_, acceptance::Acceptance>, radio_id: String, frequency_hz: f64) -> Result<serde_json::Value, String> {
+    cw_decode::validate(runtime_profile::isolated(state.path.is_some()))?;
+    tauri::async_runtime::spawn_blocking(move || cw_decode::snapshot(&radio_id, frequency_hz)).await
+        .map_err(|_| "Decoded CW text is unavailable.".to_string())?
 }
 
 #[tauri::command]
@@ -4989,7 +4998,7 @@ fn main() {
             contest_voice_profile_write, contest_voice_profile_pick,
             contest_surface_action, contest_surface_diagnostic_report, contest_surface_action_next, contest_surface_escape_next, contest_surface_action_complete, contest_surface_owner_claim, contest_surface_publish, contest_surface_snapshot, contest_rotor_target,
             workspace_mode_present, workspace_presentation_begin, workspace_canvas_close_ack, close_about_window,
-            elecraft::elecraft_request, elecraft::elecraft_agent, workspace_navigation_snapshot, workspace_navigation_ack, hm_control_snapshot, hm_control_feed, map_context_snapshot, monitor_context_snapshot, monitor_station_action, monitor_rotor_stop, rotor_telemetry_snapshot, station_telemetry_snapshot, station_selection_snapshot, station_status_snapshot, connection_doctor_snapshot, connection_doctor_export, contest_export_save, contest_scp_import, contest_history_preview, contest_history_manager_request, contest_qrz_details_lookup, propagation_session_request, station_identity_snapshot, alerts_snapshot, dx_alerts_snapshot, dx_alerts_entities, dx_alerts_preview, dx_alerts_review, nearby_callsign_snapshot, nearby_callsign_accept, normal_command_preferences, normal_command_navigate, normal_shortcut_capture, antenna_profile::antenna_transmit_context, dx_alerts_save, dx_alerts_test, dx_alerts_clear, dx_alerts_clear_selected, antenna_snapshot,
+            elecraft::elecraft_request, elecraft::elecraft_agent, workspace_navigation_snapshot, workspace_navigation_ack, hm_control_snapshot, hm_control_feed, map_context_snapshot, monitor_context_snapshot, monitor_station_action, monitor_rotor_stop, rotor_telemetry_snapshot, station_telemetry_snapshot, cw_decode_snapshot, station_selection_snapshot, station_status_snapshot, connection_doctor_snapshot, connection_doctor_export, contest_export_save, contest_scp_import, contest_history_preview, contest_history_manager_request, contest_qrz_details_lookup, propagation_session_request, station_identity_snapshot, alerts_snapshot, dx_alerts_snapshot, dx_alerts_entities, dx_alerts_preview, dx_alerts_review, nearby_callsign_snapshot, nearby_callsign_accept, normal_command_preferences, normal_command_navigate, normal_shortcut_capture, antenna_profile::antenna_transmit_context, dx_alerts_save, dx_alerts_test, dx_alerts_clear, dx_alerts_clear_selected, antenna_snapshot,
             detached_cluster_ready, cluster_session_selection, contest_post_spot, dock_detached_window, close_logbook_window, close_qso_window, close_main_window, close_cw_window, show_cw_desk, close_rotor_window, show_rotor_desk, close_station_status_window, show_station_status_desk, close_propagation_window, show_propagation_desk, close_station_identity_window, show_station_identity_desk, close_alerts_window, show_alerts_desk, close_antenna_window, show_antenna_desk,
              hf_propagation_fetch,
              acceptance::acceptance_enabled, acceptance::acceptance_large_log, acceptance::acceptance_monitor,

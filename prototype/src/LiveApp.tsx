@@ -60,6 +60,7 @@ import {useNormalCommands} from "./live/useNormalCommands";
 import {NearbyCallsigns} from "./live/NearbyCallsigns";
 import { ContactDeleteAction } from "./live/ContactDeleteAction";
 import OperatorDesk, { DeskQSO, DeskIntelligence, DeskRotor } from "./live/OperatorDesk";
+import CWDecodeStrip from "./live/CWDecodeStrip";
 import { useQSOLoggedToast } from "./live/QSOLoggedToast";
 import OperatorCanvas from "./live/OperatorCanvas";
 import { useWorkspaceLayout } from "./live/useWorkspaceLayout";
@@ -1355,7 +1356,7 @@ function MainLiveApp() {
   }
   const deskProps = { draftLocked: editorLocked, canAcceptLocalInput: acceptsInput, onLocalInputState: editorInputState, resetInputEpoch: spotEditorEpoch,
     automaticStart,
-    referenceEvidence, cwControls, equipment: settings?.stationEquipment, draft, setDraft: setOperatorDraft, save,
+    referenceEvidence, cwControls, cwDecode: <CWDecodeStrip radioId={activeRadio ?? "radio1"} frequencyHz={station?.radio?.frequency_hz} mode={station?.radio?.mode} />, equipment: settings?.stationEquipment, draft, setDraft: setOperatorDraft, save,
     clear: () => void run(clear), busy: busy || editorBlocked, lookup, previous, lookupPending, onRetryLookup: retryLookup, request, refresh: refresh + lookupRetryRevision, onEditor: () => setView("Log QSO"),
     onReadRadio: readRadioIntoDraft, follow, setFollow: setFollowImmediate, rotor: rotorState,
     rotorConfigured: hasConfiguredRotor(rotorConfigurationState.base?.configuration), autoRotor, setAutoRotor: changeAutoRotor,

@@ -298,7 +298,8 @@ actor LiveStationSession {
                                         "station_forget", "station_configuration", "station_configuration_save",
                                         "station_radio_control", "station_rotor_snapshot", "station_rotor_connect",
                                         "station_rotor_disconnect", "station_rotor_goto", "station_rotor_stop",
-                                        "station_add_spot", "station_remove_spot", "station_cat_servers"]
+                                        "station_add_spot", "station_remove_spot", "station_cat_servers",
+                                        "station_cw_text"]
 
     func handle(_ method: String, params: [String: Any]) async throws -> [String: Any] {
         // The terminal worker admits only this exact release route. It cannot
@@ -451,6 +452,30 @@ actor LiveStationSession {
             try StationAgentKeychain(endpoint: endpoint, radioID: radioID).delete()
             credentialCache.invalidate(endpoint: endpoint)
             return ["forgotten": true]
+
+        case "station_cw_text":
+            // Receive-only decoded CW text relayed by the Agent from OM0RX-Skimmer.
+            try requireKeys(params, allowed: ["provider", "after"])
+            let after = try params["after"].map { raw -> Int in
+                guard let value = try Self.integer(raw), (0...9_007_199_254_740_991).contains(value) else { throw Self.invalidParams() }
+                return Int(value)
+            }
+            guard let current = client else {
+                throw WorkerFailure("station_unavailable", "Connect to the Remote Station Agent first.")
+            }
+            let data: Data
+            do { data = try await current.fetchCWTextData(after: after) }
+            catch let failure as RemoteAgentCommandFailure {
+                throw WorkerFailure("cw_text_unavailable", failure.message)
+            } catch {
+                throw WorkerFailure("cw_text_unavailable", "Decoded CW text is unavailable from the Remote Station Agent.")
+            }
+            guard data.count <= 4_000_000,
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let text = object["cw_text"] as? [String: Any] else {
+                throw WorkerFailure("station_protocol", "Decoded CW text from the Remote Station Agent is invalid.")
+            }
+            return ["source": "direct_agent", "cw_text": text]
 
         case "station_configuration":
             try requireKeys(params, allowed: ["provider"])
@@ -1214,6 +1239,10 @@ actor LiveStationSession {
             #if os(Windows)
             if let socket = xlog_socket_connect("127.0.0.1", port, 200, nil) {
                 xlog_socket_close(socket)
+                // FlexRadio's own SmartSDR CAT listens on 5002 by default. It is a
+                // separate radio client, not a standalone xCat owner, and the direct
+                // FLEX path already runs beside it.
+                if xlog_tcp_listener_is_smartsdr_cat(port) == 1 { continue }
                 return true
             }
             #else
